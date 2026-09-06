@@ -990,10 +990,10 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
         Codec: isHls ? "hls" : "h264",
         CodecTag: isHls ? undefined : "avc1",
         DisplayTitle: height > 0 ? `${height}p H264 SDR` : "H264 SDR",
-        Index: 0,
-        IsDefault: false,
+        IsDefault: true,
         IsForced: false,
         IsExternal: false,
+        Index: 0,
         Width: width,
         Height: height || undefined,
         AspectRatio: "16:9",
@@ -1184,6 +1184,7 @@ async function itemResponse(id, request, env, fetchImpl, token) {
   }
 
   const item = mapMovie(movie, request.url, env);
+  attachPlaybackUserData(item, await readPlaybackState(env));
   const [video, subtitles] = await Promise.all([
     resolveVideo(movie, env, fetchImpl),
     hasChineseSubtitles(movie)
@@ -1252,6 +1253,110 @@ function noContentResponse() {
     },
   });
 }
+const PLAYBACK_STATE_KEY = "playback-state-v1";
+const PLAYBACK_MAX_RESUME_ITEMS = 30;
+
+function playbackKv(env) {
+  const kv = env && env.PLAYBACK_KV;
+  return kv && typeof kv.get === "function" && typeof kv.put === "function" ? kv : null;
+}
+
+async function readPlaybackState(env) {
+  const kv = playbackKv(env);
+  if (!kv) return {};
+  try {
+    const value = await kv.get(PLAYBACK_STATE_KEY, "json");
+    return value && typeof value === "object" ? value : {};
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Playback state read failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    return {};
+  }
+}
+
+async function writePlaybackState(env, state) {
+  const kv = playbackKv(env);
+  if (!kv) return;
+  try {
+    await kv.put(PLAYBACK_STATE_KEY, JSON.stringify(state || {}));
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Playback state write failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
+
+function userDataForRecord(record) {
+  const positionTicks = Math.max(0, Math.floor(Number(record && record.positionTicks) || 0));
+  const played = Boolean(record && record.played);
+  return {
+    Played: played,
+    PlayCount: Math.max(0, Math.floor(Number(record && record.playCount) || (played ? 1 : 0))),
+    IsFavorite: false,
+    PlaybackPositionTicks: positionTicks,
+  };
+}
+
+function attachPlaybackUserData(item, state) {
+  if (!item || !state) return item;
+  const record = state[item.Id];
+  if (record) {
+    item.UserData = userDataForRecord(record);
+  }
+  return item;
+}
+
+function parseJsonBodyText(raw) {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+async function recordPlaybackEvent(path, request, env) {
+  if (!playbackKv(env)) return;
+  let body = {};
+  try {
+    body = parseJsonBodyText(await request.clone().text());
+  } catch {
+    body = {};
+  }
+  const itemId = String(body.ItemId || body.itemId || (body.NowPlayingItem && body.NowPlayingItem.Id) || "");
+  if (!itemId) return;
+  const positionTicks = Math.max(0, Number(body.PositionTicks ?? body.positionTicks ?? 0) || 0);
+  const state = await readPlaybackState(env);
+  const record = state[itemId] || {
+    itemId,
+    positionTicks: 0,
+    played: false,
+    playCount: 0,
+    lastPlayedDate: "",
+  };
+  record.itemId = itemId;
+  record.lastPlayedDate = new Date().toISOString();
+  if (path === "/Sessions/Playing/Stopped") {
+    if (body.PlayedToCompletion === true || body.playedToCompletion === true) {
+      record.played = true;
+      record.positionTicks = 0;
+      record.playCount = Math.max(0, Math.floor(Number(record.playCount) || 0)) + 1;
+    } else if (positionTicks > 0) {
+      record.positionTicks = positionTicks;
+    }
+  } else if (path === "/Sessions/Playing" || positionTicks > 0) {
+    if (positionTicks > 0) {
+      record.positionTicks = positionTicks;
+    }
+  }
+  state[itemId] = record;
+  await writePlaybackState(env, state);
+}
+
+
 
 function isEmbyClientRequest(request) {
   const url = new URL(request.url);
@@ -1614,11 +1719,24 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   if (
     path === "/Sessions/Capabilities" ||
     path === "/Sessions/Capabilities/Full" ||
-    path === "/Sessions/Viewing" ||
+    path === "/Sessions/Viewing"
+  ) {
+    return noContentResponse();
+  }
+  if (
     path === "/Sessions/Playing" ||
     path === "/Sessions/Playing/Progress" ||
     path === "/Sessions/Playing/Stopped"
   ) {
+    try {
+      await recordPlaybackEvent(path, request, env);
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "Playback event handling failed",
+        path,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
     return noContentResponse();
   }
 
@@ -1631,7 +1749,8 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       const query = new URLSearchParams(url.search);
       query.requestUrl = request.url;
       const result = await getMoviePage(query, env, fetchImpl, token);
-      result.Items = result.Items.map((item) => ({ ...item, Path: item.Path }));
+      const userDataState = await readPlaybackState(env);
+      result.Items = result.Items.map((item) => attachPlaybackUserData({ ...item, Path: item.Path }, userDataState));
       return jsonResponse(result);
     } catch (error) {
       return errorResponse(502, error instanceof Error ? error.message : "Movie catalog unavailable");
@@ -1643,13 +1762,43 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       query.set("StartIndex", "0");
       query.requestUrl = request.url;
       const result = await getMoviePage(query, env, fetchImpl, token);
-      return jsonResponse(result.Items);
+      const userDataState = await readPlaybackState(env);
+      return jsonResponse(result.Items.map((item) => attachPlaybackUserData(item, userDataState)));
     } catch (error) {
       return errorResponse(502, error instanceof Error ? error.message : "Latest movies unavailable");
     }
   }
+  if (path === "/Items/Resume") {
+    try {
+      const resumeState = await readPlaybackState(env);
+      const resumeLimit = Math.min(
+        PLAYBACK_MAX_RESUME_ITEMS,
+        Math.max(1, Number(url.searchParams.get("Limit")) || PLAYBACK_MAX_RESUME_ITEMS),
+      );
+      const entries = Object.values(resumeState)
+        .filter((record) => record && record.itemId && Number(record.positionTicks) > 0)
+        .sort((a, b) => String(b.lastPlayedDate || "").localeCompare(String(a.lastPlayedDate || "")))
+        .slice(0, resumeLimit);
+      const resumeItems = [];
+      for (const record of entries) {
+        try {
+          const movie = await getMovie(record.itemId, env, fetchImpl, token);
+          if (!movie || (!movie.id && !movie.number)) continue;
+          resumeItems.push(attachPlaybackUserData(mapMovie(movie, request.url, env), resumeState));
+        } catch {
+          // Item may no longer be resolvable upstream; skip silently.
+        }
+      }
+      return jsonResponse(itemQuery(resumeItems));
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "Resume list failed",
+        error: error instanceof Error ? error.message : String(error),
+      }));
+      return jsonResponse(emptyItemQuery());
+    }
+  }
   if (
-    path === "/Items/Resume" ||
     path === "/Shows/NextUp" ||
     path === "/Shows/Upcoming" ||
     path === "/Genres" ||
@@ -1657,6 +1806,51 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     path === "/Persons"
   ) {
     return jsonResponse(emptyItemQuery());
+  }
+  const userDataMatch = path.match(/^\/Items\/([^/]+)\/UserData$/i);
+  if (userDataMatch) {
+    const userDataItemId = decodeURIComponent(userDataMatch[1]);
+    const userDataState = await readPlaybackState(env);
+    if (request.method === "DELETE") {
+      delete userDataState[userDataItemId];
+      await writePlaybackState(env, userDataState);
+      return noContentResponse();
+    }
+    if (request.method === "POST" || request.method === "PUT") {
+      let body = {};
+      try {
+        body = parseJsonBodyText(await request.clone().text());
+      } catch {
+        body = {};
+      }
+      const record = userDataState[userDataItemId] || {
+        itemId: userDataItemId,
+        positionTicks: 0,
+        played: false,
+        playCount: 0,
+        lastPlayedDate: "",
+      };
+      if (body.Played !== undefined) {
+        record.played = Boolean(body.Played);
+        if (record.played) {
+          record.positionTicks = 0;
+        }
+      }
+      if (body.PlaybackPositionTicks !== undefined) {
+        record.positionTicks = Math.max(0, Number(body.PlaybackPositionTicks) || 0);
+      }
+      if (body.PlayCount !== undefined) {
+        record.playCount = Math.max(0, Math.floor(Number(body.PlayCount) || 0));
+      }
+      if (body.IsFavorite !== undefined) {
+        record.favorite = Boolean(body.IsFavorite);
+      }
+      record.lastPlayedDate = record.lastPlayedDate || new Date().toISOString();
+      userDataState[userDataItemId] = record;
+      await writePlaybackState(env, userDataState);
+      return noContentResponse();
+    }
+    return jsonResponse(userDataForRecord(userDataState[userDataItemId]));
   }
   if (path === "/Movies/Recommendations") {
     return jsonResponse([]);
