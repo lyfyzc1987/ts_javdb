@@ -394,6 +394,13 @@ function guestToken(env) {
   return String(env.EMBY_GUEST_TOKEN || DEFAULT_GUEST_TOKEN);
 }
 
+// 默认“本地信任登录”：不要求真实 JavDB 账号，随便输入的用户名都能登录成功。
+// 只有显式设置 EMBY_REAL_JAVDB_LOGIN=true 时，才回到“必须真实 JavDB 账号验证”。
+function realJavdbLoginEnabled(env) {
+  const value = String(env.EMBY_REAL_JAVDB_LOGIN ?? "false").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(value);
+}
+
 function virtualUser(env = {}, name = "JAVDB Guest", hasPassword = false) {
   return {
     Id: USER_ID,
@@ -751,9 +758,18 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
   return item;
 }
 
-function apiToken(token, env) {
-  const value = String(token || "");
-  return value && value !== guestToken(env) ? value : "";
+async function apiToken(token, env) {
+  const value = String(token || "").trim();
+  if (!value || value === guestToken(env)) {
+    return "";
+  }
+  const record = await lookupSessionRecord(env, value);
+  // 只有“真实 JavDB 会话”的 token 才透传给上游数据接口；
+  // “本地信任登录”生成的随机 token 一律不带，避免被 JavDB 当成无效会话拒绝。
+  if (!record || record.trusted === true) {
+    return "";
+  }
+  return value;
 }
 
 async function getMovie(id, env, fetchImpl, token = "") {
@@ -761,7 +777,7 @@ async function getMovie(id, env, fetchImpl, token = "") {
     `/v4/movies/${encodeURIComponent(id)}`,
     env,
     fetchImpl,
-    { token: apiToken(token, env) },
+    { token: await apiToken(token, env) },
   );
   return movieFromPayload(payload);
 }
@@ -784,7 +800,7 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
         movie_filter_by: "p",
         limit,
       },
-      token: apiToken(token, env),
+      token: await apiToken(token, env),
     });
     const movies = moviesFromPayload(payload).filter(library.matches);
     return {
@@ -815,7 +831,7 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
         filter_by: library.sourceFilter,
         limit: HOME_SOURCE_PAGE_SIZE,
       },
-      token: apiToken(token, env),
+      token: await apiToken(token, env),
     });
     const movies = moviesFromPayload(payload);
     matchingMovies.push(...movies.filter(library.matches));
@@ -1075,7 +1091,9 @@ async function authenticate(request, env, fetchImpl) {
   const url = new URL(request.url);
   const username = String(input.Username || input.username || url.searchParams.get("username") || "").trim();
   const password = String(input.Pw || input.Password || input.password || url.searchParams.get("password") || "");
-  if (!username || !password) {
+
+  // 没填用户名：保留“访客/免登录”（可选）或报错
+  if (!username) {
     if (guestAccessEnabled(env)) {
       return authenticationResponse(
         request,
@@ -1084,9 +1102,19 @@ async function authenticate(request, env, fetchImpl) {
         guestToken(env),
       );
     }
-    return errorResponse(401, "JavDB username and password are required");
+    return errorResponse(401, "用户名不能为空");
   }
 
+  // 默认“本地信任登录”：不向 JavDB 验证账号密码。
+  // 随便输入一个用户名（密码任意、可留空）都直接登录成功，
+  // 客户端显示的名称就是登录时输入的用户名，播放记录按用户名独立分桶。
+  if (!realJavdbLoginEnabled(env)) {
+    const token = crypto.randomUUID();
+    await storeSessionUser(env, token, username, requestDeviceId(request), { trusted: true });
+    return authenticationResponse(request, env, virtualUser(env, username, true), token);
+  }
+
+  // 可选：EMBY_REAL_JAVDB_LOGIN=true 时，仍按真实 JavDB 账号验证（原逻辑）
   const form = new FormData();
   form.set("username", username);
   form.set("password", password);
@@ -1112,12 +1140,7 @@ async function authenticate(request, env, fetchImpl) {
     const accountName = String(data?.user?.username || username || "").trim();
     await storeSessionUser(env, token, accountName, requestDeviceId(request));
 
-    const user = virtualUser(
-      env,
-      accountName,
-      true,
-    );
-    return authenticationResponse(request, env, user, token);
+    return authenticationResponse(request, env, virtualUser(env, accountName, true), token);
   } catch (error) {
     return errorResponse(401, error instanceof Error ? error.message : "JavDB authentication failed");
   }
@@ -1287,13 +1310,16 @@ function sessionUserKey(token) {
   return `${SESSION_USER_KEY_PREFIX}${playbackTokenPart(token)}`;
 }
 
-async function storeSessionUser(env, token, username, deviceId = "") {
+async function storeSessionUser(env, token, username, deviceId = "", extra = {}) {
   const kv = playbackKv(env);
   if (!kv || !token || !username) return;
   try {
     const record = { username: String(username), at: Date.now() };
     if (deviceId) {
       record.deviceId = String(deviceId);
+    }
+    if (extra && extra.trusted) {
+      record.trusted = true;
     }
     await kv.put(sessionUserKey(token), JSON.stringify(record));
   } catch (error) {
@@ -1762,6 +1788,10 @@ function isMediaDeliveryPath(path) {
 
 // token 绑定登录设备：非媒体接口从别的设备使用同一 token 一律 401
 async function deviceBindingFailure(request, url, env, path) {
+  // 登录 / 切换账号的请求不应被旧 token 的设备绑定拦住
+  if (path === "/Users/AuthenticateByName") {
+    return null;
+  }
   const token = getToken(request, url);
   if (!token || token === guestToken(env)) {
     return null;
