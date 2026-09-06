@@ -8,7 +8,7 @@ const ROOT_ID = "bbjavdb-root";
 const PLAYABLE_LIBRARY_ID = "bbjavdb-playable";
 const CHINESE_PLAYABLE_LIBRARY_ID = "bbjavdb-chinese-playable";
 const USER_ID = "bbjavdb-user";
-const PRODUCT_NAME = "步兵JAVDB";
+const PRODUCT_NAME = "月影emby";
 const DEFAULT_GUEST_TOKEN = "bbjavdb-guest";
 const LIBRARIES = [
   {
