@@ -1833,8 +1833,15 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   if (path === "/Branding/Configuration" || path === "/Startup/Configuration") {
     return jsonResponse({});
   }
-  if (path === "/Users/Public" || path === "/Users") {
-    return jsonResponse([await userForRequest(request, url, env)]);
+  if (path === "/Users/Public") {
+    // 不返回任何“公开用户”：客户端会显示手动输入账号密码，
+    // 避免它把 JAVDB Guest 当作用户名发给上游而报“账号不存在”。
+    return jsonResponse([]);
+  }
+  if (path === "/Users") {
+    const currentUser = await userForRequest(request, url, env);
+    const hasToken = Boolean(getToken(request, url));
+    return jsonResponse(hasToken ? [currentUser] : []);
   }
   if (path === "/Users/AuthenticateByName") {
     return authenticate(request, env, fetchImpl);
