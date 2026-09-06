@@ -349,6 +349,19 @@ function getToken(request, url) {
   return bearerMatch ? bearerMatch[1] : "";
 }
 
+function requestDeviceId(request) {
+  const header =
+    request.headers.get("x-emby-authorization") ||
+    request.headers.get("x-mediabrowser-authorization") ||
+    request.headers.get("authorization") ||
+    "";
+  const match = header.match(/(?:^|[,\s])DeviceId\s*=\s*"?([^",\s]+)/i);
+  if (match) {
+    return match[1];
+  }
+  return String(request.headers.get("x-emby-device-id") || "");
+}
+
 function routePath(requestUrl) {
   const path = new URL(requestUrl).pathname;
   const withoutPrefix = /^\/emby(?:\/|$)/i.test(path)
@@ -1096,9 +1109,12 @@ async function authenticate(request, env, fetchImpl) {
       return errorResponse(401, "JavDB authentication failed");
     }
 
+    const accountName = String(data?.user?.username || username || "").trim();
+    await storeSessionUser(env, token, accountName, requestDeviceId(request));
+
     const user = virtualUser(
       env,
-      data?.user?.username || username,
+      accountName,
       true,
     );
     return authenticationResponse(request, env, user, token);
@@ -1184,7 +1200,7 @@ async function itemResponse(id, request, env, fetchImpl, token) {
   }
 
   const item = mapMovie(movie, request.url, env);
-  attachPlaybackUserData(item, await readPlaybackState(env));
+  attachPlaybackUserData(item, await readPlaybackState(env, token));
   const [video, subtitles] = await Promise.all([
     resolveVideo(movie, env, fetchImpl),
     hasChineseSubtitles(movie)
@@ -1261,11 +1277,66 @@ function playbackKv(env) {
   return kv && typeof kv.get === "function" && typeof kv.put === "function" ? kv : null;
 }
 
-async function readPlaybackState(env) {
+function playbackTokenPart(token) {
+  return md5(String(token || "").trim());
+}
+
+const SESSION_USER_KEY_PREFIX = "session-user:v1:";
+
+function sessionUserKey(token) {
+  return `${SESSION_USER_KEY_PREFIX}${playbackTokenPart(token)}`;
+}
+
+async function storeSessionUser(env, token, username, deviceId = "") {
+  const kv = playbackKv(env);
+  if (!kv || !token || !username) return;
+  try {
+    const record = { username: String(username), at: Date.now() };
+    if (deviceId) {
+      record.deviceId = String(deviceId);
+    }
+    await kv.put(sessionUserKey(token), JSON.stringify(record));
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Session user mapping write failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
+
+async function lookupSessionRecord(env, token) {
+  const kv = playbackKv(env);
+  if (!kv || !token) return null;
+  try {
+    const value = await kv.get(sessionUserKey(token), "json");
+    return value && typeof value === "object" ? value : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function lookupSessionUsername(env, token) {
+  const record = await lookupSessionRecord(env, token);
+  return record && record.username ? String(record.username) : "";
+}
+
+async function playbackStateKey(env, token) {
+  const scope = String(token || "").trim();
+  if (!scope || scope === guestToken(env)) {
+    return PLAYBACK_STATE_KEY;
+  }
+  const username = await lookupSessionUsername(env, scope);
+  if (username) {
+    return `${PLAYBACK_STATE_KEY}:u:${md5(username)}`;
+  }
+  return `${PLAYBACK_STATE_KEY}:${playbackTokenPart(scope)}`;
+}
+
+async function readPlaybackState(env, token) {
   const kv = playbackKv(env);
   if (!kv) return {};
   try {
-    const value = await kv.get(PLAYBACK_STATE_KEY, "json");
+    const value = await kv.get(await playbackStateKey(env, token), "json");
     return value && typeof value === "object" ? value : {};
   } catch (error) {
     console.error(JSON.stringify({
@@ -1276,11 +1347,11 @@ async function readPlaybackState(env) {
   }
 }
 
-async function writePlaybackState(env, state) {
+async function writePlaybackState(env, state, token) {
   const kv = playbackKv(env);
   if (!kv) return;
   try {
-    await kv.put(PLAYBACK_STATE_KEY, JSON.stringify(state || {}));
+    await kv.put(await playbackStateKey(env, token), JSON.stringify(state || {}));
   } catch (error) {
     console.error(JSON.stringify({
       message: "Playback state write failed",
@@ -1320,6 +1391,7 @@ function parseJsonBodyText(raw) {
 
 async function recordPlaybackEvent(path, request, env) {
   if (!playbackKv(env)) return;
+  const token = getToken(request, new URL(request.url));
   let body = {};
   try {
     body = parseJsonBodyText(await request.clone().text());
@@ -1329,7 +1401,7 @@ async function recordPlaybackEvent(path, request, env) {
   const itemId = String(body.ItemId || body.itemId || (body.NowPlayingItem && body.NowPlayingItem.Id) || "");
   if (!itemId) return;
   const positionTicks = Math.max(0, Number(body.PositionTicks ?? body.positionTicks ?? 0) || 0);
-  const state = await readPlaybackState(env);
+  const state = await readPlaybackState(env, token);
   const record = state[itemId] || {
     itemId,
     positionTicks: 0,
@@ -1353,7 +1425,7 @@ async function recordPlaybackEvent(path, request, env) {
     }
   }
   state[itemId] = record;
-  await writePlaybackState(env, state);
+  await writePlaybackState(env, state, token);
 }
 
 
@@ -1640,8 +1712,82 @@ function isHandledPath(path) {
   );
 }
 
+async function userForRequest(request, url, env) {
+  const token = getToken(request, url);
+  if (token && token !== guestToken(env)) {
+    const username = await lookupSessionUsername(env, token);
+    if (username) {
+      return virtualUser(env, username, true);
+    }
+  }
+  return virtualUser(env);
+}
+
+function notFoundPage() {
+  return new Response(
+    "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><title>404 Not Found</title>" +
+      "<body style=\"font-family:system-ui,-apple-system,sans-serif;text-align:center;padding-top:14vh;color:#444\">" +
+      "<h1 style=\"font-size:64px;margin:0\">404</h1><p>Not Found</p></body></html>",
+    {
+      status: 404,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      },
+    },
+  );
+}
+
+// 识别“浏览器直接打开网页”的请求：限制浏览器访问，直接返回 404。
+// EMBY 客户端（APP/TV/第三方）走的接口请求不会被拦截。
+function browserPageBlocked(request) {
+  const mode = String(request.headers.get("sec-fetch-mode") || "");
+  if (mode === "navigate" || mode === "nested-navigate") {
+    return true;
+  }
+  const accept = String(request.headers.get("accept") || "").toLowerCase();
+  return accept.includes("text/html") && !accept.includes("application/json");
+}
+
+// 媒体投递类请求（播放/字幕/图片/下载）：URL 自带 api_key，播放器不带设备头，跳过设备校验
+function isMediaDeliveryPath(path) {
+  return (
+    path.startsWith("/Videos/") ||
+    /^\/Items\/[^/]+\/Images\//i.test(path) ||
+    /^\/Items\/[^/]+\/Download$/i.test(path) ||
+    path.startsWith("/emby-media/")
+  );
+}
+
+// token 绑定登录设备：非媒体接口从别的设备使用同一 token 一律 401
+async function deviceBindingFailure(request, url, env, path) {
+  const token = getToken(request, url);
+  if (!token || token === guestToken(env)) {
+    return null;
+  }
+  if (isMediaDeliveryPath(path)) {
+    return null;
+  }
+  const record = await lookupSessionRecord(env, token);
+  if (!record || !record.deviceId) {
+    return null; // 旧版未绑定/无法识别的 token：放行，重新登录后即绑定
+  }
+  const deviceId = requestDeviceId(request);
+  if (!deviceId) {
+    return errorResponse(401, "无法验证设备，请重新登录后再试");
+  }
+  if (deviceId !== record.deviceId) {
+    return errorResponse(401, "Token 与登录设备不匹配（禁止跨设备使用），请重新登录");
+  }
+  return null;
+}
+
 export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   const url = new URL(request.url);
+  if (browserPageBlocked(request)) {
+    return notFoundPage();
+  }
   const requestPath = routePath(request.url);
   if (requestPath === "/" && /^\/emby\/?$/i.test(url.pathname)) {
     return jsonResponse(systemInfo(request.url, env));
@@ -1670,6 +1816,11 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     });
   }
 
+  const deviceFailure = await deviceBindingFailure(request, url, env, path);
+  if (deviceFailure) {
+    return deviceFailure;
+  }
+
   if (path === "/System/Info/Public" || path === "/System/Info") {
     return jsonResponse(systemInfo(request.url, env));
   }
@@ -1683,13 +1834,13 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     return jsonResponse({});
   }
   if (path === "/Users/Public" || path === "/Users") {
-    return jsonResponse([virtualUser(env)]);
+    return jsonResponse([await userForRequest(request, url, env)]);
   }
   if (path === "/Users/AuthenticateByName") {
     return authenticate(request, env, fetchImpl);
   }
   if (path === "/Users/Me" || /^\/Users\/[^/]+$/i.test(path)) {
-    return jsonResponse(virtualUser(env));
+    return jsonResponse(await userForRequest(request, url, env));
   }
   if (/^\/Users\/[^/]+\/GroupingOptions$/i.test(path)) {
     return jsonResponse([]);
@@ -1749,7 +1900,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       const query = new URLSearchParams(url.search);
       query.requestUrl = request.url;
       const result = await getMoviePage(query, env, fetchImpl, token);
-      const userDataState = await readPlaybackState(env);
+      const userDataState = await readPlaybackState(env, token);
       result.Items = result.Items.map((item) => attachPlaybackUserData({ ...item, Path: item.Path }, userDataState));
       return jsonResponse(result);
     } catch (error) {
@@ -1762,7 +1913,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       query.set("StartIndex", "0");
       query.requestUrl = request.url;
       const result = await getMoviePage(query, env, fetchImpl, token);
-      const userDataState = await readPlaybackState(env);
+      const userDataState = await readPlaybackState(env, token);
       return jsonResponse(result.Items.map((item) => attachPlaybackUserData(item, userDataState)));
     } catch (error) {
       return errorResponse(502, error instanceof Error ? error.message : "Latest movies unavailable");
@@ -1770,7 +1921,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   }
   if (path === "/Items/Resume") {
     try {
-      const resumeState = await readPlaybackState(env);
+      const resumeState = await readPlaybackState(env, token);
       const resumeLimit = Math.min(
         PLAYBACK_MAX_RESUME_ITEMS,
         Math.max(1, Number(url.searchParams.get("Limit")) || PLAYBACK_MAX_RESUME_ITEMS),
@@ -1810,10 +1961,10 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   const userDataMatch = path.match(/^\/Items\/([^/]+)\/UserData$/i);
   if (userDataMatch) {
     const userDataItemId = decodeURIComponent(userDataMatch[1]);
-    const userDataState = await readPlaybackState(env);
+    const userDataState = await readPlaybackState(env, token);
     if (request.method === "DELETE") {
       delete userDataState[userDataItemId];
-      await writePlaybackState(env, userDataState);
+      await writePlaybackState(env, userDataState, token);
       return noContentResponse();
     }
     if (request.method === "POST" || request.method === "PUT") {
@@ -1847,7 +1998,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       }
       record.lastPlayedDate = record.lastPlayedDate || new Date().toISOString();
       userDataState[userDataItemId] = record;
-      await writePlaybackState(env, userDataState);
+      await writePlaybackState(env, userDataState, token);
       return noContentResponse();
     }
     return jsonResponse(userDataForRecord(userDataState[userDataItemId]));
