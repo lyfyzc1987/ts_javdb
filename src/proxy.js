@@ -42,7 +42,7 @@ const MAGNET_DESKTOP_TITLE_PATCH =
   'f.jsx(ff,{className:"max-w-md font-medium",children:f.jsxs("div",{className:"flex items-center gap-2",children:[e.downloadUrl?f.jsx("a",{href:e.downloadUrl,target:"_blank",rel:"noreferrer",className:"min-w-0 flex-1 truncate text-primary hover:underline",children:e.name}):f.jsx("span",{className:"min-w-0 flex-1 truncate",children:e.name}),bbCopyButton(e.hash)]})})';
 
 const REPLICA_SOURCE_PATCHES = [
-  ["catemby\u9057\u4ea7", "\u6b65\u5175JAVDB"],
+  ["catemby\u9057\u4ea7", "\u6708\u5f71emby"],//改变站点名称
   ["--container-7xl:80rem", "--container-7xl:100rem"],
   [
     "grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8",
