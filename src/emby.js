@@ -1,245 +1,87 @@
-const DEFAULT_API_ORIGIN = "https://jdforrepam.com/api";
-const DEFAULT_UPSTREAM_ORIGIN = "https://catembylegacy.fastcdn.dpdns.org";
-const DEFAULT_RESOLVER_ORIGIN = "https://javstrm.emby-59f.workers.dev";
-const SIGNATURE_KEY = "lpw6vgqzsp";
-const SIGNATURE_SECRET =
-  "71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa";
-const ROOT_ID = "bbjavdb-root";
-const PLAYABLE_LIBRARY_ID = "bbjavdb-playable";
-const CHINESE_PLAYABLE_LIBRARY_ID = "bbjavdb-chinese-playable";
-const USER_ID = "bbjavdb-user";
-const PRODUCT_NAME = "月影emby";
+// 完整 emby.js — 2026-09-07 修改版
+// 登录强制密码 + M3U8→STRM + 标题完整 + 搜索多页 + 独立用户ID
+
+const DEFAULT_API_ORIGIN = "https://catembylegacy.bbemby.com";
 const DEFAULT_GUEST_TOKEN = "bbjavdb-guest";
-const LIBRARIES = [
-  {
-    id: PLAYABLE_LIBRARY_ID,
-    name: "可播放",
-    sourceFilter: "can_play",
-    matches: (movie) => Boolean(movie?.can_play),
-  },
-  {
-    id: CHINESE_PLAYABLE_LIBRARY_ID,
-    name: "中文可播放",
-    sourceFilter: "subtitle",
-    matches: (movie) => isPlayableChinese(movie),
-  },
-];
+const USER_ID = "bbjavdb-user";
+const PLAYABLE_LIBRARY_ID = "bbjavdb-library";
+const CHINESE_PLAYABLE_LIBRARY_ID = "bbjavdb-chinese";
+const ROOT_ID = "bbjavdb-root";
+const HOME_MAX_SOURCE_PAGES = 6;
+const HOME_SOURCE_PAGE_SIZE = 32;
+const PLAYBACK_MAX_RESUME_ITEMS = 30;
 
-const MEDIA_HOSTS = new Set([
-  "fast-stream.jav.si",
-  "jdforrepam.com",
-  "tp.spfcas.com",
-  "h1.gzankun.com",
-]);
-const MEDIA_SUFFIXES = [".spfcas.com", ".gzankun.com"];
-const INLINE_HLS_CONTENT_TYPES = new Set([
-  "application/mpegurl",
-  "application/vnd.apple.mpegurl",
-  "application/x-mpegurl",
-]);
-const MAX_INLINE_HLS_LENGTH = 2_000_000;
-const HOME_SOURCE_PAGE_SIZE = 50;
-const HOME_MAX_SOURCE_PAGES = 12;
-const IMAGE_CONTENT_TYPES = new Map([
-  [".avif", "image/avif"],
-  [".gif", "image/gif"],
-  [".jpeg", "image/jpeg"],
-  [".jpg", "image/jpeg"],
-  [".png", "image/png"],
-  [".webp", "image/webp"],
-]);
-const IMAGE_SIGNATURES = [
-  { contentType: "image/jpeg", bytes: [0xff, 0xd8, 0xff] },
-  { contentType: "image/png", bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] },
-  { contentType: "image/gif", bytes: [0x47, 0x49, 0x46, 0x38, 0x37, 0x61] },
-  { contentType: "image/gif", bytes: [0x47, 0x49, 0x46, 0x38, 0x39, 0x61] },
-  { contentType: "image/bmp", bytes: [0x42, 0x4d] },
-];
-
-function add32(...values) {
-  return values.reduce((sum, value) => (sum + value) | 0, 0);
+function md5(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return String(hash);
 }
 
-function rotateLeft(value, amount) {
-  return (value << amount) | (value >>> (32 - amount));
-}
-
-function littleEndianHex(value) {
-  const unsigned = value >>> 0;
-  let result = "";
-  for (let index = 0; index < 4; index += 1) {
-    result += (`0${((unsigned >>> (index * 8)) & 255).toString(16)}`).slice(-2);
-  }
-  return result;
-}
-
-function md5(value) {
-  const bytes = new TextEncoder().encode(value);
-  const blockLength = (((bytes.length + 8) >>> 6) + 1) * 16;
-  const words = new Int32Array(blockLength);
-
-  for (let index = 0; index < bytes.length; index += 1) {
-    words[index >>> 2] |= bytes[index] << ((index & 3) * 8);
-  }
-
-  words[bytes.length >>> 2] |= 0x80 << ((bytes.length & 3) * 8);
-  const bitLength = bytes.length * 8;
-  words[blockLength - 2] = bitLength;
-  words[blockLength - 1] = Math.floor(bitLength / 4294967296);
-
-  const shifts = [
-    [7, 12, 17, 22],
-    [5, 9, 14, 20],
-    [4, 11, 16, 23],
-    [6, 10, 15, 21],
-  ];
-  const constants = [
-    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
-    0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
-    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
-    0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
-    0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
-    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
-    0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
-    0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
-    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
-  ];
-
-  let a = 0x67452301 | 0;
-  let b = 0xefcdab89 | 0;
-  let c = 0x98badcfe | 0;
-  let d = 0x10325476 | 0;
-
-  for (let offset = 0; offset < blockLength; offset += 16) {
-    const originalA = a;
-    const originalB = b;
-    const originalC = c;
-    const originalD = d;
-
-    for (let index = 0; index < 64; index += 1) {
-      let functionValue;
-      let wordIndex;
-      let round;
-
-      if (index < 16) {
-        functionValue = (b & c) | (~b & d);
-        wordIndex = index;
-        round = 0;
-      } else if (index < 32) {
-        functionValue = (d & b) | (~d & c);
-        wordIndex = (5 * index + 1) % 16;
-        round = 1;
-      } else if (index < 48) {
-        functionValue = b ^ c ^ d;
-        wordIndex = (3 * index + 5) % 16;
-        round = 2;
-      } else {
-        functionValue = c ^ (b | ~d);
-        wordIndex = (7 * index) % 16;
-        round = 3;
-      }
-
-      const shifted = (functionValue + a + constants[index] + words[offset + wordIndex]) | 0;
-      const rotated = (rotateLeft(shifted, shifts[round][index % 4]) + b) | 0;
-      a = d;
-      d = c;
-      c = b;
-      b = rotated;
-    }
-
-    a = add32(originalA, a);
-    b = add32(originalB, b);
-    c = add32(originalC, c);
-    d = add32(originalD, d);
-  }
-
-  return littleEndianHex(a) + littleEndianHex(b) + littleEndianHex(c) + littleEndianHex(d);
+function md5hex(str) {
+  return md5(str).toString(16).padStart(32, "0");
 }
 
 function serverId(env) {
-  const id = env?.SERVER_ID || "bbjavdb";
-  return id;
-}
-
-function isPlayableChinese(movie) {
-  if (!movie) return false;
-  const hasPlayable = Boolean(movie.can_play);
-  const hasChineseSub = movie.subtitles?.some((sub) => sub.language === "chi" || sub.language === "zho");
-  return hasPlayable && hasChineseSub;
-}
-
-function moviesFromPayload(payload) {
-  const data = payload?.data || payload || {};
-  const list = data.items || data.movies || data.results || [];
-  if (!Array.isArray(list)) return [];
-  return list;
-}
-
-function normalizeClientPath(path) {
-  const normalized = path.replace(/^\/emby\//i, "/").replace(/^\/emby$/i, "/");
-  return normalized;
+  return env?.SERVER_ID || "bbjavdb-server";
 }
 
 function routePath(url) {
-  const pathname = new URL(url).pathname;
-  return normalizeClientPath(pathname);
+  try {
+    const u = new URL(url);
+    return u.pathname.replace(/^\/emby/, "") || "/";
+  } catch {
+    return "/";
+  }
+}
+
+function normalizeClientPath(path) {
+  if (path === "/") return "/";
+  return path.replace(/\/+$/, "") || "/";
 }
 
 function isHandledPath(path) {
-  const handledPrefixes = [
-    "/System/",
-    "/Branding/",
-    "/Startup/",
-    "/Users/",
-    "/UserViews",
-    "/Library/",
-    "/Sessions/",
-    "/DisplayPreferences/",
-    "/Items/",
-    "/Shows/",
-    "/Genres",
-    "/Studios",
-    "/Persons",
-    "/SearchHints",
-    "/Videos/",
-    "/emby-media/",
-    "/LiveTv/",
-    "/Channels",
-    "/Trailers",
-    "/Artists/",
-    "/Suggestions",
-    "/PlaybackInfo",
-    "/Download",
-    "/Subtitles",
+  const handled = [
+    "/System/Info/Public", "/System/Info", "/System/Endpoint",
+    "/System/Configuration", "/Branding/Configuration",
+    "/Startup/Configuration", "/Users/Public", "/Users",
+    "/Users/AuthenticateByName", "/Users/Me",
+    "/Users/GroupingOptions", "/Users/Views", "/UserViews",
+    "/Library/MediaFolders", "/Library/VirtualFolders",
+    "/Library/VirtualFolders/Query", "/Sessions",
+    "/DisplayPreferences/usersettings", "/Sessions/Capabilities",
+    "/Sessions/Capabilities/Full", "/Sessions/Viewing",
+    "/Sessions/Playing", "/Sessions/Playing/Progress",
+    "/Sessions/Playing/Stopped", "/Items/Root", "/Items",
+    "/Items/Latest", "/Items/Resume", "/Shows/NextUp",
+    "/Shows/Upcoming", "/Genres", "/Studios", "/Persons",
+    "/Items/UserData",
   ];
-  const exactPaths = ["/"];
-  if (exactPaths.includes(path)) return true;
-  if (path === "/" || path === "/emby") return true;
-  return handledPrefixes.some((prefix) => path.startsWith(prefix) || path === prefix);
-}
-
-function isEmbyClientRequest(request) {
-  const accept = request.headers.get("accept") || "";
-  const userAgent = request.headers.get("user-agent") || "";
-  if (accept.includes("json") || accept.includes("emby")) return true;
-  if (userAgent.includes("Emby") || userAgent.includes("JavDB")) return true;
+  if (handled.some(h => path === h || path.startsWith(h + "/"))) return true;
+  if (/^\/Videos\/[^/]+\/stream/i.test(path)) return true;
+  if (/^\/Items\/[^/]+\/Images\/Primary/i.test(path)) return true;
+  if (/^\/Items\/[^/]+\/PlaybackInfo/i.test(path)) return true;
+  if (/^\/Items\/[^/]+\/Download/i.test(path)) return true;
+  if (/^\/Items\/[^/]+$/i.test(path)) return true;
+  if (/^\/Videos\/[^/]+\/[^/]+\/Subtitles\/\d+\/Stream\.[a-z0-9]+$/i.test(path)) return true;
+  if (/^\/Videos\/[^/]+(?:\/[^/]+)?\/(?:stream(?:ing)?|original|download|playback)(?:[._-][^/]*)?$/i.test(path)) return true;
+  if (path.startsWith("/emby-media/")) return true;
   return false;
 }
 
+function isEmbyClientRequest(request) {
+  const ua = request.headers.get("user-agent") || "";
+  return /emby|android|iphone|ipad|tvos|webos|firefox|chrome|safari/i.test(ua);
+}
+
 function browserPageBlocked(request) {
-  const userAgent = request.headers.get("user-agent") || "";
+  const ua = request.headers.get("user-agent") || "";
   const accept = request.headers.get("accept") || "";
-  if (accept.includes("text/html") && !accept.includes("json") && !accept.includes("emby")) {
-    if (userAgent.includes("Mozilla") || userAgent.includes("Chrome") || userAgent.includes("Safari")) {
-      return true;
-    }
+  if (accept.includes("text/html") && !/emby|android|iphone|ipad|tvos|webos/i.test(ua)) {
+    return true;
   }
   return false;
 }
@@ -248,34 +90,76 @@ function notFoundPage() {
   return new Response("404 Not Found", { status: 404, headers: { "content-type": "text/plain" } });
 }
 
-function jsonResponse(value, status = 200, extraHeaders = {}) {
-  const headers = new Headers(extraHeaders);
-  headers.set("content-type", "application/json");
-  headers.set("access-control-allow-origin", "*");
-  return new Response(JSON.stringify(value), { status, headers });
-}
-
 function errorResponse(status, message) {
-  return jsonResponse({ Error: message }, status);
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 function noContentResponse() {
-  return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*" } });
+  return new Response(null, { status: 204 });
+}
+
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function itemQuery(items) {
+  return {
+    Items: items,
+    TotalRecordCount: items.length,
+    StartIndex: 0,
+  };
 }
 
 function emptyItemQuery() {
   return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
 }
 
-function itemQuery(items) {
-  return { Items: items, TotalRecordCount: items.length, StartIndex: 0 };
+function parseJsonBodyText(text) {
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return {};
+  }
 }
 
-function publicRoutePath(requestUrl, relativePath) {
-  const url = new URL(requestUrl);
-  const base = url.origin;
-  return new URL(relativePath, base).toString();
+function safeMediaUrl(url, env) {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    const allowed = env?.ALLOWED_MEDIA_DOMAINS || ["fast-stream.jav.si", "jav.si", "catembylegacy.bbemby.com"];
+    if (allowed.some(domain => u.hostname === domain || u.hostname.endsWith("." + domain))) {
+      return u;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
+
+const LIBRARIES = [
+  {
+    id: PLAYABLE_LIBRARY_ID,
+    name: "JAVDB 影片",
+    sourceFilter: "all",
+    matches: () => true,
+  },
+  {
+    id: CHINESE_PLAYABLE_LIBRARY_ID,
+    name: "中文 JAVDB",
+    sourceFilter: "chinese",
+    matches: (movie) => {
+      const title = (movie.title || "").toLowerCase();
+      const synopsis = (movie.synopsis || "").toLowerCase();
+      return /[\u4e00-\u9fff]/.test(title) || /[\u4e00-\u9fff]/.test(synopsis);
+    },
+  },
+];
 
 function libraryView(library, env) {
   return {
@@ -284,11 +168,9 @@ function libraryView(library, env) {
     ServerId: serverId(env),
     Type: "CollectionFolder",
     CollectionType: "movies",
-    LocationType: "Virtual",
-    ImageTags: {},
-    PrimaryImageAspectRatio: 1.333,
     IsFolder: true,
     ChildCount: 0,
+    PrimaryImageTag: "",
   };
 }
 
@@ -296,42 +178,20 @@ function virtualFolder(library) {
   return {
     Name: library.name,
     Id: library.id,
-    Type: "CollectionFolder",
     CollectionType: "movies",
-    LocationType: "Virtual",
-  };
-}
-
-function displayPreferences(url) {
-  const theme = url.searchParams.get("theme") || "dark";
-  return {
-    Id: "usersettings",
-    ViewType: "List",
-    SortBy: "SortName",
-    SortOrder: "Ascending",
-    ShowBackdrop: true,
-    SkipForwardLength: 30000,
-    HomeSectionOrder: [],
-    CustomPrefs: {
-      dashboardtheme: theme,
-      displaymissingepisodes: "false",
-    },
+    IsVirtualFolder: true,
+    PrimaryImageTag: "",
   };
 }
 
 function rootItem(env) {
   return {
-    Name: PRODUCT_NAME,
-    SortName: PRODUCT_NAME,
-    ServerId: serverId(env),
+    Name: "JAVDB",
     Id: ROOT_ID,
-    Guid: ROOT_ID,
-    Type: "Folder",
-    ChildCount: LIBRARIES.length,
-    DisplayPreferencesId: "usersettings",
+    ServerId: serverId(env),
+    Type: "UserRootFolder",
     IsFolder: true,
-    LocationType: "Virtual",
-    ImageTags: {},
+    ChildCount: LIBRARIES.length,
     UserData: {
       Played: false,
       PlayCount: 0,
@@ -340,61 +200,28 @@ function rootItem(env) {
   };
 }
 
-function isMediaHost(host) {
-  if (MEDIA_HOSTS.has(host)) return true;
-  return MEDIA_SUFFIXES.some((suffix) => host.endsWith(suffix));
-}
-
-function safeMediaUrl(input, env) {
-  if (!input) return null;
-  try {
-    const url = new URL(input);
-    if (isMediaHost(url.hostname)) {
-      return url;
-    }
-    if (env?.ALLOWED_MEDIA_HOSTS) {
-      const allowed = new Set(env.ALLOWED_MEDIA_HOSTS.split(",").map((h) => h.trim()));
-      if (allowed.has(url.hostname)) return url;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function isInlineHls(playlist) {
-  if (!playlist) return false;
-  return INLINE_HLS_CONTENT_TYPES.has(playlist.contentType) && playlist.length < MAX_INLINE_HLS_LENGTH;
-}
-
-function resolveInlineHls(source, requestUrl, env) {
-  const commaIndex = source.indexOf(",");
-  if (commaIndex === -1 || commaIndex + 1 >= source.length) {
-    return null;
-  }
-
-  const metadata = source.slice(5, commaIndex).toLowerCase();
-  const contentType = metadata.split(";")[0];
-  if (!INLINE_HLS_CONTENT_TYPES.has(contentType)) {
-    return null;
-  }
-
-  try {
-    const payload = source.slice(commaIndex + 1);
-    const playlist = metadata.split(";").includes("base64")
-      ? new TextDecoder().decode(
-          Uint8Array.from(atob(payload), (character) => character.charCodeAt(0)),
-        )
-      : decodeURIComponent(payload);
-    return playlist.trimStart().startsWith("#EXTM3U") ? playlist : null;
-  } catch {
-    return null;
-  }
+function displayPreferences(url) {
+  return {
+    Id: "usersettings",
+    ViewType: "Thumb",
+    SortBy: "SortName",
+    IndexBy: "None",
+    RememberIndexing: false,
+    PrimaryImageHeight: 250,
+    PrimaryImageWidth: 180,
+    CustomPrefs: {},
+    ScrollDirection: "Horizontal",
+    ShowBackdrop: true,
+    RememberSorting: true,
+    SortOrder: "Ascending",
+    ShowSidebar: true,
+    ShowTitle: true,
+    ShowGenres: false,
+  };
 }
 
 function getToken(request, url) {
-  const queryToken =
-    url.searchParams.get("api_key") ||
+  const queryToken = url.searchParams.get("api_key") ||
     url.searchParams.get("AccessToken") ||
     url.searchParams.get("token");
   if (queryToken) return queryToken;
@@ -421,7 +248,7 @@ function requestDeviceId(request) {
   return "";
 }
 
-function deviceIdForToken(env, token) {
+async function deviceIdForToken(env, token) {
   if (!token) return null;
   return env.PLAYBACK_KV?.get(`device:v1:${token}`, "json") ?? null;
 }
@@ -454,11 +281,20 @@ function guestToken(env) {
   return env?.GUEST_TOKEN || DEFAULT_GUEST_TOKEN;
 }
 
+function realJavdbLoginEnabled(env) {
+  return env?.REAL_JAVDB_LOGIN === "true" || env?.REAL_JAVDB_LOGIN === true;
+}
+
+function generateUserId(username) {
+  return "user-" + md5hex(username);
+}
+
 function virtualUser(env = {}, name = "JAVDB Guest", hasPassword = false) {
   const defaultName = guestAccessEnabled(env) ? "JAVDB Guest" : "JAVDB User";
+  const displayName = name || defaultName;
   return {
-    Name: name || defaultName,
-    Id: USER_ID,
+    Name: displayName,
+    Id: generateUserId(displayName),
     ServerId: serverId(env),
     HasPassword: hasPassword,
     HasConfiguredPassword: hasPassword,
@@ -492,17 +328,11 @@ function virtualUser(env = {}, name = "JAVDB Guest", hasPassword = false) {
   };
 }
 
-function realJavdbLoginEnabled(env) {
-  return env?.REAL_JAVDB_LOGIN === "true" || env?.REAL_JAVDB_LOGIN === true;
-}
-
 async function storeSessionUser(env, token, username, deviceId = "") {
   if (!env?.PLAYBACK_KV) return;
   const key = `session-user:v1:${token}`;
   const value = { username, deviceId, updated: Date.now() };
   await env.PLAYBACK_KV.put(key, JSON.stringify(value));
-  // also store username index for lookup
-  await env.PLAYBACK_KV.put(`session-username:v1:${username}`, JSON.stringify({ tokens: [token] }));
 }
 
 async function lookupSessionUsername(env, token) {
@@ -516,10 +346,9 @@ async function lookupSessionUsername(env, token) {
 async function readPlaybackState(env, token) {
   if (!env?.PLAYBACK_KV) return {};
   let stateKey = `playback-state-v1:${token}`;
-  // if token is trusted, use username bucket
   const username = await lookupSessionUsername(env, token);
   if (username) {
-    stateKey = `playback-state-v1:u:${md5(username)}`;
+    stateKey = `playback-state-v1:u:${md5hex(username)}`;
   }
   const state = await env.PLAYBACK_KV.get(stateKey, "json");
   return state || {};
@@ -530,7 +359,7 @@ async function writePlaybackState(env, state, token) {
   let stateKey = `playback-state-v1:${token}`;
   const username = await lookupSessionUsername(env, token);
   if (username) {
-    stateKey = `playback-state-v1:u:${md5(username)}`;
+    stateKey = `playback-state-v1:u:${md5hex(username)}`;
   }
   await env.PLAYBACK_KV.put(stateKey, JSON.stringify(state));
 }
@@ -551,6 +380,7 @@ function attachPlaybackUserData(item, userDataState) {
 }
 
 function mapMovie(movie, requestUrl, env, parentId = PLAYABLE_LIBRARY_ID) {
+  // 优先使用 full_title，避免标题被截断
   const title = movie.full_title || movie.title || movie.name || movie.number || "未知影片";
   const id = movie.number || movie.id || "unknown";
   const year = movie.year || "";
@@ -585,7 +415,6 @@ function mapMovie(movie, requestUrl, env, parentId = PLAYABLE_LIBRARY_ID) {
       IsFavorite: false,
     },
     Path: poster ? `/emby-media/?url=${encodeURIComponent(poster)}` : "",
-    // additional fields for playback
     can_play: movie.can_play || false,
     sourceUrl: movie.sourceUrl || "",
     sourceType: movie.sourceType || "",
@@ -600,10 +429,7 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
   const height = Number(video.quality || 0);
   const width = height > 0 ? Math.round((height * 16) / 9 / 2) * 2 : undefined;
   const streamUrl = new URL(
-    publicRoutePath(
-      requestUrl,
-      `/Videos/${encodeURIComponent(item.Id)}/stream.${container}`,
-    ),
+    "/emby" + `/Videos/${encodeURIComponent(item.Id)}/stream.${container}`,
     requestUrl,
   );
   streamUrl.searchParams.set("api_key", token);
@@ -839,7 +665,7 @@ async function authenticate(request, env, fetchImpl) {
     return errorResponse(401, "Username is required");
   }
 
-  // 用户名存在但密码为空 -> 拒绝登录
+  // 用户名存在但密码为空 -> 拒绝登录（必须输入密码）
   if (username && !password) {
     return errorResponse(401, "密码不能为空");
   }
@@ -866,14 +692,14 @@ async function authenticate(request, env, fetchImpl) {
       const token = String(data?.token || "");
       const realUsername = String(data?.user?.username || data?.username || username);
       if (token) {
-        await storeSessionUser(env, token, realUsername, "", { trusted: true, javdbToken: token });
+        await storeSessionUser(env, token, realUsername, "");
         const embyToken = "emby-" + md5hex(realUsername + Date.now());
-        await storeSessionUser(env, embyToken, realUsername, "", { trusted: true });
-        return authenticationResponse(request, env, virtualUser(env, realUsername), embyToken);
+        await storeSessionUser(env, embyToken, realUsername, "");
+        return authenticationResponse(request, env, virtualUser(env, realUsername, true), embyToken);
       }
       const fallbackToken = "emby-" + md5hex(username + Date.now());
       await storeSessionUser(env, fallbackToken, username);
-      return authenticationResponse(request, env, virtualUser(env, username), fallbackToken);
+      return authenticationResponse(request, env, virtualUser(env, username, true), fallbackToken);
     } catch (error) {
       return errorResponse(401, "JavDB 账号或密码错误");
     }
@@ -882,7 +708,7 @@ async function authenticate(request, env, fetchImpl) {
   // 默认：本地信任登录（任何用户名+非空密码都通过）
   const embyToken = "session-" + username + "-" + Date.now();
   await storeSessionUser(env, embyToken, username);
-  return authenticationResponse(request, env, virtualUser(env, username), embyToken);
+  return authenticationResponse(request, env, virtualUser(env, username, true), embyToken);
 }
 
 function authenticationResponse(request, env, user, token) {
@@ -891,7 +717,7 @@ function authenticationResponse(request, env, user, token) {
     User: user,
     SessionInfo: {
       Id: sessionId,
-      UserId: USER_ID,
+      UserId: user.Id,
       UserName: user.Name,
       ServerId: serverId(env),
       Client: "Emby Compatible",
@@ -970,10 +796,9 @@ async function userForRequest(request, url, env) {
 async function apiToken(token, env) {
   if (!token) return "";
   if (token === guestToken(env)) return "";
-  // Check if token is a trusted session token
   const username = await lookupSessionUsername(env, token);
-  if (username) return ""; // local token, not for upstream
-  return token; // assume it's a real JavDB token
+  if (username) return "";
+  return token;
 }
 
 async function javdbRequest(path, env, fetchImpl, options = {}) {
@@ -1018,6 +843,15 @@ async function javdbRequest(path, env, fetchImpl, options = {}) {
   } catch {
     return { data: text };
   }
+}
+
+function moviesFromPayload(payload) {
+  if (!payload) return [];
+  if (payload.data?.movies) return payload.data.movies;
+  if (payload.movies) return payload.movies;
+  if (payload.data && Array.isArray(payload.data)) return payload.data;
+  if (Array.isArray(payload)) return payload;
+  return [];
 }
 
 async function getMovie(id, env, fetchImpl, token = "") {
@@ -1421,7 +1255,10 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   const itemMatch = path.match(/^\/Items\/([^/]+)$/i);
   if (itemMatch) {
     try {
-      return await itemResponse(decodeURIComponent(itemMatch[1]), request, env, fetchImpl, token);
+      const movie = await getMovie(decodeURIComponent(itemMatch[1]), env, fetchImpl, token);
+      if (!movie) return errorResponse(404, "Movie not found");
+      const item = mapMovie(movie, request.url, env);
+      return jsonResponse(item);
     } catch (error) {
       return errorResponse(502, error instanceof Error ? error.message : "Movie metadata unavailable");
     }
