@@ -1,225 +1,294 @@
-// ============================================================
-// bb_javdb - Cloudflare Worker for Emby/JavDB bridge
-// ============================================================
-
-const USER_ID = "bbjavdb-user";
+const DEFAULT_API_ORIGIN = "https://jdforrepam.com/api";
+const DEFAULT_UPSTREAM_ORIGIN = "https://catembylegacy.fastcdn.dpdns.org";
+const DEFAULT_RESOLVER_ORIGIN = "https://javstrm.emby-59f.workers.dev";
+const SIGNATURE_KEY = "lpw6vgqzsp";
+const SIGNATURE_SECRET =
+  "71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa";
 const ROOT_ID = "bbjavdb-root";
-const CHINESE_PLAYABLE_LIBRARY_ID = "javdb-chinese";
-const JAVDB_LIBRARY_ID = "javdb-all";
+const PLAYABLE_LIBRARY_ID = "bbjavdb-playable";
+const CHINESE_PLAYABLE_LIBRARY_ID = "bbjavdb-chinese-playable";
+const USER_ID = "bbjavdb-user";
+const PRODUCT_NAME = "月影emby";
 const DEFAULT_GUEST_TOKEN = "bbjavdb-guest";
-const HOME_SOURCE_PAGE_SIZE = 40;
-const HOME_MAX_SOURCE_PAGES = 8;
-const PLAYBACK_MAX_RESUME_ITEMS = 12;
-const PLAYBACK_STATE_KEY = "playback-state-v1";
-const SESSION_USER_KEY_PREFIX = "session-user:v1:";
-
-// 库定义（客户端侧边栏显示的媒体库）
 const LIBRARIES = [
   {
-    id: CHINESE_PLAYABLE_LIBRARY_ID,
-    name: "中文番号",
-    sourceFilter: "chinese",
-    matches: (movie) => {
-      // 有中文字幕或中文标题
-      return !!(movie?.cn_title || movie?.has_chinese_subtitle);
-    },
+    id: PLAYABLE_LIBRARY_ID,
+    name: "可播放",
+    sourceFilter: "can_play",
+    matches: (movie) => Boolean(movie?.can_play),
   },
   {
-    id: JAVDB_LIBRARY_ID,
-    name: "全部番号",
-    sourceFilter: "",
-    matches: () => true,
+    id: CHINESE_PLAYABLE_LIBRARY_ID,
+    name: "中文可播放",
+    sourceFilter: "subtitle",
+    matches: (movie) => isPlayableChinese(movie),
   },
 ];
 
-// 允许的 Emby 路由前缀
-const HANDLED_PATHS = [
-  "/System",
-  "/Branding",
-  "/Startup",
-  "/Users",
-  "/UserViews",
-  "/Library",
-  "/Sessions",
-  "/DisplayPreferences",
-  "/Items",
-  "/Shows",
-  "/Genres",
-  "/Studios",
-  "/Persons",
-  "/Videos",
+const MEDIA_HOSTS = new Set([
+  "fast-stream.jav.si",
+  "jdforrepam.com",
+  "tp.spfcas.com",
+  "h1.gzankun.com",
+]);
+const MEDIA_SUFFIXES = [".spfcas.com", ".gzankun.com"];
+const INLINE_HLS_CONTENT_TYPES = new Set([
+  "application/mpegurl",
+  "application/vnd.apple.mpegurl",
+  "application/x-mpegurl",
+]);
+const MAX_INLINE_HLS_LENGTH = 2_000_000;
+const HOME_SOURCE_PAGE_SIZE = 50;
+const HOME_MAX_SOURCE_PAGES = 12;
+const IMAGE_CONTENT_TYPES = new Map([
+  [".avif", "image/avif"],
+  [".gif", "image/gif"],
+  [".jpeg", "image/jpeg"],
+  [".jpg", "image/jpeg"],
+  [".png", "image/png"],
+  [".webp", "image/webp"],
+]);
+const IMAGE_SIGNATURES = [
+  { contentType: "image/jpeg", bytes: [0xff, 0xd8, 0xff] },
+  { contentType: "image/png", bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] },
+  { contentType: "image/gif", bytes: [0x47, 0x49, 0x46, 0x38, 0x37, 0x61] },
+  { contentType: "image/gif", bytes: [0x47, 0x49, 0x46, 0x38, 0x39, 0x61] },
+  { contentType: "image/bmp", bytes: [0x42, 0x4d] },
 ];
 
-// 简单的浏览器页面拦截（返回 404 给浏览器访问）
-function browserPageBlocked(request) {
-  const ua = request.headers.get("user-agent") || "";
+function add32(...values) {
+  return values.reduce((sum, value) => (sum + value) | 0, 0);
+}
+
+function rotateLeft(value, amount) {
+  return (value << amount) | (value >>> (32 - amount));
+}
+
+function littleEndianHex(value) {
+  const unsigned = value >>> 0;
+  let result = "";
+  for (let index = 0; index < 4; index += 1) {
+    result += (`0${((unsigned >>> (index * 8)) & 255).toString(16)}`).slice(-2);
+  }
+  return result;
+}
+
+function md5(value) {
+  const bytes = new TextEncoder().encode(value);
+  const blockLength = (((bytes.length + 8) >>> 6) + 1) * 16;
+  const words = new Int32Array(blockLength);
+
+  for (let index = 0; index < bytes.length; index += 1) {
+    words[index >>> 2] |= bytes[index] << ((index & 3) * 8);
+  }
+
+  words[bytes.length >>> 2] |= 0x80 << ((bytes.length & 3) * 8);
+  const bitLength = bytes.length * 8;
+  words[blockLength - 2] = bitLength;
+  words[blockLength - 1] = Math.floor(bitLength / 4294967296);
+
+  const shifts = [
+    [7, 12, 17, 22],
+    [5, 9, 14, 20],
+    [4, 11, 16, 23],
+    [6, 10, 15, 21],
+  ];
+  const constants = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+    0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+    0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+    0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+    0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+    0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+  ];
+
+  let a = 0x67452301 | 0;
+  let b = 0xefcdab89 | 0;
+  let c = 0x98badcfe | 0;
+  let d = 0x10325476 | 0;
+
+  for (let offset = 0; offset < blockLength; offset += 16) {
+    const originalA = a;
+    const originalB = b;
+    const originalC = c;
+    const originalD = d;
+
+    for (let index = 0; index < 64; index += 1) {
+      let functionValue;
+      let wordIndex;
+      let round;
+
+      if (index < 16) {
+        functionValue = (b & c) | (~b & d);
+        wordIndex = index;
+        round = 0;
+      } else if (index < 32) {
+        functionValue = (d & b) | (~d & c);
+        wordIndex = (5 * index + 1) % 16;
+        round = 1;
+      } else if (index < 48) {
+        functionValue = b ^ c ^ d;
+        wordIndex = (3 * index + 5) % 16;
+        round = 2;
+      } else {
+        functionValue = c ^ (b | ~d);
+        wordIndex = (7 * index) % 16;
+        round = 3;
+      }
+
+      const shifted = (functionValue + a + constants[index] + words[offset + wordIndex]) | 0;
+      const rotated = (rotateLeft(shifted, shifts[round][index % 4]) + b) | 0;
+      a = d;
+      d = c;
+      c = b;
+      b = rotated;
+    }
+
+    a = add32(originalA, a);
+    b = add32(originalB, b);
+    c = add32(originalC, c);
+    d = add32(originalD, d);
+  }
+
+  return littleEndianHex(a) + littleEndianHex(b) + littleEndianHex(c) + littleEndianHex(d);
+}
+
+function serverId(env) {
+  const id = env?.SERVER_ID || "bbjavdb";
+  return id;
+}
+
+function isPlayableChinese(movie) {
+  if (!movie) return false;
+  const hasPlayable = Boolean(movie.can_play);
+  const hasChineseSub = movie.subtitles?.some((sub) => sub.language === "chi" || sub.language === "zho");
+  return hasPlayable && hasChineseSub;
+}
+
+function moviesFromPayload(payload) {
+  const data = payload?.data || payload || {};
+  const list = data.items || data.movies || data.results || [];
+  if (!Array.isArray(list)) return [];
+  return list;
+}
+
+function normalizeClientPath(path) {
+  const normalized = path.replace(/^\/emby\//i, "/").replace(/^\/emby$/i, "/");
+  return normalized;
+}
+
+function routePath(url) {
+  const pathname = new URL(url).pathname;
+  return normalizeClientPath(pathname);
+}
+
+function isHandledPath(path) {
+  const handledPrefixes = [
+    "/System/",
+    "/Branding/",
+    "/Startup/",
+    "/Users/",
+    "/UserViews",
+    "/Library/",
+    "/Sessions/",
+    "/DisplayPreferences/",
+    "/Items/",
+    "/Shows/",
+    "/Genres",
+    "/Studios",
+    "/Persons",
+    "/SearchHints",
+    "/Videos/",
+    "/emby-media/",
+    "/LiveTv/",
+    "/Channels",
+    "/Trailers",
+    "/Artists/",
+    "/Suggestions",
+    "/PlaybackInfo",
+    "/Download",
+    "/Subtitles",
+  ];
+  const exactPaths = ["/"];
+  if (exactPaths.includes(path)) return true;
+  if (path === "/" || path === "/emby") return true;
+  return handledPrefixes.some((prefix) => path.startsWith(prefix) || path === prefix);
+}
+
+function isEmbyClientRequest(request) {
   const accept = request.headers.get("accept") || "";
-  // 如果 User-Agent 包含浏览器特征，且 Accept 包含 text/html，就认为是浏览器访问
-  if (/Mozilla|Chrome|Safari|Firefox|Edge/i.test(ua) && /text\/html/.test(accept)) {
-    const url = new URL(request.url);
-    // 不拦截 /emby 根路径（Emby 客户端可能也用浏览器 UA）
-    if (url.pathname === "/" || url.pathname === "/emby") return false;
-    return true;
+  const userAgent = request.headers.get("user-agent") || "";
+  if (accept.includes("json") || accept.includes("emby")) return true;
+  if (userAgent.includes("Emby") || userAgent.includes("JavDB")) return true;
+  return false;
+}
+
+function browserPageBlocked(request) {
+  const userAgent = request.headers.get("user-agent") || "";
+  const accept = request.headers.get("accept") || "";
+  if (accept.includes("text/html") && !accept.includes("json") && !accept.includes("emby")) {
+    if (userAgent.includes("Mozilla") || userAgent.includes("Chrome") || userAgent.includes("Safari")) {
+      return true;
+    }
   }
   return false;
 }
 
 function notFoundPage() {
-  return new Response("Not Found", { status: 404 });
-}
-
-// 解析路由路径：/emby/xxx -> /xxx，兼容 /emby 前缀
-function routePath(requestUrl) {
-  const url = new URL(requestUrl);
-  let path = url.pathname;
-  if (path.startsWith("/emby")) {
-    path = path.slice(5) || "/";
-  }
-  return path;
-}
-
-function normalizeClientPath(path) {
-  // 移除末尾的 / 除非是根
-  if (path !== "/" && path.endsWith("/")) {
-    path = path.slice(0, -1);
-  }
-  return path;
-}
-
-function isHandledPath(path) {
-  return HANDLED_PATHS.some((prefix) => path === prefix || path.startsWith(prefix + "/"));
-}
-
-function isEmbyClientRequest(request) {
-  const ua = request.headers.get("user-agent") || "";
-  return /Emby|Jellyfin|MediaBrowser/i.test(ua);
-}
-
-// 从请求中提取 token（Authorization 头或 URL 参数）
-function getToken(request, url) {
-  const auth = request.headers.get("authorization") || "";
-  const match = auth.match(/MediaBrowser\s+Token=([^,\s]+)/i);
-  if (match) return match[1];
-  const tokenParam = url?.searchParams?.get("api_key") || "";
-  if (tokenParam) return tokenParam;
-  // 也支持 X-Emby-Token
-  const xToken = request.headers.get("x-emby-token") || "";
-  if (xToken) return xToken;
-  return "";
-}
-
-function guestToken(env) {
-  return String(env.EMBY_GUEST_TOKEN || DEFAULT_GUEST_TOKEN);
-}
-
-// 默认“本地信任登录”：不要求真实 JavDB 账号，任意用户名都能登录成功。
-// 只有显式设置 EMBY_REAL_JAVDB_LOGIN=true 时，才回到“必须真实 JavDB 账号验证”。
-function realJavdbLoginEnabled(env) {
-  const value = String(env.EMBY_REAL_JAVDB_LOGIN ?? "false").trim().toLowerCase();
-  return ["1", "true", "yes", "on"].includes(value);
-}
-
-function guestAccessEnabled(env) {
-  const value = String(env.EMBY_GUEST_ACCESS ?? "true").trim().toLowerCase();
-  return ["1", "true", "yes", "on"].includes(value);
-}
-
-// 用户信息结构（供 Emby 客户端展示）
-function virtualUser(env, username = "JAVDB Guest") {
-  return {
-    Name: username,
-    Id: USER_ID,
-    ServerId: serverId(env),
-    HasPassword: true,
-    HasConfiguredPassword: true,
-    HasConfiguredEasyPassword: false,
-    EnableAutoLogin: false,
-    LastLoginDate: new Date().toISOString(),
-    DateCreated: new Date().toISOString(),
-    ConnectLinkType: "None",
-    Policy: {
-      IsAdministrator: false,
-      IsHidden: true,
-      IsDisabled: false,
-      EnableAllDevices: true,
-      EnableAllChannels: true,
-      EnableAllFolders: true,
-      EnableRemoteAccess: true,
-      EnableSyncTranscoding: false,
-      EnableMediaPlayback: true,
-      EnableAudioPlaybackTranscoding: false,
-      EnableVideoPlaybackTranscoding: false,
-      EnableContentDownloading: false,
-      EnableContentUploading: false,
-      EnableSubtitleDownloading: true,
-      EnableSubtitleManagement: false,
-      EnableLiveTvManagement: false,
-      EnableLiveTvAccess: false,
-      EnableCollectionManagement: false,
-      EnableSharedDeviceControl: false,
-      EnablePublicSharing: false,
-      EnableRemoteControlOfOtherUsers: false,
-      BlockedChannels: [],
-      BlockedMediaFolders: [],
-      BlockedTags: [],
-      MaxParentalRating: 0,
-      MaxActiveSessions: 0,
-      InvalidLoginAttemptCount: 0,
-      LoginAttemptsBeforeLockout: -1,
-      EnableUserPreferenceAccess: true,
-    },
-  };
-}
-
-function serverId(env) {
-  return env.EMBY_SERVER_ID || "bbjavdb-server";
+  return new Response("404 Not Found", { status: 404, headers: { "content-type": "text/plain" } });
 }
 
 function jsonResponse(value, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(value), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-      "access-control-allow-origin": "*",
-      ...extraHeaders,
-    },
-  });
+  const headers = new Headers(extraHeaders);
+  headers.set("content-type", "application/json");
+  headers.set("access-control-allow-origin", "*");
+  return new Response(JSON.stringify(value), { status, headers });
 }
 
 function errorResponse(status, message) {
-  return jsonResponse({
-    error: message,
-    ErrorCode: status === 401 ? "Unauthorized" : "UnknownError",
-    Message: message,
-  }, status);
+  return jsonResponse({ Error: message }, status);
 }
 
 function noContentResponse() {
-  return new Response(null, { status: 204 });
+  return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*" } });
 }
 
 function emptyItemQuery() {
   return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
 }
 
-function itemQuery(items, startIndex = 0) {
-  return {
-    Items: items,
-    TotalRecordCount: items.length,
-    StartIndex: startIndex,
-  };
+function itemQuery(items) {
+  return { Items: items, TotalRecordCount: items.length, StartIndex: 0 };
+}
+
+function publicRoutePath(requestUrl, relativePath) {
+  const url = new URL(requestUrl);
+  const base = url.origin;
+  return new URL(relativePath, base).toString();
 }
 
 function libraryView(library, env) {
   return {
     Name: library.name,
     Id: library.id,
-    CollectionType: "movies",
     ServerId: serverId(env),
-    Path: library.id,
-    Locations: [],
-    PrimaryImageAspectRatio: 2 / 3,
+    Type: "CollectionFolder",
+    CollectionType: "movies",
+    LocationType: "Virtual",
+    ImageTags: {},
+    PrimaryImageAspectRatio: 1.333,
+    IsFolder: true,
+    ChildCount: 0,
   };
 }
 
@@ -227,485 +296,249 @@ function virtualFolder(library) {
   return {
     Name: library.name,
     Id: library.id,
+    Type: "CollectionFolder",
     CollectionType: "movies",
-    PrimaryImageAspectRatio: 2 / 3,
-    Locations: [],
-    RefreshStatus: "Idle",
+    LocationType: "Virtual",
   };
 }
 
 function displayPreferences(url) {
+  const theme = url.searchParams.get("theme") || "dark";
   return {
     Id: "usersettings",
-    ViewType: "Poster",
+    ViewType: "List",
     SortBy: "SortName",
     SortOrder: "Ascending",
-    GroupItemsIntoCollections: false,
     ShowBackdrop: true,
-    ShowSidebar: true,
-    ShowPlayedIndicator: true,
-    ShowUnplayedIndicator: true,
-    ShowProgressBar: true,
-    ShowStatusIndicator: true,
+    SkipForwardLength: 30000,
+    HomeSectionOrder: [],
+    CustomPrefs: {
+      dashboardtheme: theme,
+      displaymissingepisodes: "false",
+    },
   };
 }
 
 function rootItem(env) {
   return {
-    Name: "Media Library",
+    Name: PRODUCT_NAME,
+    SortName: PRODUCT_NAME,
+    ServerId: serverId(env),
     Id: ROOT_ID,
-    ServerId: serverId(env),
-    IsFolder: true,
-    Type: "CollectionFolder",
-    CollectionType: "movies",
-    Path: ROOT_ID,
-    Locations: [],
+    Guid: ROOT_ID,
+    Type: "Folder",
     ChildCount: LIBRARIES.length,
-  };
-}
-
-// ---------- 播放状态（KV 存储） ----------
-function playbackKv(env) {
-  return env.PLAYBACK_KV || null;
-}
-
-// 获取 token 对应的存储键
-function playbackStateKey(token) {
-  // 如果 token 为空或是 guest token，用全局键
-  if (!token || token === DEFAULT_GUEST_TOKEN || token === "bbjavdb-guest") {
-    return PLAYBACK_STATE_KEY;
-  }
-  // 用 md5 对 token 做哈希，避免特殊字符
-  return PLAYBACK_STATE_KEY + ":" + md5hex(token);
-}
-
-// 获取用户名对应的存储键（用于按用户名分桶）
-function userPlaybackStateKey(username) {
-  if (!username || username === "JAVDB Guest") {
-    return PLAYBACK_STATE_KEY;
-  }
-  return PLAYBACK_STATE_KEY + ":u:" + md5hex(username);
-}
-
-// 获取 token -> 用户名 映射键
-function sessionUserKey(token) {
-  return SESSION_USER_KEY_PREFIX + md5hex(token);
-}
-
-// MD5 简单实现（用于键名哈希）
-function md5hex(str) {
-  // 使用 Crypto API（Worker 环境）
-  const encoder = new TextEncoder();
-  const data = encoder.encode(str);
-  const hash = crypto.subtle.digestSync("MD5", data);
-  return Array.from(new Uint8Array(hash))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-// 从 KV 读取播放状态（优先按用户名分桶，其次按 token 回退）
-async function readPlaybackState(env, token) {
-  const kv = playbackKv(env);
-  if (!kv) return {};
-
-  // 1. 尝试通过 token 查用户名
-  const sessionKey = sessionUserKey(token);
-  let username = null;
-  try {
-    const recordRaw = await kv.get(sessionKey, "json");
-    if (recordRaw && recordRaw.username) {
-      username = recordRaw.username;
-    }
-  } catch {
-    // ignore
-  }
-
-  // 2. 如果有用户名，优先读用户名桶
-  if (username) {
-    const key = userPlaybackStateKey(username);
-    try {
-      const data = await kv.get(key, "json");
-      if (data && typeof data === "object") return data;
-    } catch {
-      // ignore
-    }
-  }
-
-  // 3. 回退到 per-token 桶
-  const fallbackKey = playbackStateKey(token);
-  try {
-    const data = await kv.get(fallbackKey, "json");
-    if (data && typeof data === "object") return data;
-  } catch {
-    // ignore
-  }
-
-  return {};
-}
-
-// 写入播放状态（按用户名分桶，同时保留 per-token 兼容）
-async function writePlaybackState(env, state, token) {
-  const kv = playbackKv(env);
-  if (!kv) return;
-
-  // 1. 尝试通过 token 查用户名
-  const sessionKey = sessionUserKey(token);
-  let username = null;
-  try {
-    const recordRaw = await kv.get(sessionKey, "json");
-    if (recordRaw && recordRaw.username) {
-      username = recordRaw.username;
-    }
-  } catch {
-    // ignore
-  }
-
-  // 2. 如果有用户名，写入用户名桶
-  if (username) {
-    const key = userPlaybackStateKey(username);
-    await kv.put(key, JSON.stringify(state));
-  }
-
-  // 3. 同时写入 per-token 桶（兼容旧客户端）
-  const tokenKey = playbackStateKey(token);
-  await kv.put(tokenKey, JSON.stringify(state));
-}
-
-// 存储 token -> 用户名 映射
-async function storeSessionUser(env, token, username, deviceId = "", extra = {}) {
-  const kv = playbackKv(env);
-  if (!kv || !token || !username) return;
-  try {
-    const record = { username: String(username), at: Date.now() };
-    if (deviceId) {
-      record.deviceId = String(deviceId);
-    }
-    if (extra && extra.trusted) {
-      record.trusted = true;
-    }
-    await kv.put(sessionUserKey(token), JSON.stringify(record));
-  } catch (error) {
-    // 静默失败，不影响主流程
-  }
-}
-
-// 设备绑定检查（限制 token 跨设备使用）
-async function deviceBindingFailure(request, url, env, path) {
-  // 登录/切换账号的请求不应被旧 token 的设备绑定拦住
-  if (path === "/Users/AuthenticateByName") {
-    return null;
-  }
-  const token = getToken(request, url);
-  if (!token || token === guestToken(env)) {
-    return null;
-  }
-  const kv = playbackKv(env);
-  if (!kv) return null;
-  const sessionKey = sessionUserKey(token);
-  let record = null;
-  try {
-    record = await kv.get(sessionKey, "json");
-  } catch {
-    return null;
-  }
-  if (!record || !record.deviceId) return null;
-  // 从请求中提取 deviceId（Emby 客户端会传 DeviceId 头）
-  const clientDeviceId = request.headers.get("x-emby-deviceid") || request.headers.get("device-id") || "";
-  if (!clientDeviceId) return null;
-  if (record.deviceId !== clientDeviceId) {
-    // 设备不匹配，返回 401 并要求重新登录
-    return errorResponse(401, "This token is bound to another device. Please re-login.");
-  }
-  return null;
-}
-
-// ---------- 用户信息获取（按 token 反查用户名） ----------
-async function userForRequest(request, url, env) {
-  const token = getToken(request, url);
-  if (!token || token === guestToken(env)) {
-    return virtualUser(env);
-  }
-  // 查映射表
-  const kv = playbackKv(env);
-  if (kv) {
-    try {
-      const record = await kv.get(sessionUserKey(token), "json");
-      if (record && record.username) {
-        return virtualUser(env, record.username);
-      }
-    } catch {
-      // ignore
-    }
-  }
-  // 没找到映射，返回 guest
-  return virtualUser(env);
-}
-
-// ---------- JavDB API 调用 ----------
-function apiOrigin(env) {
-  return String(env.API_BASE || "https://api.javdb.com");
-}
-
-// JavDB 请求签名（MD5 时间戳）
-function createJavdbSignature() {
-  const ts = Math.floor(Date.now() / 1000);
-  const key = "javdb_emby_bridge_secret"; // 固定密钥
-  const raw = `${ts}.${key}`;
-  const hash = md5hex(raw);
-  return `${ts}.${hash}`;
-}
-
-async function javdbRequest(path, env, fetchImpl, options = {}) {
-  const url = new URL(`${apiOrigin(env)}${path}`);
-  if (options.query) {
-    for (const [k, v] of Object.entries(options.query)) {
-      if (v !== undefined && v !== null && v !== "") {
-        url.searchParams.set(k, String(v));
-      }
-    }
-  }
-  const headers = new Headers(options.headers || {});
-  headers.set("accept", "application/json");
-  headers.set("user-agent", "bb-javdb-emby-bridge/1.0");
-  headers.set("jdsignature", createJavdbSignature());
-  if (options.token) {
-    headers.set("authorization", `Bearer ${options.token}`);
-  }
-  const body = options.body || undefined;
-  const res = await fetchImpl(url.toString(), {
-    method: options.method || "GET",
-    headers,
-    body,
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`JavDB API error ${res.status}: ${text.slice(0, 200)}`);
-  }
-  const data = await res.json();
-  return data;
-}
-
-// 从 JavDB 返回体中提取影片列表
-function moviesFromPayload(payload) {
-  if (!payload) return [];
-  const data = payload.data || payload;
-  if (Array.isArray(data)) return data;
-  if (Array.isArray(data?.movies)) return data.movies;
-  if (Array.isArray(data?.list)) return data.list;
-  if (Array.isArray(data?.items)) return data.items;
-  return [];
-}
-
-// 影片映射到 Emby 格式
-function mapMovie(movie, baseUrl, env, parentId = CHINESE_PLAYABLE_LIBRARY_ID) {
-  const id = String(movie.id || movie.number || "");
-  const title = movie.full_title || movie.title || movie.number || id;
-  const year = movie.year || "";
-  const overview = movie.description || movie.overview || "";
-  const cover = movie.cover || movie.poster || "";
-  const number = movie.number || "";
-  const date = movie.date || movie.release_date || "";
-  const runtime = movie.runtime || 0;
-  const genres = movie.genres || [];
-  const actors = movie.actors || [];
-  const hasChinese = !!movie.cn_title || !!movie.has_chinese_subtitle;
-
-  const item = {
-    Id: id,
-    Name: title,
-    OriginalTitle: movie.title || "",
-    ServerId: serverId(env),
-    Container: "strm",
-    IsFolder: false,
-    Type: "Movie",
-    ProductionYear: year ? parseInt(year, 10) : 0,
-    PremiereDate: date || null,
-    Overview: overview,
-    Genres: genres,
-    Actors: actors.map((a) => ({
-      Name: typeof a === "string" ? a : a.name || "",
-      Id: "",
-      Role: "",
-    })),
-    Studios: [],
-    Tags: [],
-    ParentId: parentId,
-    Path: `${baseUrl}/emby/Videos/${encodeURIComponent(id)}/stream`,
-    MediaSources: [],
-    MediaStreams: [],
-    MediaSourceCount: 0,
-    HasSubtitles: false,
-    PlayAccess: "Full",
-    IndexNumber: null,
-    SortName: title,
-    PrimaryImageAspectRatio: 2 / 3,
-    ImageTags: {
-      Primary: cover ? `cover-${id}` : undefined,
-    },
-    BackdropImageTags: [],
+    DisplayPreferencesId: "usersettings",
+    IsFolder: true,
+    LocationType: "Virtual",
+    ImageTags: {},
     UserData: {
-      PlaybackPositionTicks: 0,
+      Played: false,
       PlayCount: 0,
       IsFavorite: false,
-      LastPlayedDate: null,
-      Played: false,
     },
   };
-
-  // 如果有封面 URL，存到 ExternalUrls 或 ImageTags
-  if (cover) {
-    item.ImageTags.Primary = `cover-${id}`;
-  }
-
-  // 额外字段（番号）
-  if (number) {
-    item.Number = number;
-  }
-  if (hasChinese) {
-    item.HasChineseSubtitle = true;
-  }
-
-  return item;
 }
 
-// 生成 MediaSource
-function mediaSource(item, baseUrl, token, video, subtitles = []) {
-  const id = item.Id;
-  const isHls = true; // 使用 HLS 流
-  const container = isHls ? "strm" : "mp4";
-  const path = `${baseUrl}/emby/Videos/${encodeURIComponent(id)}/stream?api_key=${token}`;
-
-  const streams = [];
-  // 视频流
-  streams.push({
-    Codec: "h264",
-    CodecTag: "avc1",
-    Language: "und",
-    DisplayLanguage: "Unknown",
-    DisplayTitle: "1080p",
-    Index: 0,
-    IsDefault: true,
-    IsForced: false,
-    IsExternal: false,
-    Type: "Video",
-    Width: 1920,
-    Height: 1080,
-    BitRate: 0,
-    AverageBitRate: 0,
-    IsInterlaced: false,
-    IsAVC: true,
-    IsAnamorphic: false,
-    PixelFormat: "yuv420p",
-    ReferenceFrames: 1,
-    Profile: "High",
-    Level: 4.0,
-    IsTextSubtitleStream: false,
-    SupportsExternalSubtitleStream: true,
-    DeliveryUrl: path,
-  });
-
-  // 音频流
-  streams.push({
-    Type: "Audio",
-    Codec: "aac",
-    CodecTag: "mp4a",
-    Language: "und",
-    DisplayLanguage: "Undetermined",
-    DisplayTitle: "AAC stereo",
-    Index: 1,
-    Channels: 2,
-    ChannelLayout: "stereo",
-    SampleRate: 48000,
-    IsDefault: true,
-    IsForced: false,
-    IsExternal: false,
-  });
-
-  // 字幕流
-  for (const sub of subtitles) {
-    streams.push({
-      Type: "Subtitle",
-      Codec: "srt",
-      Language: sub.language || "chi",
-      DisplayLanguage: sub.displayLanguage || "Chinese",
-      DisplayTitle: sub.displayTitle || "Chinese",
-      Index: streams.length,
-      IsDefault: false,
-      IsForced: false,
-      IsExternal: true,
-      DeliveryUrl: sub.url || "",
-    });
-  }
-
-  return {
-    Id: `source-${id}`,
-    Path: path,
-    Protocol: "Http",
-    Container: container,
-    Size: 0,
-    Name: "JavDB Stream",
-    IsRemote: true,
-    ETag: "",
-    RunTimeTicks: 0,
-    ReadAtNativeFramerate: false,
-    IgnoreDts: false,
-    IgnoreIndex: false,
-    GenPtsInput: false,
-    SupportsTranscoding: false,
-    SupportsDirectStream: true,
-    SupportsDirectPlay: true,
-    SupportsIsoImagePlayback: false,
-    RequiresOpening: false,
-    RequiresClosing: false,
-    RequiresLooping: false,
-    IsInfiniteStream: false,
-    SupportsProbing: false,
-    MediaStreams: streams,
-    MediaAttachments: [],
-    Formats: [],
-    Bitrate: 0,
-    RequiredHttpHeaders: {},
-    DefaultAudioStreamIndex: 1,
-  };
+function isMediaHost(host) {
+  if (MEDIA_HOSTS.has(host)) return true;
+  return MEDIA_SUFFIXES.some((suffix) => host.endsWith(suffix));
 }
 
-// ---------- 单部影片获取 ----------
-async function getMovie(id, env, fetchImpl, token = "") {
+function safeMediaUrl(input, env) {
+  if (!input) return null;
   try {
-    const payload = await javdbRequest(`/v4/movies/${id}`, env, fetchImpl, {
-      token: await apiToken(token, env),
-    });
-    const data = payload?.data || payload;
-    if (data && data.id) return data;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-// API Token 处理（真实 JavDB token 或空）
-async function apiToken(token, env) {
-  if (!token || token === guestToken(env) || token === DEFAULT_GUEST_TOKEN) {
-    return "";
-  }
-  // 如果有真实 token，直接返回
-  // 注意：这里不会自动生成，只有真实登录才会存
-  const kv = playbackKv(env);
-  if (!kv) return "";
-  try {
-    const record = await kv.get(sessionUserKey(token), "json");
-    if (record && record.trusted && record.javdbToken) {
-      return record.javdbToken;
+    const url = new URL(input);
+    if (isMediaHost(url.hostname)) {
+      return url;
     }
+    if (env?.ALLOWED_MEDIA_HOSTS) {
+      const allowed = new Set(env.ALLOWED_MEDIA_HOSTS.split(",").map((h) => h.trim()));
+      if (allowed.has(url.hostname)) return url;
+    }
+    return null;
   } catch {
-    // ignore
+    return null;
   }
+}
+
+function isInlineHls(playlist) {
+  if (!playlist) return false;
+  return INLINE_HLS_CONTENT_TYPES.has(playlist.contentType) && playlist.length < MAX_INLINE_HLS_LENGTH;
+}
+
+function resolveInlineHls(source, requestUrl, env) {
+  const commaIndex = source.indexOf(",");
+  if (commaIndex === -1 || commaIndex + 1 >= source.length) {
+    return null;
+  }
+
+  const metadata = source.slice(5, commaIndex).toLowerCase();
+  const contentType = metadata.split(";")[0];
+  if (!INLINE_HLS_CONTENT_TYPES.has(contentType)) {
+    return null;
+  }
+
+  try {
+    const payload = source.slice(commaIndex + 1);
+    const playlist = metadata.split(";").includes("base64")
+      ? new TextDecoder().decode(
+          Uint8Array.from(atob(payload), (character) => character.charCodeAt(0)),
+        )
+      : decodeURIComponent(payload);
+    return playlist.trimStart().startsWith("#EXTM3U") ? playlist : null;
+  } catch {
+    return null;
+  }
+}
+
+function getToken(request, url) {
+  const queryToken =
+    url.searchParams.get("api_key") ||
+    url.searchParams.get("AccessToken") ||
+    url.searchParams.get("token");
+  if (queryToken) return queryToken;
+
+  const authHeader = request.headers.get("x-emby-token") || request.headers.get("Authorization") || "";
+  if (authHeader.startsWith("Bearer ")) {
+    return authHeader.slice(7);
+  }
+  if (authHeader) return authHeader;
+
+  const cookie = request.headers.get("cookie") || "";
+  const cookieMatch = cookie.match(/(?:^|;)\s*emby_token=([^;]+)/);
+  if (cookieMatch) return cookieMatch[1];
+
   return "";
 }
 
-// ---------- Emby 响应组装 ----------
+function requestDeviceId(request) {
+  const fromHeader = request.headers.get("x-emby-device-id") || request.headers.get("x-device-id") || "";
+  if (fromHeader) return fromHeader;
+  const cookie = request.headers.get("cookie") || "";
+  const match = cookie.match(/(?:^|;)\s*device_id=([^;]+)/);
+  if (match) return match[1];
+  return "";
+}
+
+function deviceIdForToken(env, token) {
+  if (!token) return null;
+  return env.PLAYBACK_KV?.get(`device:v1:${token}`, "json") ?? null;
+}
+
+async function storeDeviceId(env, token, deviceId) {
+  if (!token || !deviceId) return;
+  await env.PLAYBACK_KV?.put(`device:v1:${token}`, JSON.stringify({ deviceId }));
+}
+
+async function deviceBindingFailure(request, url, env, path) {
+  if (!env?.PLAYBACK_KV) return null;
+  const token = getToken(request, url);
+  if (!token) return null;
+  const deviceId = requestDeviceId(request);
+  if (!deviceId) return null;
+  const bound = await deviceIdForToken(env, token);
+  if (!bound) {
+    await storeDeviceId(env, token, deviceId);
+    return null;
+  }
+  if (bound.deviceId === deviceId) return null;
+  return errorResponse(401, "Device not authorized for this token");
+}
+
+function guestAccessEnabled(env) {
+  return env?.GUEST_ACCESS !== "false" && env?.GUEST_ACCESS !== false;
+}
+
+function guestToken(env) {
+  return env?.GUEST_TOKEN || DEFAULT_GUEST_TOKEN;
+}
+
+function virtualUser(env = {}, name = "JAVDB Guest", hasPassword = false) {
+  const defaultName = guestAccessEnabled(env) ? "JAVDB Guest" : "JAVDB User";
+  return {
+    Name: name || defaultName,
+    Id: USER_ID,
+    ServerId: serverId(env),
+    HasPassword: hasPassword,
+    HasConfiguredPassword: hasPassword,
+    HasConfiguredEasyPassword: false,
+    EnableAutoLogin: false,
+    LastLoginDate: new Date().toISOString(),
+    LastActivityDate: new Date().toISOString(),
+    PrimaryImageTag: "",
+    Configuration: {
+      AudioLanguagePreference: "zh",
+      PlayDefaultAudioTrack: true,
+      SubtitleLanguagePreference: "zh",
+      DisplayMissingEpisodes: false,
+      GroupedFolders: [],
+      SubtitleMode: "Default",
+    },
+    Policy: {
+      IsAdministrator: false,
+      IsDisabled: false,
+      EnableRemoteAccess: true,
+      EnableLiveTvAccess: false,
+      EnableMediaPlayback: true,
+      EnableAudioPlaybackTranscoding: true,
+      EnableVideoPlaybackTranscoding: true,
+      EnableContentDownloading: true,
+      EnableContentUploading: false,
+      EnableAllDevices: true,
+      EnableAllChannels: true,
+      EnablePublicSharing: false,
+    },
+  };
+}
+
+function realJavdbLoginEnabled(env) {
+  return env?.REAL_JAVDB_LOGIN === "true" || env?.REAL_JAVDB_LOGIN === true;
+}
+
+async function storeSessionUser(env, token, username, deviceId = "") {
+  if (!env?.PLAYBACK_KV) return;
+  const key = `session-user:v1:${token}`;
+  const value = { username, deviceId, updated: Date.now() };
+  await env.PLAYBACK_KV.put(key, JSON.stringify(value));
+  // also store username index for lookup
+  await env.PLAYBACK_KV.put(`session-username:v1:${username}`, JSON.stringify({ tokens: [token] }));
+}
+
+async function lookupSessionUsername(env, token) {
+  if (!env?.PLAYBACK_KV || !token) return null;
+  const key = `session-user:v1:${token}`;
+  const record = await env.PLAYBACK_KV.get(key, "json");
+  if (record && record.username) return record.username;
+  return null;
+}
+
+async function readPlaybackState(env, token) {
+  if (!env?.PLAYBACK_KV) return {};
+  let stateKey = `playback-state-v1:${token}`;
+  // if token is trusted, use username bucket
+  const username = await lookupSessionUsername(env, token);
+  if (username) {
+    stateKey = `playback-state-v1:u:${md5(username)}`;
+  }
+  const state = await env.PLAYBACK_KV.get(stateKey, "json");
+  return state || {};
+}
+
+async function writePlaybackState(env, state, token) {
+  if (!env?.PLAYBACK_KV) return;
+  let stateKey = `playback-state-v1:${token}`;
+  const username = await lookupSessionUsername(env, token);
+  if (username) {
+    stateKey = `playback-state-v1:u:${md5(username)}`;
+  }
+  await env.PLAYBACK_KV.put(stateKey, JSON.stringify(state));
+}
+
 function attachPlaybackUserData(item, userDataState) {
-  const id = item.Id || "";
+  if (!userDataState) return item;
+  const id = item.Id || item.id;
+  if (!id) return item;
   const record = userDataState[id] || {};
   item.UserData = {
     PlaybackPositionTicks: record.positionTicks || 0,
@@ -715,6 +548,117 @@ function attachPlaybackUserData(item, userDataState) {
     Played: (record.positionTicks || 0) > 0,
   };
   return item;
+}
+
+function mapMovie(movie, requestUrl, env, parentId = PLAYABLE_LIBRARY_ID) {
+  const title = movie.full_title || movie.title || movie.name || movie.number || "未知影片";
+  const id = movie.number || movie.id || "unknown";
+  const year = movie.year || "";
+  const image = movie.poster || movie.image || movie.cover || "";
+  const images = movie.images || [];
+  const poster = image || (images.length > 0 ? images[0] : "");
+  const item = {
+    Name: title,
+    Id: id,
+    ServerId: serverId(env),
+    Guid: id,
+    Type: "Movie",
+    IsFolder: false,
+    LocationType: "Virtual",
+    MediaType: "Video",
+    ParentId: parentId,
+    ProductionYear: year ? Number(year) : null,
+    PremiereDate: year ? `${year}-01-01` : null,
+    Overview: movie.synopsis || movie.description || movie.plot || "",
+    Genres: movie.genres || [],
+    Tags: movie.tags || [],
+    Studios: movie.studio ? [{ Name: movie.studio }] : [],
+    People: [],
+    ImageTags: {
+      Primary: id,
+    },
+    BackdropImageTags: [],
+    PrimaryImageAspectRatio: 1.333,
+    UserData: {
+      Played: false,
+      PlayCount: 0,
+      IsFavorite: false,
+    },
+    Path: poster ? `/emby-media/?url=${encodeURIComponent(poster)}` : "",
+    // additional fields for playback
+    can_play: movie.can_play || false,
+    sourceUrl: movie.sourceUrl || "",
+    sourceType: movie.sourceType || "",
+  };
+  return item;
+}
+
+function mediaSource(item, requestUrl, token, video, subtitles = []) {
+  const isHls = /mpegurl|m3u8/i.test(video.sourceType || video.sourceUrl);
+  // 修改：M3U8 改为 STRM
+  const container = isHls ? "strm" : "mp4";
+  const height = Number(video.quality || 0);
+  const width = height > 0 ? Math.round((height * 16) / 9 / 2) * 2 : undefined;
+  const streamUrl = new URL(
+    publicRoutePath(
+      requestUrl,
+      `/Videos/${encodeURIComponent(item.Id)}/stream.${container}`,
+    ),
+    requestUrl,
+  );
+  streamUrl.searchParams.set("api_key", token);
+  streamUrl.searchParams.set("static", "true");
+  streamUrl.searchParams.set("mediaSourceId", item.Id);
+
+  const mediaStreams = [
+    {
+      Codec: "h264",
+      Type: "Video",
+      Index: 0,
+      IsDefault: true,
+      IsForced: false,
+      IsExternal: false,
+      Width: width || 1280,
+      Height: height || 720,
+      BitRate: 4000000,
+    },
+  ];
+  if (subtitles.length) {
+    for (let i = 0; i < subtitles.length; i++) {
+      const sub = subtitles[i];
+      mediaStreams.push({
+        Codec: "srt",
+        Type: "Subtitle",
+        Index: i + 1,
+        IsDefault: false,
+        IsForced: false,
+        IsExternal: true,
+        Language: sub.language || "chi",
+        DisplayLanguage: sub.displayLanguage || "Chinese",
+        DisplayTitle: sub.displayTitle || "Chinese",
+        DeliveryUrl: sub.url || "",
+      });
+    }
+  }
+
+  return {
+    Id: item.Id,
+    Path: streamUrl.toString(),
+    Protocol: "Http",
+    Container: container,
+    Size: 0,
+    SupportsDirectStream: true,
+    SupportsDirectPlay: true,
+    SupportsTranscoding: true,
+    SupportsProbing: false,
+    IsInfiniteStream: false,
+    IsRemote: false,
+    MediaStreams: mediaStreams,
+    Bitrate: 4000000,
+    VideoType: "VideoFile",
+    DefaultAudioStreamIndex: 0,
+    DefaultSubtitleStreamIndex: subtitles.length > 0 ? 1 : -1,
+  };
 }
 
 function itemResponse(item, env, token, requestUrl, video, subtitles) {
@@ -742,7 +686,6 @@ function itemResponse(item, env, token, requestUrl, video, subtitles) {
   return jsonResponse(item);
 }
 
-// ---------- 搜索/列表 ----------
 async function getMoviePage(query, env, fetchImpl, token = "") {
   const startIndex = Math.max(0, Number(query.get("StartIndex") || 0));
   const limit = Math.min(100, Math.max(1, Number(query.get("Limit") || 32)));
@@ -832,7 +775,6 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
   };
 }
 
-// ---------- 播放事件记录 ----------
 async function recordPlaybackEvent(path, request, env) {
   const url = new URL(request.url);
   const token = getToken(request, url);
@@ -867,7 +809,6 @@ async function recordPlaybackEvent(path, request, env) {
   await writePlaybackState(env, state, token);
 }
 
-// ---------- 认证 ----------
 async function authenticate(request, env, fetchImpl) {
   let input = {};
   try {
@@ -925,14 +866,11 @@ async function authenticate(request, env, fetchImpl) {
       const token = String(data?.token || "");
       const realUsername = String(data?.user?.username || data?.username || username);
       if (token) {
-        // 存储真实 token 到映射表
         await storeSessionUser(env, token, realUsername, "", { trusted: true, javdbToken: token });
-        // 生成 Emby 侧 token（用 username 哈希）
         const embyToken = "emby-" + md5hex(realUsername + Date.now());
         await storeSessionUser(env, embyToken, realUsername, "", { trusted: true });
         return authenticationResponse(request, env, virtualUser(env, realUsername), embyToken);
       }
-      // 登录成功但没有 token（罕见），回退
       const fallbackToken = "emby-" + md5hex(username + Date.now());
       await storeSessionUser(env, fallbackToken, username);
       return authenticationResponse(request, env, virtualUser(env, username), fallbackToken);
@@ -969,7 +907,6 @@ function authenticationResponse(request, env, user, token) {
   });
 }
 
-// ---------- 系统信息 ----------
 function systemInfo(requestUrl, env) {
   const url = new URL(requestUrl);
   const host = url.hostname;
@@ -1018,7 +955,163 @@ function systemInfo(requestUrl, env) {
   };
 }
 
-// ---------- 主请求入口 ----------
+async function userForRequest(request, url, env) {
+  const token = getToken(request, url);
+  const username = await lookupSessionUsername(env, token);
+  if (username) {
+    return virtualUser(env, username, true);
+  }
+  if (guestAccessEnabled(env)) {
+    return virtualUser(env);
+  }
+  return virtualUser(env, "JAVDB User", false);
+}
+
+async function apiToken(token, env) {
+  if (!token) return "";
+  if (token === guestToken(env)) return "";
+  // Check if token is a trusted session token
+  const username = await lookupSessionUsername(env, token);
+  if (username) return ""; // local token, not for upstream
+  return token; // assume it's a real JavDB token
+}
+
+async function javdbRequest(path, env, fetchImpl, options = {}) {
+  const base = env?.API_ORIGIN || DEFAULT_API_ORIGIN;
+  const url = new URL(path, base);
+  if (options.query) {
+    for (const [key, value] of Object.entries(options.query)) {
+      if (value !== undefined && value !== null) {
+        url.searchParams.set(key, String(value));
+      }
+    }
+  }
+
+  const headers = new Headers();
+  if (options.token) {
+    headers.set("authorization", `Bearer ${options.token}`);
+  }
+  if (options.method === "POST" && !(options.body instanceof FormData)) {
+    headers.set("content-type", "application/json");
+  }
+
+  const fetchOptions = {
+    method: options.method || "GET",
+    headers,
+    redirect: "follow",
+  };
+  if (options.body) {
+    if (options.body instanceof FormData) {
+      fetchOptions.body = options.body;
+    } else {
+      fetchOptions.body = JSON.stringify(options.body);
+    }
+  }
+
+  const res = await fetchImpl(url.toString(), fetchOptions);
+  if (!res.ok) {
+    throw new Error(`JavDB API error: ${res.status} ${res.statusText}`);
+  }
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { data: text };
+  }
+}
+
+async function getMovie(id, env, fetchImpl, token = "") {
+  const payload = await javdbRequest(`/v4/movies/${id}`, env, fetchImpl, {
+    token: await apiToken(token, env),
+  });
+  const movie = payload?.data || payload;
+  return movie;
+}
+
+async function resolveVideo(movie, env, fetchImpl) {
+  if (!movie) return null;
+  const sources = movie.sources || movie.videos || [];
+  if (sources.length === 0) return null;
+  const source = sources[0];
+  if (typeof source === "string") {
+    return { sourceUrl: source, sourceType: "m3u8" };
+  }
+  return { sourceUrl: source.url || source, sourceType: source.type || "m3u8" };
+}
+
+async function resolveSubtitles(movie, env, fetchImpl) {
+  if (!movie) return [];
+  const subs = movie.subtitles || [];
+  return subs.map((sub) => ({
+    url: sub.url || "",
+    language: sub.language || "chi",
+    displayLanguage: sub.displayLanguage || "Chinese",
+    displayTitle: sub.displayTitle || "Chinese",
+  }));
+}
+
+async function imageResponse(id, request, env, fetchImpl, token) {
+  const movie = await getMovie(id, env, fetchImpl, token);
+  if (!movie) return errorResponse(404, "Movie not found");
+  const image = movie.poster || movie.image || movie.cover || "";
+  if (!image) return errorResponse(404, "No image");
+  const url = safeMediaUrl(image, env);
+  if (!url) return errorResponse(403, "Invalid image URL");
+  const upstream = await fetchImpl(url.toString(), { redirect: "follow" });
+  const headers = new Headers();
+  for (const name of ["content-type", "content-length", "cache-control"]) {
+    const value = upstream.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  headers.set("access-control-allow-origin", "*");
+  return new Response(upstream.body, { status: upstream.status, headers });
+}
+
+async function streamResponse(id, request, env, fetchImpl, token) {
+  const movie = await getMovie(id, env, fetchImpl, token);
+  if (!movie) return errorResponse(404, "Movie not found");
+  const video = await resolveVideo(movie, env, fetchImpl);
+  if (!video) return errorResponse(404, "No video source");
+  const url = safeMediaUrl(video.sourceUrl, env);
+  if (!url) return errorResponse(403, "Invalid video URL");
+  const headers = new Headers();
+  const range = request.headers.get("range");
+  if (range) headers.set("range", range);
+  const upstream = await fetchImpl(url.toString(), {
+    method: request.method,
+    headers,
+    redirect: "follow",
+  });
+  const responseHeaders = new Headers();
+  for (const name of ["accept-ranges", "content-length", "content-range", "content-type"]) {
+    const value = upstream.headers.get(name);
+    if (value) responseHeaders.set(name, value);
+  }
+  responseHeaders.set("access-control-allow-origin", "*");
+  return new Response(request.method === "HEAD" ? null : upstream.body, {
+    status: upstream.status,
+    headers: responseHeaders,
+  });
+}
+
+async function subtitleResponse(id, subIndex, request, env, fetchImpl, token) {
+  const movie = await getMovie(id, env, fetchImpl, token);
+  if (!movie) return errorResponse(404, "Movie not found");
+  const subtitles = await resolveSubtitles(movie, env, fetchImpl);
+  if (subIndex >= subtitles.length) return errorResponse(404, "Subtitle not found");
+  const sub = subtitles[subIndex];
+  const url = safeMediaUrl(sub.url, env);
+  if (!url) return errorResponse(403, "Invalid subtitle URL");
+  const upstream = await fetchImpl(url.toString(), { redirect: "follow" });
+  const headers = new Headers();
+  for (const name of ["content-type", "content-length"]) {
+    const value = upstream.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  headers.set("access-control-allow-origin", "*");
+  return new Response(upstream.body, { status: upstream.status, headers });
+}
+
 export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   const url = new URL(request.url);
   if (browserPageBlocked(request)) {
@@ -1070,8 +1163,6 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     return jsonResponse({});
   }
   if (path === "/Users/Public") {
-    // 不返回任何“公开用户”：客户端会显示手动输入账号密码，
-    // 避免它把 JAVDB Guest 当作用户名发给上游而报“账号不存在”。
     return jsonResponse([]);
   }
   if (path === "/Users") {
@@ -1243,7 +1334,6 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     return jsonResponse(userDataState[userDataItemId] || {});
   }
 
-  // 视频播放请求
   const videoMatch = path.match(/^\/Videos\/([^/]+)\/stream$/i);
   if (videoMatch) {
     const id = decodeURIComponent(videoMatch[1]);
@@ -1253,7 +1343,6 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
         return errorResponse(404, "Movie not found");
       }
       const item = mapMovie(movie, request.url, env);
-      // 尝试获取字幕
       const subtitles = [];
       try {
         const subPayload = await javdbRequest(`/v4/movies/${id}/subtitles`, env, fetchImpl, {
@@ -1279,7 +1368,121 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     }
   }
 
-  // 未匹配的 Emby 请求
+  const imageMatch = path.match(/^\/Items\/([^/]+)\/Images\/Primary$/i);
+  if (imageMatch) {
+    try {
+      return await imageResponse(decodeURIComponent(imageMatch[1]), request, env, fetchImpl, token);
+    } catch (error) {
+      return errorResponse(502, error instanceof Error ? error.message : "Movie image unavailable");
+    }
+  }
+
+  const playbackMatch = path.match(/^\/Items\/([^/]+)\/PlaybackInfo$/i);
+  if (playbackMatch) {
+    try {
+      const movie = await getMovie(decodeURIComponent(playbackMatch[1]), env, fetchImpl, token);
+      const item = mapMovie(movie, request.url, env);
+      const [video, subtitles] = await Promise.all([
+        resolveVideo(movie, env, fetchImpl),
+        resolveSubtitles(movie, env, fetchImpl).catch(() => []),
+      ]);
+      if (!video) {
+        return jsonResponse({ PlaySessionId: crypto.randomUUID(), MediaSources: [] });
+      }
+      return jsonResponse({
+        PlaySessionId: crypto.randomUUID(),
+        ItemId: item.Id,
+        MediaSources: [
+          mediaSource(
+            item,
+            request.url,
+            token || (guestAccessEnabled(env) ? guestToken(env) : ""),
+            video,
+            subtitles,
+          ),
+        ],
+      });
+    } catch (error) {
+      return errorResponse(502, error instanceof Error ? error.message : "Playback metadata unavailable");
+    }
+  }
+
+  const downloadMatch = path.match(/^\/Items\/([^/]+)\/Download$/i);
+  if (downloadMatch) {
+    return streamResponse(
+      decodeURIComponent(downloadMatch[1]),
+      request,
+      env,
+      fetchImpl,
+      token,
+    );
+  }
+
+  const itemMatch = path.match(/^\/Items\/([^/]+)$/i);
+  if (itemMatch) {
+    try {
+      return await itemResponse(decodeURIComponent(itemMatch[1]), request, env, fetchImpl, token);
+    } catch (error) {
+      return errorResponse(502, error instanceof Error ? error.message : "Movie metadata unavailable");
+    }
+  }
+
+  const subtitleMatch = path.match(
+    /^\/Videos\/([^/]+)\/[^/]+\/Subtitles\/(\d+)\/Stream\.[a-z0-9]+$/i,
+  );
+  if (subtitleMatch) {
+    return subtitleResponse(
+      decodeURIComponent(subtitleMatch[1]),
+      Number(subtitleMatch[2]),
+      request,
+      env,
+      fetchImpl,
+      token,
+    );
+  }
+
+  const streamMatch = path.match(
+    /^\/Videos\/([^/]+)(?:\/[^/]+)?\/(?:stream(?:ing)?|original|download|playback)(?:[._-][^/]*)?$/i,
+  );
+  if (streamMatch) {
+    return streamResponse(
+      decodeURIComponent(streamMatch[1]),
+      request,
+      env,
+      fetchImpl,
+      token,
+    );
+  }
+
+  if (path.startsWith("/emby-media/")) {
+    const mediaUrl = safeMediaUrl(url.searchParams.get("url"), env);
+    if (!mediaUrl) {
+      return errorResponse(403, "Media URL is not allowed");
+    }
+    const headers = new Headers();
+    const range = request.headers.get("range");
+    if (range) {
+      headers.set("range", range);
+    }
+    const upstream = await fetchImpl(mediaUrl.toString(), {
+      method: request.method,
+      headers,
+      redirect: "follow",
+    });
+    const responseHeaders = new Headers();
+    for (const name of ["accept-ranges", "content-length", "content-range", "content-type"]) {
+      const value = upstream.headers.get(name);
+      if (value) {
+        responseHeaders.set(name, value);
+      }
+    }
+    responseHeaders.set("access-control-allow-origin", "*");
+    return new Response(request.method === "HEAD" ? null : upstream.body, {
+      status: upstream.status,
+      headers: responseHeaders,
+    });
+  }
+
   return errorResponse(404, "Emby endpoint not found");
 }
 
