@@ -10,8 +10,6 @@ const CHINESE_PLAYABLE_LIBRARY_ID = "bbjavdb-chinese-playable";
 const USER_ID = "bbjavdb-user";
 const PRODUCT_NAME = "月影emby";
 const DEFAULT_GUEST_TOKEN = "bbjavdb-guest";
-const HOME_MAX_SOURCE_PAGES = 5;        // 首页最大拉取页数
-const HOME_SOURCE_PAGE_SIZE = 32;       // 每页数量
 const LIBRARIES = [
   {
     id: PLAYABLE_LIBRARY_ID,
@@ -388,8 +386,8 @@ function serverId(env) {
 }
 
 function guestAccessEnabled(env) {
-  const value = String(env.EMBY_GUEST_ACCESS ?? "true").trim().toLowerCase();
-  return !["0", "false", "no", "off"].includes(value);
+  const value = String(env.EMBY_GUEST_ACCESS ?? "false").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(value);
 }
 
 function guestToken(env) {
@@ -401,6 +399,12 @@ function guestToken(env) {
 function realJavdbLoginEnabled(env) {
   const value = String(env.EMBY_REAL_JAVDB_LOGIN ?? "false").trim().toLowerCase();
   return ["1", "true", "yes", "on"].includes(value);
+}
+
+// 固定登录密码：设置 EMBY_LOGIN_PASSWORD 后，密码必须与它一致才能登录；
+// 未设置时则仅要求“必须填写密码”（任意非空密码都可通过）。
+function loginPassword(env) {
+  return String(env.EMBY_LOGIN_PASSWORD || "").trim();
 }
 
 function virtualUser(env = {}, name = "JAVDB Guest", hasPassword = false) {
@@ -687,46 +691,76 @@ function imageContentType(imageUrl, declaredType, detectedType) {
   return "image/jpeg";
 }
 
-function mapMovie(movie, requestUrl, env, parentId = PLAYABLE_LIBRARY_ID) {
-  // 修改点：优先使用 full_title，避免标题被截断
-  const title = movie.full_title || movie.title || movie.name || movie.number || "未知影片";
-  const id = movie.number || movie.id || "unknown";
-  const year = movie.year || "";
-  const image = movie.poster || movie.image || movie.cover || "";
-  const images = movie.images || [];
-  const poster = image || (images.length > 0 ? images[0] : "");
+function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRARY_ID) {
+  const id = String(movie.id ?? movie.number ?? "");
+  const image = movie.cover_url || movie.thumb_url || "";
+  const date = movie.release_date || movie.released_at || "";
+  const year = Number.parseInt(String(date).slice(0, 4), 10);
+  const duration = Number(movie.duration || 0);
+  const tags = (movie.tags || []).map(tagName).filter(Boolean);
+  if (hasChineseSubtitles(movie)) {
+    tags.unshift("中文字幕");
+  }
+  if (movie.can_play) {
+    tags.unshift("可播放");
+  }
+  const uniqueTags = [...new Set(tags)];
+  const actors = (movie.actors || []).filter(Boolean).map((actor) => ({
+    Name: actor.name || actor,
+    Type: "Actor",
+    Id: String(actor.id || actor.name || ""),
+  }));
   const item = {
-    Name: title,
     Id: id,
     ServerId: serverId(env),
-    Guid: id,
+    ParentId: parentId,
+    Name: movie.title || movie.number || id,
+    OriginalTitle: movie.title || movie.number || id,
+    SortName: movie.title || movie.number || id,
     Type: "Movie",
     IsFolder: false,
-    LocationType: "Virtual",
+    CanDelete: false,
+    CanDownload: true,
+    SupportsSync: true,
+    PlayAccess: "Full",
+    LocationType: "Remote",
     MediaType: "Video",
-    ParentId: parentId,
-    ProductionYear: year ? Number(year) : null,
-    PremiereDate: year ? `${year}-01-01` : null,
-    Overview: movie.synopsis || movie.description || movie.plot || "",
-    Genres: movie.genres || [],
-    Tags: movie.tags || [],
-    Studios: movie.studio ? [{ Name: movie.studio }] : [],
-    People: [],
-    ImageTags: {
-      Primary: id,
-    },
+    VideoType: "VideoFile",
+    Container: "mp4",
+    Overview: movie.summary || "",
+    PremiereDate: date || undefined,
+    ProductionYear: Number.isFinite(year) ? year : undefined,
+    RunTimeTicks: duration > 0 ? Math.round(duration * 60 * 10_000_000) : undefined,
+    Genres: uniqueTags,
+    Tags: uniqueTags,
+    People: actors,
+    ImageTags: image ? { Primary: id } : {},
     BackdropImageTags: [],
-    PrimaryImageAspectRatio: 1.333,
+    PrimaryImageAspectRatio: image ? 0.667 : undefined,
+    ProviderIds: { JavDB: id },
     UserData: {
       Played: false,
       PlayCount: 0,
       IsFavorite: false,
+      PlaybackPositionTicks: 0,
     },
-    Path: poster ? `/emby-media/?url=${encodeURIComponent(poster)}` : "",
-    can_play: movie.can_play || false,
-    sourceUrl: movie.sourceUrl || "",
-    sourceType: movie.sourceType || "",
   };
+
+  if (movie.maker_name) {
+    item.Studios = [{ Name: movie.maker_name, Id: String(movie.maker_id || "") }];
+  }
+  if (movie.director_name) {
+    item.People.push({
+      Name: movie.director_name,
+      Type: "Director",
+      Id: String(movie.director_id || movie.director_name),
+    });
+  }
+  if (movie.series_name) {
+    item.SeriesName = movie.series_name;
+    item.SeriesId = String(movie.series_id || "");
+  }
+
   return item;
 }
 
@@ -763,42 +797,26 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
   const library = LIBRARIES.find((item) => item.id === requestedParentId) ||
     LIBRARIES.find((item) => item.id === CHINESE_PLAYABLE_LIBRARY_ID);
   const parentId = requestedParentId === ROOT_ID ? ROOT_ID : library.id;
-
   if (searchTerm) {
-    // 修改点：搜索支持多页累积，解决搜索结果不全的问题
-    let allMovies = [];
-    let totalCount = 0;
-    let currentPage = page;
-    let hasMore = true;
-    const maxPages = 12;
-
-    while (allMovies.length < startIndex + limit && currentPage <= maxPages && hasMore) {
-      const payload = await javdbRequest("/v2/search", env, fetchImpl, {
-        query: {
-          q: searchTerm,
-          page: currentPage,
-          type: "movie",
-          movie_filter_by: "p",
-          limit: limit,
-        },
-        token: await apiToken(token, env),
-      });
-      const movies = moviesFromPayload(payload).filter(library.matches);
-      allMovies.push(...movies);
-      totalCount = Number(payload?.total_count || payload?.total || allMovies.length);
-      hasMore = movies.length >= limit;
-      currentPage++;
-    }
-
-    const resultMovies = allMovies.slice(startIndex, startIndex + limit);
+    const payload = await javdbRequest("/v2/search", env, fetchImpl, {
+      query: {
+        q: searchTerm,
+        page,
+        type: "movie",
+        movie_filter_by: "p",
+        limit,
+      },
+      token: await apiToken(token, env),
+    });
+    const movies = moviesFromPayload(payload).filter(library.matches);
     return {
-      Items: resultMovies.map((movie) => mapMovie(
+      Items: movies.map((movie) => mapMovie(
         movie,
         query.requestUrl || "https://localhost/",
         env,
         parentId,
       )),
-      TotalRecordCount: totalCount,
+      TotalRecordCount: Number(payload?.total_count || payload?.total || movies.length),
       StartIndex: startIndex,
     };
   }
@@ -870,7 +888,7 @@ async function resolveVideo(movie, env, fetchImpl) {
             item.mime_type || "video/mp4",
         inlinePlaylist,
         variant: item.variant || item.name || item.id,
-        title: item.title || item.name || movie.title || movie.number || code,
+        title: movie.title || item.title || item.name || movie.number || code,
         quality: Number(item.quality || item.height || 0),
       }];
     });
@@ -936,66 +954,111 @@ async function resolveSubtitles(movie, env, fetchImpl) {
 
 function mediaSource(item, requestUrl, token, video, subtitles = []) {
   const isHls = /mpegurl|m3u8/i.test(video.sourceType || video.sourceUrl);
-  // 修改点：M3U8 改为 STRM
-  const container = isHls ? "strm" : "mp4";
+  // 媒体信息里的“容器”提示统一显示成 HLS，而不是 M3U8。
+  const container = isHls ? "hls" : "mp4";
+  // 实际播放/下载地址的后缀仍用 .m3u8 / .mp4，保持真实文件类型。
+  const streamExtension = isHls ? "m3u8" : "mp4";
   const height = Number(video.quality || 0);
   const width = height > 0 ? Math.round((height * 16) / 9 / 2) * 2 : undefined;
   const streamUrl = new URL(
-    "/emby" + `/Videos/${encodeURIComponent(item.Id)}/stream.${container}`,
+    publicRoutePath(
+      requestUrl,
+      `/Videos/${encodeURIComponent(item.Id)}/stream.${streamExtension}`,
+    ),
     requestUrl,
   );
   streamUrl.searchParams.set("api_key", token);
   streamUrl.searchParams.set("static", "true");
   streamUrl.searchParams.set("mediaSourceId", item.Id);
-
-  const mediaStreams = [
-    {
-      Codec: "h264",
-      Type: "Video",
-      Index: 0,
-      IsDefault: true,
-      IsForced: false,
-      IsExternal: false,
-      Width: width || 1280,
-      Height: height || 720,
-      BitRate: 4000000,
-    },
-  ];
-  if (subtitles.length) {
-    for (let i = 0; i < subtitles.length; i++) {
-      const sub = subtitles[i];
-      mediaStreams.push({
-        Codec: "srt",
-        Type: "Subtitle",
-        Index: i + 1,
-        IsDefault: false,
-        IsForced: false,
-        IsExternal: true,
-        Language: sub.language || "chi",
-        DisplayLanguage: sub.displayLanguage || "Chinese",
-        DisplayTitle: sub.displayTitle || "Chinese",
-        DeliveryUrl: sub.url || "",
-      });
-    }
+  if (video.sourceUrl) {
+    streamUrl.searchParams.set("source", video.sourceUrl);
+    streamUrl.searchParams.set("sourceType", video.sourceType || "video/mp4");
   }
-
+  const subtitleStreams = subtitles.map((subtitle, index) => {
+    const streamIndex = index + 2;
+    const deliveryUrl = new URL(
+      publicRoutePath(
+        requestUrl,
+        `/Videos/${encodeURIComponent(item.Id)}/${encodeURIComponent(item.Id)}/Subtitles/${streamIndex}/Stream.${subtitle.codec}`,
+      ),
+      requestUrl,
+    );
+    deliveryUrl.searchParams.set("api_key", token);
+    return {
+      Type: "Subtitle",
+      Codec: subtitle.codec,
+      Language: "chi",
+      DisplayLanguage: "中文",
+      Title: subtitle.title,
+      DisplayTitle: index === 0 ? "中文字幕" : `中文字幕 ${index + 1}`,
+      Index: streamIndex,
+      IsDefault: index === 0,
+      IsForced: false,
+      IsExternal: true,
+      IsExternalUrl: false,
+      IsTextSubtitleStream: true,
+      SupportsExternalStream: true,
+      DeliveryMethod: "External",
+      DeliveryUrl: `${deliveryUrl.pathname}${deliveryUrl.search}`,
+    };
+  });
   return {
     Id: item.Id,
+    Name: video.title,
     Path: streamUrl.toString(),
+    DirectStreamUrl: `${streamUrl.pathname}${streamUrl.search}`,
     Protocol: "Http",
+    Type: "Default",
     Container: container,
-    Size: 0,
-    SupportsDirectStream: true,
-    SupportsDirectPlay: true,
-    SupportsTranscoding: true,
-    SupportsProbing: false,
-    IsInfiniteStream: false,
-    IsRemote: false,
-    MediaStreams: mediaStreams,
-    Bitrate: 4000000,
     VideoType: "VideoFile",
-    DefaultAudioStreamIndex: 0,
-    DefaultSubtitleStreamIndex: subtitles.length > 0 ? 1 : -1,
+    IsRemote: true,
+    SupportsDirectPlay: true,
+    SupportsDirectStream: true,
+    SupportsTranscoding: false,
+    SupportsProbing: false,
+    RequiresOpening: false,
+    RequiresClosing: false,
+    RequiredHttpHeaders: {},
+    RunTimeTicks: item.RunTimeTicks,
+    DefaultAudioStreamIndex: 1,
+    DefaultSubtitleStreamIndex: subtitleStreams.length > 0 ? 2 : undefined,
+    MediaStreams: [
+      {
+        Type: "Video",
+        Codec: isHls ? "hls" : "h264",
+        CodecTag: isHls ? undefined : "avc1",
+        DisplayTitle: height > 0 ? `${height}p H264 SDR` : "H264 SDR",
+        IsDefault: true,
+        IsForced: false,
+        IsExternal: false,
+        Index: 0,
+        Width: width,
+        Height: height || undefined,
+        AspectRatio: "16:9",
+        VideoRange: "SDR",
+        VideoRangeType: "SDR",
+        IsInterlaced: false,
+        IsAVC: !isHls,
+        IsAnamorphic: false,
+        TimeBase: "1/10000000",
+      },
+      {
+        Type: "Audio",
+        Codec: "aac",
+        CodecTag: "mp4a",
+        Language: "und",
+        DisplayLanguage: "Undetermined",
+        DisplayTitle: "AAC stereo",
+        Index: 1,
+        Channels: 2,
+        ChannelLayout: "stereo",
+        SampleRate: 48000,
+        IsDefault: true,
+        IsForced: false,
+        IsExternal: false,
+      },
+      ...subtitleStreams,
+    ],
   };
 }
 
@@ -1038,7 +1101,8 @@ async function authenticate(request, env, fetchImpl) {
   const username = String(input.Username || input.username || url.searchParams.get("username") || "").trim();
   const password = String(input.Pw || input.Password || input.password || url.searchParams.get("password") || "");
 
-  // 没填用户名：保留“访客/免登录”（可选）或报错
+  // 没填用户名：只有显式开启“访客/免登录”（EMBY_GUEST_ACCESS=true）才放行，
+  // 否则必须输入账号密码登录
   if (!username) {
     if (guestAccessEnabled(env)) {
       return authenticationResponse(
@@ -1048,13 +1112,23 @@ async function authenticate(request, env, fetchImpl) {
         guestToken(env),
       );
     }
-    return errorResponse(401, "用户名不能为空");
+    return errorResponse(401, "请输入用户名和密码");
+  }
+
+  // 必须输入密码才能登录
+  if (!password) {
+    return errorResponse(401, "请输入密码");
   }
 
   // 默认“本地信任登录”：不向 JavDB 验证账号密码。
-  // 随便输入一个用户名（密码任意、可留空）都直接登录成功，
+  // 用户名可任意填写，但必须输入密码；
+  // 若配置了固定密码 EMBY_LOGIN_PASSWORD，则密码必须与它一致。
   // 客户端显示的名称就是登录时输入的用户名，播放记录按用户名独立分桶。
   if (!realJavdbLoginEnabled(env)) {
+    const expectedPassword = loginPassword(env);
+    if (expectedPassword && password !== expectedPassword) {
+      return errorResponse(401, "密码错误");
+    }
     const token = crypto.randomUUID();
     await storeSessionUser(env, token, username, requestDeviceId(request), { trusted: true });
     return authenticationResponse(request, env, virtualUser(env, username, true), token);
@@ -1692,7 +1766,7 @@ async function userForRequest(request, url, env) {
       return virtualUser(env, username, true);
     }
   }
-  return virtualUser(env);
+  return virtualUser(env, undefined, guestAccessEnabled(env) ? false : true);
 }
 
 function notFoundPage() {
