@@ -7,6 +7,9 @@ const SIGNATURE_SECRET =
 const ROOT_ID = "bbjavdb-root";
 const PLAYABLE_LIBRARY_ID = "bbjavdb-playable";
 const CHINESE_PLAYABLE_LIBRARY_ID = "bbjavdb-chinese-playable";
+const CENSORED_LIBRARY_ID = "bbjavdb-censored";
+const UNCENSORED_LIBRARY_ID = "bbjavdb-uncensored";
+const WESTERN_LIBRARY_ID = "bbjavdb-western";
 const USER_ID = "bbjavdb-user";
 const PRODUCT_NAME = "月影emby";
 const DEFAULT_GUEST_TOKEN = "bbjavdb-guest";
@@ -14,14 +17,37 @@ const LIBRARIES = [
   {
     id: PLAYABLE_LIBRARY_ID,
     name: "可播放",
+    sourceType: "all",
     sourceFilter: "can_play",
     matches: (movie) => Boolean(movie?.can_play),
   },
   {
     id: CHINESE_PLAYABLE_LIBRARY_ID,
     name: "中文可播放",
+    sourceType: "all",
     sourceFilter: "subtitle",
     matches: (movie) => isPlayableChinese(movie),
+  },
+  {
+    id: CENSORED_LIBRARY_ID,
+    name: "有码",
+    sourceType: "0",
+    sourceFilter: "can_play",
+    matches: (movie) => Boolean(movie?.can_play),
+  },
+  {
+    id: UNCENSORED_LIBRARY_ID,
+    name: "无码",
+    sourceType: "1",
+    sourceFilter: "can_play",
+    matches: (movie) => Boolean(movie?.can_play),
+  },
+  {
+    id: WESTERN_LIBRARY_ID,
+    name: "欧美",
+    sourceType: "2",
+    sourceFilter: "can_play",
+    matches: (movie) => Boolean(movie?.can_play),
   },
 ];
 
@@ -893,6 +919,7 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
       query: {
         page: sourcePage,
         filter_by: library.sourceFilter,
+        type: library.sourceType,
         limit: HOME_SOURCE_PAGE_SIZE,
       },
       token: await apiToken(token, env),
@@ -996,31 +1023,39 @@ async function resolveSubtitles(movie, env, fetchImpl) {
   }
 
   const rows = Array.isArray(payload?.data) ? payload.data : [];
+  const subtitles = [];
   const seen = new Set();
-  return rows.flatMap((subtitle) => {
+  for (const subtitle of rows) {
+    if (subtitles.length >= 8) {
+      break;
+    }
     const value = String(subtitle?.url || "");
     let url;
     try {
       url = new URL(value);
     } catch {
-      return [];
+      continue;
     }
     if (!["http:", "https:"].includes(url.protocol)) {
-      return [];
+      continue;
     }
 
     const id = String(subtitle.cid || subtitle.gcid || value);
     if (seen.has(id)) {
-      return [];
+      continue;
     }
     seen.add(id);
-    return [{
+    subtitles.push({
       id,
       url: url.toString(),
       codec: subtitleCodec(subtitle),
-      title: String(subtitle.extra_name || subtitle.name || "中文字幕"),
-    }];
-  }).slice(0, 8);
+    });
+  }
+  // 字幕标题不再显示上传者（如“网友上传”），统一改成“字幕 1、字幕 2…”这类序号
+  return subtitles.map((subtitle, index) => ({
+    ...subtitle,
+    title: `字幕 ${index + 1}`,
+  }));
 }
 
 function mediaSource(item, requestUrl, token, video, subtitles = []) {
@@ -1061,7 +1096,7 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
       Language: "chi",
       DisplayLanguage: "中文",
       Title: subtitle.title,
-      DisplayTitle: index === 0 ? "中文字幕" : `中文字幕 ${index + 1}`,
+      DisplayTitle: subtitle.title,
       Index: streamIndex,
       IsDefault: index === 0,
       IsForced: false,
