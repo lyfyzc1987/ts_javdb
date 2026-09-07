@@ -38,8 +38,11 @@ const INLINE_HLS_CONTENT_TYPES = new Set([
   "application/x-mpegurl",
 ]);
 const MAX_INLINE_HLS_LENGTH = 2_000_000;
+const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
-const HOME_MAX_SOURCE_PAGES = 12;
+const HOME_MAX_SOURCE_PAGES = 40;
+const SEARCH_SOURCE_PAGE_SIZE = 50;
+const SEARCH_MAX_SOURCE_PAGES = 40;
 const IMAGE_CONTENT_TYPES = new Map([
   [".avif", "image/avif"],
   [".gif", "image/gif"],
@@ -691,6 +694,17 @@ function imageContentType(imageUrl, declaredType, detectedType) {
   return "image/jpeg";
 }
 
+// 展示用影片名称：番号 + 完整标题，例如 “JUR-799 息子の友人と…”；
+// 若标题本身已带番号前缀（如 “ABC-123 xxx”），就不再重复拼接。
+function movieDisplayName(movie) {
+  const title = String(movie?.title || movie?.name || "").trim();
+  const number = String(movie?.number || movie?.code || "").trim();
+  if (number && title && !title.toUpperCase().startsWith(number.toUpperCase())) {
+    return `${number} ${title}`.trim();
+  }
+  return title || number || String(movie?.id || "");
+}
+
 function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRARY_ID) {
   const id = String(movie.id ?? movie.number ?? "");
   const image = movie.cover_url || movie.thumb_url || "";
@@ -714,9 +728,9 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     Id: id,
     ServerId: serverId(env),
     ParentId: parentId,
-    Name: movie.title || movie.number || id,
+    Name: movieDisplayName(movie),
     OriginalTitle: movie.title || movie.number || id,
-    SortName: movie.title || movie.number || id,
+    SortName: movieDisplayName(movie),
     Type: "Movie",
     IsFolder: false,
     CanDelete: false,
@@ -790,41 +804,85 @@ async function getMovie(id, env, fetchImpl, token = "") {
 
 async function getMoviePage(query, env, fetchImpl, token = "") {
   const startIndex = Math.max(0, Number(query.get("StartIndex") || 0));
-  const limit = Math.min(100, Math.max(1, Number(query.get("Limit") || 32)));
-  const page = Math.floor(startIndex / limit) + 1;
+  const limit = Math.min(
+    DEFAULT_PAGE_SIZE,
+    Math.max(1, Number(query.get("Limit") || DEFAULT_PAGE_SIZE)),
+  );
   const searchTerm = query.get("SearchTerm") || query.get("searchTerm") || "";
   const requestedParentId = query.get("ParentId") || CHINESE_PLAYABLE_LIBRARY_ID;
   const library = LIBRARIES.find((item) => item.id === requestedParentId) ||
     LIBRARIES.find((item) => item.id === CHINESE_PLAYABLE_LIBRARY_ID);
   const parentId = requestedParentId === ROOT_ID ? ROOT_ID : library.id;
+  const requiredCount = startIndex + limit;
+
   if (searchTerm) {
-    const payload = await javdbRequest("/v2/search", env, fetchImpl, {
-      query: {
-        q: searchTerm,
-        page,
-        type: "movie",
-        movie_filter_by: "p",
-        limit,
-      },
-      token: await apiToken(token, env),
-    });
-    const movies = moviesFromPayload(payload).filter(library.matches);
+    // 搜索：上游 /v2/search 每页最多返回 50 条，且里面混着“不可播放”的条目。
+    // 因此按页翻找、过滤并去重，把该片库（可播放/中文可播放）里匹配的结果尽量都找出来，
+    // 避免客户端只能看到第一页里筛剩下的几条（例如明明有几十上百部，却只显示 2 部）。
+    const matchingMovies = [];
+    const seen = new Set();
+    let sourcePage = 1;
+    let sourceExhausted = false;
+
+    while (
+      matchingMovies.length < requiredCount &&
+      sourcePage <= SEARCH_MAX_SOURCE_PAGES &&
+      !sourceExhausted
+    ) {
+      const payload = await javdbRequest("/v2/search", env, fetchImpl, {
+        query: {
+          q: searchTerm,
+          page: sourcePage,
+          type: "movie",
+          movie_filter_by: library.sourceFilter,
+          limit: SEARCH_SOURCE_PAGE_SIZE,
+        },
+        token: await apiToken(token, env),
+      });
+      const movies = moviesFromPayload(payload);
+      if (movies.length === 0) {
+        sourceExhausted = true;
+        break;
+      }
+      for (const movie of movies) {
+        if (!library.matches(movie)) {
+          continue;
+        }
+        const key = String(movie.id ?? movie.number ?? "");
+        if (key && !seen.has(key)) {
+          seen.add(key);
+          matchingMovies.push(movie);
+        }
+      }
+      // 这一页不足一页，说明已经翻到结果末尾
+      if (movies.length < SEARCH_SOURCE_PAGE_SIZE) {
+        sourceExhausted = true;
+        break;
+      }
+      sourcePage += 1;
+    }
+
+    const pageMovies = matchingMovies.slice(startIndex, requiredCount);
     return {
-      Items: movies.map((movie) => mapMovie(
+      Items: pageMovies.map((movie) => mapMovie(
         movie,
         query.requestUrl || "https://localhost/",
         env,
         parentId,
       )),
-      TotalRecordCount: Number(payload?.total_count || payload?.total || movies.length),
+      // 已翻到末尾时用真实数量；否则略多报，让客户端能继续往下翻页
+      TotalRecordCount: sourceExhausted
+        ? matchingMovies.length
+        : matchingMovies.length + 1,
       StartIndex: startIndex,
     };
   }
 
-  const requiredCount = startIndex + limit;
   const matchingMovies = [];
+  const seen = new Set();
   let sourcePage = 1;
   let hasMoreSource = true;
+  let sourceExhausted = false;
 
   while (
     matchingMovies.length < requiredCount &&
@@ -840,15 +898,28 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
       token: await apiToken(token, env),
     });
     const movies = moviesFromPayload(payload);
-    matchingMovies.push(...movies.filter(library.matches));
     hasMoreSource = movies.length >= HOME_SOURCE_PAGE_SIZE;
+    for (const movie of movies) {
+      if (!library.matches(movie)) {
+        continue;
+      }
+      const key = String(movie.id ?? movie.number ?? "");
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        matchingMovies.push(movie);
+      }
+    }
+    if (movies.length < HOME_SOURCE_PAGE_SIZE) {
+      sourceExhausted = true;
+      break;
+    }
     sourcePage += 1;
   }
 
   const movies = matchingMovies.slice(startIndex, requiredCount);
-  const totalRecordCount = hasMoreSource
-    ? startIndex + movies.length + 1
-    : matchingMovies.length;
+  const totalRecordCount = sourceExhausted
+    ? matchingMovies.length
+    : matchingMovies.length + 1;
   return {
     Items: movies.map((movie) => mapMovie(
       movie,
@@ -888,7 +959,7 @@ async function resolveVideo(movie, env, fetchImpl) {
             item.mime_type || "video/mp4",
         inlinePlaylist,
         variant: item.variant || item.name || item.id,
-        title: movie.title || item.title || item.name || movie.number || code,
+        title: movieDisplayName(movie) || code,
         quality: Number(item.quality || item.height || 0),
       }];
     });
@@ -1211,7 +1282,7 @@ function libraryView(library, env) {
     Guid: library.id,
     Type: "CollectionFolder",
     CollectionType: "movies",
-    ChildCount: 32,
+    ChildCount: 1000,
     DisplayPreferencesId: `usersettings-${library.id}`,
     IsFolder: true,
     LocationType: "Virtual",
@@ -2068,7 +2139,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   }
   if (path === "/Items/Counts") {
     return jsonResponse({
-      MovieCount: 32,
+      MovieCount: 1000,
       SeriesCount: 0,
       EpisodeCount: 0,
       ArtistCount: 0,
@@ -2079,7 +2150,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       MusicVideoCount: 0,
       BoxSetCount: 0,
       BookCount: 0,
-      ItemCount: 32,
+      ItemCount: 1000,
     });
   }
   if (
@@ -2093,7 +2164,13 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   }
   if (path === "/SearchHints") {
     try {
-      const result = await getMoviePage(new URLSearchParams(`SearchTerm=${encodeURIComponent(url.searchParams.get("SearchTerm") || "")}`), env, fetchImpl, token);
+      const hintQuery = new URLSearchParams();
+      hintQuery.set("SearchTerm", url.searchParams.get("SearchTerm") || "");
+      const hintStart = Number(url.searchParams.get("StartIndex") || 0);
+      const hintLimit = Number(url.searchParams.get("Limit") || 100);
+      if (Number.isFinite(hintStart) && hintStart > 0) hintQuery.set("StartIndex", String(hintStart));
+      if (Number.isFinite(hintLimit) && hintLimit > 0) hintQuery.set("Limit", String(hintLimit));
+      const result = await getMoviePage(hintQuery, env, fetchImpl, token);
       return jsonResponse({
         SearchHints: result.Items.map((item) => ({
           ItemId: item.Id,
@@ -2227,3 +2304,4 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
 
   return errorResponse(404, "Emby endpoint not found");
 }
+
