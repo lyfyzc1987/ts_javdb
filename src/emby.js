@@ -5,7 +5,8 @@ const SIGNATURE_KEY = "lpw6vgqzsp";
 const SIGNATURE_SECRET =
   "71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa";
 const ROOT_ID = "bbjavdb-root";
-const PLAYABLE_LIBRARY_ID = "bbjavdb-playable";
+// “中文可播放”分类在客户端显示为“中文字幕”：只收“有中文字幕且可播放”的影片。
+// 原“可播放”分类已按要求移除，避免与“有码/无码/欧美”重复。
 const CHINESE_PLAYABLE_LIBRARY_ID = "bbjavdb-chinese-playable";
 const CENSORED_LIBRARY_ID = "bbjavdb-censored";
 const UNCENSORED_LIBRARY_ID = "bbjavdb-uncensored";
@@ -15,15 +16,8 @@ const PRODUCT_NAME = "月影emby";
 const DEFAULT_GUEST_TOKEN = "bbjavdb-guest";
 const LIBRARIES = [
   {
-    id: PLAYABLE_LIBRARY_ID,
-    name: "可播放",
-    sourceType: "all",
-    sourceFilter: "can_play",
-    matches: (movie) => Boolean(movie?.can_play),
-  },
-  {
     id: CHINESE_PLAYABLE_LIBRARY_ID,
-    name: "中文可播放",
+    name: "中文字幕",
     sourceType: "all",
     sourceFilter: "subtitle",
     matches: (movie) => isPlayableChinese(movie),
@@ -828,6 +822,87 @@ async function getMovie(id, env, fetchImpl, token = "") {
   return movieFromPayload(payload);
 }
 
+// ---------- 分类列表排序 ----------
+// Emby 客户端浏览分类时可选“按年份/名称/添加时间”排序，并带 SortBy/SortOrder。
+// 原先这些参数被忽略，返回的一直是上游“最新上架”顺序，所以客户端里选排序没反应。
+// 现在由服务器端把抓到的影片按所选条件排序后再分页返回，排序即可生效。
+const NATURAL_ORDER_SORT_KEYS = new Set([
+  "DateCreated",
+  "DateAdded",
+  "CreatedDate",
+]);
+const DATE_SORT_KEYS = new Set([
+  "PremiereDate",
+  "ProductionYear",
+  "ReleaseDate",
+  "Year",
+  ...NATURAL_ORDER_SORT_KEYS,
+]);
+const NAME_SORT_KEYS = new Set([
+  "SortName",
+  "Name",
+  "SeriesSortName",
+]);
+
+function buildSortComparators(sortByRaw) {
+  const comparators = [];
+  for (const rawKey of String(sortByRaw || "").split(",")) {
+    const key = String(rawKey || "").trim();
+    if (!key) continue;
+    if (NAME_SORT_KEYS.has(key)) {
+      comparators.push({
+        key,
+        kind: "name",
+        value: (movie) => String(movieDisplayName(movie)).toLowerCase(),
+      });
+    } else if (DATE_SORT_KEYS.has(key)) {
+      comparators.push({
+        key,
+        kind: "date",
+        value: NATURAL_ORDER_SORT_KEYS.has(key)
+          ? (movie) => movie?.created_at || movie?.release_date || movie?.released_at || ""
+          : (movie) => movie?.release_date || movie?.released_at || "",
+      });
+    }
+  }
+  return comparators;
+}
+
+// 判断客户端要求的排序是否等于上游自带的“最新上架”顺序；
+// 是的话继续用原来的快速分页，不额外抓全量。
+function isNaturalCatalogOrder(comparators, sortOrder) {
+  if (comparators.length === 0) return true;
+  if (sortOrder === "asc") return false;
+  return comparators.every((comparator) => NATURAL_ORDER_SORT_KEYS.has(comparator.key));
+}
+
+// 服务器端排序：无日期的条目排到最后，早/晚顺序由 SortOrder 决定。
+function sortMoviesForClient(movies, comparators, sortOrder) {
+  if (!comparators.length) return movies;
+  const direction = sortOrder === "asc" ? 1 : -1;
+  const sorted = movies.slice();
+  sorted.sort((left, right) => {
+    for (const comparator of comparators) {
+      const leftValue = comparator.value(left);
+      const rightValue = comparator.value(right);
+      if (comparator.kind === "date") {
+        const leftTime = Date.parse(String(leftValue || ""));
+        const rightTime = Date.parse(String(rightValue || ""));
+        const leftValid = Number.isFinite(leftTime);
+        const rightValid = Number.isFinite(rightTime);
+        if (leftValid !== rightValid) return leftValid ? -1 : 1;
+        if (!leftValid && !rightValid) continue;
+        if (leftTime === rightTime) continue;
+        return (leftTime < rightTime ? -1 : 1) * direction;
+      }
+      const compared = String(leftValue).localeCompare(String(rightValue), "zh-CN");
+      if (compared !== 0) return compared * direction;
+    }
+    return 0;
+  });
+  return sorted;
+}
+
 async function getMoviePage(query, env, fetchImpl, token = "") {
   const startIndex = Math.max(0, Number(query.get("StartIndex") || 0));
   const limit = Math.min(
@@ -840,10 +915,15 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
     LIBRARIES.find((item) => item.id === CHINESE_PLAYABLE_LIBRARY_ID);
   const parentId = requestedParentId === ROOT_ID ? ROOT_ID : library.id;
   const requiredCount = startIndex + limit;
+  const sortOrder = /^asc/i.test(String(query.get("SortOrder") || "")) ? "asc" : "desc";
+  const sortComparators = buildSortComparators(query.get("SortBy"));
+  // 默认“最新上架”顺序走原有快速路径；
+  // 一旦客户端明确要求“按年份/名称”等排序，就抓全量后再排序分页，保证排序真的生效。
+  const needsFullCatalog = !isNaturalCatalogOrder(sortComparators, sortOrder);
 
   if (searchTerm) {
     // 搜索：上游 /v2/search 每页最多返回 50 条，且里面混着“不可播放”的条目。
-    // 因此按页翻找、过滤并去重，把该片库（可播放/中文可播放）里匹配的结果尽量都找出来，
+    // 因此按页翻找、过滤并去重，把该片库里匹配的结果尽量都找出来，
     // 避免客户端只能看到第一页里筛剩下的几条（例如明明有几十上百部，却只显示 2 部）。
     const matchingMovies = [];
     const seen = new Set();
@@ -851,9 +931,9 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
     let sourceExhausted = false;
 
     while (
-      matchingMovies.length < requiredCount &&
       sourcePage <= SEARCH_MAX_SOURCE_PAGES &&
-      !sourceExhausted
+      !sourceExhausted &&
+      (needsFullCatalog || matchingMovies.length < requiredCount)
     ) {
       const payload = await javdbRequest("/v2/search", env, fetchImpl, {
         query: {
@@ -888,7 +968,10 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
       sourcePage += 1;
     }
 
-    const pageMovies = matchingMovies.slice(startIndex, requiredCount);
+    const orderedMovies = needsFullCatalog
+      ? sortMoviesForClient(matchingMovies, sortComparators, sortOrder)
+      : matchingMovies;
+    const pageMovies = orderedMovies.slice(startIndex, requiredCount);
     return {
       Items: pageMovies.map((movie) => mapMovie(
         movie,
@@ -911,9 +994,9 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
   let sourceExhausted = false;
 
   while (
-    matchingMovies.length < requiredCount &&
     sourcePage <= HOME_MAX_SOURCE_PAGES &&
-    hasMoreSource
+    hasMoreSource &&
+    (needsFullCatalog || matchingMovies.length < requiredCount)
   ) {
     const payload = await javdbRequest("/v1/movies/latest", env, fetchImpl, {
       query: {
@@ -943,7 +1026,10 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
     sourcePage += 1;
   }
 
-  const movies = matchingMovies.slice(startIndex, requiredCount);
+  const orderedMovies = needsFullCatalog
+    ? sortMoviesForClient(matchingMovies, sortComparators, sortOrder)
+    : matchingMovies;
+  const movies = orderedMovies.slice(startIndex, requiredCount);
   const totalRecordCount = sourceExhausted
     ? matchingMovies.length
     : matchingMovies.length + 1;
@@ -1226,14 +1312,28 @@ async function authenticate(request, env, fetchImpl) {
     return errorResponse(401, "请输入密码");
   }
 
-  // 默认“本地信任登录”：不向 JavDB 验证账号密码。
-  // 用户名可任意填写，但必须输入密码；
-  // 若配置了固定密码 EMBY_LOGIN_PASSWORD，则密码必须与它一致。
+  // 默认“本地信任登录”：不向 JavDB 验证账号密码，用户名可任意填写。
+  // 密码校验：
+  // 1) 若配置了固定密码 EMBY_LOGIN_PASSWORD，则登录必须使用该密码；
+  // 2) 未配置时记住每个用户名“首次登录”使用的密码，之后同一用户名
+  //    必须用相同密码登录，否则提示“密码不正确”。
   // 客户端显示的名称就是登录时输入的用户名，播放记录按用户名独立分桶。
   if (!realJavdbLoginEnabled(env)) {
     const expectedPassword = loginPassword(env);
-    if (expectedPassword && password !== expectedPassword) {
-      return errorResponse(401, "密码错误");
+    if (expectedPassword) {
+      if (password !== expectedPassword) {
+        return errorResponse(401, "密码不正确");
+      }
+    } else {
+      // 没有固定密码时，记住该用户名首次登录使用的密码。
+      const storedPassword = await readStoredLoginPassword(env, username);
+      if (storedPassword) {
+        if (password !== storedPassword) {
+          return errorResponse(401, "密码不正确");
+        }
+      } else {
+        await storeStoredLoginPassword(env, username, password);
+      }
     }
     const token = crypto.randomUUID();
     await storeSessionUser(env, token, username, requestDeviceId(request), { trusted: true });
@@ -1421,9 +1521,30 @@ function noContentResponse() {
 const PLAYBACK_STATE_KEY = "playback-state-v1";
 const PLAYBACK_MAX_RESUME_ITEMS = 30;
 
+// 播放记录的后备存储：
+// - 优先用 KV 命名空间（PLAYBACK_KV）跨请求长期保存；
+// - 即使没配置 KV，也会在内存里记一份，保证同一实例内“进度/已播”立刻生效。
+const MAX_MEMORY_PLAYBACK_STATES = 500;
+
 function playbackKv(env) {
   const kv = env && env.PLAYBACK_KV;
   return kv && typeof kv.get === "function" && typeof kv.put === "function" ? kv : null;
+}
+
+const MEMORY_PLAYBACK_STATES = new Map();
+
+function rememberPlaybackState(key, state) {
+  try {
+    MEMORY_PLAYBACK_STATES.set(key, state || {});
+    if (MEMORY_PLAYBACK_STATES.size > MAX_MEMORY_PLAYBACK_STATES) {
+      const oldestKey = MEMORY_PLAYBACK_STATES.keys().next().value;
+      if (oldestKey !== undefined) {
+        MEMORY_PLAYBACK_STATES.delete(oldestKey);
+      }
+    }
+  } catch {
+    // 内存兜底失败不能影响主流程
+  }
 }
 
 function playbackTokenPart(token) {
@@ -1472,6 +1593,62 @@ async function lookupSessionUsername(env, token) {
   return record && record.username ? String(record.username) : "";
 }
 
+// “记住首次登录密码”：同一用户名第二次登录时，密码必须与首次一致。
+const LOGIN_PASSWORD_KEY_PREFIX = "login-password:v1:";
+const MEMORY_LOGIN_PASSWORDS = new Map();
+
+function normalizedLoginName(username) {
+  return String(username || "").trim().toLowerCase();
+}
+
+function loginPasswordRecordKey(username) {
+  return `${LOGIN_PASSWORD_KEY_PREFIX}u:${md5(normalizedLoginName(username))}`;
+}
+
+async function readStoredLoginPassword(env, username) {
+  const name = normalizedLoginName(username);
+  if (!name) return "";
+  const kv = playbackKv(env);
+  const memoryValue = MEMORY_LOGIN_PASSWORDS.get(name);
+  if (!kv) {
+    return typeof memoryValue === "string" ? memoryValue : "";
+  }
+  try {
+    const value = await kv.get(loginPasswordRecordKey(username), "text");
+    if (typeof value === "string" && value.length > 0) {
+      MEMORY_LOGIN_PASSWORDS.set(name, value);
+      return value;
+    }
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Stored login password read failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+  return typeof memoryValue === "string" ? memoryValue : "";
+}
+
+async function storeStoredLoginPassword(env, username, password) {
+  const name = normalizedLoginName(username);
+  const pw = String(password || "");
+  if (!name || !pw) return;
+  try {
+    MEMORY_LOGIN_PASSWORDS.set(name, pw);
+  } catch {
+    // 内存兜底失败不影响主流程
+  }
+  const kv = playbackKv(env);
+  if (!kv) return;
+  try {
+    await kv.put(loginPasswordRecordKey(username), pw);
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Stored login password write failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
+
 async function playbackStateKey(env, token) {
   const scope = String(token || "").trim();
   if (!scope || scope === guestToken(env)) {
@@ -1485,25 +1662,34 @@ async function playbackStateKey(env, token) {
 }
 
 async function readPlaybackState(env, token) {
+  const key = await playbackStateKey(env, token);
+  const memoryState = MEMORY_PLAYBACK_STATES.get(key);
   const kv = playbackKv(env);
-  if (!kv) return {};
+  if (!kv) {
+    return memoryState && typeof memoryState === "object" ? memoryState : {};
+  }
   try {
-    const value = await kv.get(await playbackStateKey(env, token), "json");
-    return value && typeof value === "object" ? value : {};
+    const value = await kv.get(key, "json");
+    if (value && typeof value === "object") {
+      rememberPlaybackState(key, value);
+      return value;
+    }
   } catch (error) {
     console.error(JSON.stringify({
       message: "Playback state read failed",
       error: error instanceof Error ? error.message : String(error),
     }));
-    return {};
   }
+  return memoryState && typeof memoryState === "object" ? memoryState : {};
 }
 
 async function writePlaybackState(env, state, token) {
+  const key = await playbackStateKey(env, token);
+  rememberPlaybackState(key, state || {});
   const kv = playbackKv(env);
   if (!kv) return;
   try {
-    await kv.put(await playbackStateKey(env, token), JSON.stringify(state || {}));
+    await kv.put(key, JSON.stringify(state || {}));
   } catch (error) {
     console.error(JSON.stringify({
       message: "Playback state write failed",
@@ -1520,14 +1706,25 @@ function userDataForRecord(record) {
     PlayCount: Math.max(0, Math.floor(Number(record && record.playCount) || (played ? 1 : 0))),
     IsFavorite: false,
     PlaybackPositionTicks: positionTicks,
+    LastPlayedDate: record && record.lastPlayedDate ? record.lastPlayedDate : null,
   };
 }
 
+// 把已存的播放进度挂到条目上：客户端详情页的“继续播放”进度条、
+// 卡片上的已播放角标都读这里的 UserData。
 function attachPlaybackUserData(item, state) {
   if (!item || !state) return item;
   const record = state[item.Id];
   if (record) {
-    item.UserData = userDataForRecord(record);
+    const data = userDataForRecord(record);
+    const runtimeTicks = Math.max(0, Number(item.RunTimeTicks) || 0);
+    const positionTicks = Math.max(0, Number(data.PlaybackPositionTicks) || 0);
+    if (data.Played) {
+      data.PlayedPercentage = 100;
+    } else if (runtimeTicks > 0 && positionTicks > 0) {
+      data.PlayedPercentage = Math.min(99, Math.round((positionTicks / runtimeTicks) * 100));
+    }
+    item.UserData = data;
   }
   return item;
 }
@@ -1542,7 +1739,6 @@ function parseJsonBodyText(raw) {
 }
 
 async function recordPlaybackEvent(path, request, env) {
-  if (!playbackKv(env)) return;
   const token = getToken(request, new URL(request.url));
   let body = {};
   try {
@@ -1550,11 +1746,25 @@ async function recordPlaybackEvent(path, request, env) {
   } catch {
     body = {};
   }
-  const itemId = String(body.ItemId || body.itemId || (body.NowPlayingItem && body.NowPlayingItem.Id) || "");
+  const nowPlayingItem = body.NowPlayingItem || body.nowPlayingItem || {};
+  const itemId = String(
+    body.ItemId || body.itemId || nowPlayingItem.Id || nowPlayingItem.id || "",
+  ).trim();
   if (!itemId) return;
   const positionTicks = Math.max(0, Number(body.PositionTicks ?? body.positionTicks ?? 0) || 0);
+  const runTimeTicks = Math.max(0, Number(
+    body.RunTimeTicks ?? body.runTimeTicks ?? nowPlayingItem.RunTimeTicks ?? 0,
+  ) || 0);
+  // 播完判断：客户端明确上报 PlayedToCompletion，或进度已到总时长 90% 以上
+  // （部分客户端停播时不带 PlayedToCompletion，用进度兜底也能标已播）。
+  const playedToCompletion =
+    body.PlayedToCompletion === true ||
+    body.playedToCompletion === true ||
+    (runTimeTicks > 0 && positionTicks >= runTimeTicks * 0.9);
+
   const state = await readPlaybackState(env, token);
-  const record = state[itemId] || {
+  const existing = state[itemId];
+  const record = existing || {
     itemId,
     positionTicks: 0,
     played: false,
@@ -1563,19 +1773,34 @@ async function recordPlaybackEvent(path, request, env) {
   };
   record.itemId = itemId;
   record.lastPlayedDate = new Date().toISOString();
+
+  let touched = false;
   if (path === "/Sessions/Playing/Stopped") {
-    if (body.PlayedToCompletion === true || body.playedToCompletion === true) {
+    if (playedToCompletion) {
+      // 整部看完：标已播放、进度清零、播放次数 +1
       record.played = true;
       record.positionTicks = 0;
       record.playCount = Math.max(0, Math.floor(Number(record.playCount) || 0)) + 1;
+      touched = true;
     } else if (positionTicks > 0) {
+      // 中途退出：保留进度（未看完就不算已播）
+      record.played = false;
       record.positionTicks = positionTicks;
+      touched = true;
+    } else if (!existing) {
+      // 刚点开就退出（0 进度）：不生成无效记录
+      return;
+    } else {
+      // 已有记录但这次 0 进度退出：清掉续播进度，保留“是否已播”的状态
+      record.positionTicks = 0;
+      touched = true;
     }
-  } else if (path === "/Sessions/Playing" || positionTicks > 0) {
-    if (positionTicks > 0) {
-      record.positionTicks = positionTicks;
-    }
+  } else if (positionTicks > 0) {
+    // Playing / Progress：持续上报当前位置，用来画进度条和续播
+    record.positionTicks = positionTicks;
+    touched = true;
   }
+  if (!touched) return;
   state[itemId] = record;
   await writePlaybackState(env, state, token);
 }
@@ -1858,6 +2083,9 @@ function isHandledPath(path) {
     /^\/Users\/[^/]+\/Views$/i.test(path) ||
     /^\/Users\/[^/]+\/Suggestions$/i.test(path) ||
     /^\/Users\/[^/]+\/Items(?:\/|$)/i.test(path) ||
+    /^\/Users\/[^/]+\/PlayedItems\/[^/]+$/i.test(path) ||
+    /^\/Users\/[^/]+\/UnplayedItems\/[^/]+$/i.test(path) ||
+    /^\/Users\/[^/]+\/PlayingItems\/[^/]+$/i.test(path) ||
     path.toLowerCase().startsWith("/items/") ||
     path.toLowerCase().startsWith("/videos/") ||
     path.toLowerCase().startsWith("/emby-media/")
@@ -1923,6 +2151,10 @@ async function deviceBindingFailure(request, url, env, path) {
     return null;
   }
   if (isMediaDeliveryPath(path)) {
+    return null;
+  }
+  // 播放进度上报/已播标记来自播放器，放行并允许带 token 上报，不做设备绑定拦截
+  if (/^\/(?:Sessions\/Playing(?:\/Progress|\/Stopped)?|Items\/[^/]+\/UserData|Users\/[^/]+\/(?:PlayedItems|UnplayedItems|PlayingItems)\/[^/]+)$/i.test(path)) {
     return null;
   }
   const record = await lookupSessionRecord(env, token);
@@ -2090,7 +2322,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
         Math.max(1, Number(url.searchParams.get("Limit")) || PLAYBACK_MAX_RESUME_ITEMS),
       );
       const entries = Object.values(resumeState)
-        .filter((record) => record && record.itemId && Number(record.positionTicks) > 0)
+        .filter((record) => record && record.itemId && !record.played && Number(record.positionTicks) > 0)
         .sort((a, b) => String(b.lastPlayedDate || "").localeCompare(String(a.lastPlayedDate || "")))
         .slice(0, resumeLimit);
       const resumeItems = [];
@@ -2148,6 +2380,9 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
         record.played = Boolean(body.Played);
         if (record.played) {
           record.positionTicks = 0;
+          if (record.playCount <= 0) {
+            record.playCount = 1;
+          }
         }
       }
       if (body.PlaybackPositionTicks !== undefined) {
@@ -2165,6 +2400,73 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       return noContentResponse();
     }
     return jsonResponse(userDataForRecord(userDataState[userDataItemId]));
+  }
+  // 兼容旧版客户端的“标记已播/取消已播/上报进度”接口
+  const playedItemsMatch = path.match(/^\/Users\/[^/]+\/PlayedItems\/([^/]+)$/i);
+  if (playedItemsMatch && (request.method === "POST" || request.method === "PUT")) {
+    const playedItemId = decodeURIComponent(playedItemsMatch[1]);
+    const playedState = await readPlaybackState(env, token);
+    const playedRecord = playedState[playedItemId] || {
+      itemId: playedItemId,
+      positionTicks: 0,
+      played: false,
+      playCount: 0,
+      lastPlayedDate: "",
+    };
+    playedRecord.itemId = playedItemId;
+    playedRecord.played = true;
+    playedRecord.positionTicks = 0;
+    playedRecord.playCount = Math.max(0, Math.floor(Number(playedRecord.playCount) || 0)) + 1;
+    playedRecord.lastPlayedDate = new Date().toISOString();
+    playedState[playedItemId] = playedRecord;
+    await writePlaybackState(env, playedState, token);
+    return noContentResponse();
+  }
+  const unplayedItemsMatch = path.match(/^\/Users\/[^/]+\/UnplayedItems\/([^/]+)$/i);
+  if (unplayedItemsMatch && (request.method === "POST" || request.method === "DELETE")) {
+    const unplayedItemId = decodeURIComponent(unplayedItemsMatch[1]);
+    const unplayedState = await readPlaybackState(env, token);
+    const unplayedRecord = unplayedState[unplayedItemId] || {
+      itemId: unplayedItemId,
+      positionTicks: 0,
+      played: false,
+      playCount: 0,
+      lastPlayedDate: "",
+    };
+    unplayedRecord.itemId = unplayedItemId;
+    unplayedRecord.played = false;
+    unplayedState[unplayedItemId] = unplayedRecord;
+    await writePlaybackState(env, unplayedState, token);
+    return noContentResponse();
+  }
+  const playingItemsMatch = path.match(/^\/Users\/[^/]+\/PlayingItems\/([^/]+)$/i);
+  if (playingItemsMatch && (request.method === "POST" || request.method === "PUT")) {
+    let playingBody = {};
+    try {
+      playingBody = parseJsonBodyText(await request.clone().text());
+    } catch {
+      playingBody = {};
+    }
+    const playingItemId = decodeURIComponent(playingItemsMatch[1]);
+    const playingPosition = Math.max(0, Number(
+      playingBody.PositionTicks ?? playingBody.positionTicks ?? 0,
+    ) || 0);
+    if (playingPosition > 0) {
+      const playingState = await readPlaybackState(env, token);
+      const playingRecord = playingState[playingItemId] || {
+        itemId: playingItemId,
+        positionTicks: 0,
+        played: false,
+        playCount: 0,
+        lastPlayedDate: "",
+      };
+      playingRecord.itemId = playingItemId;
+      playingRecord.positionTicks = playingPosition;
+      playingRecord.lastPlayedDate = new Date().toISOString();
+      playingState[playingItemId] = playingRecord;
+      await writePlaybackState(env, playingState, token);
+    }
+    return noContentResponse();
   }
   if (path === "/Movies/Recommendations") {
     return jsonResponse([]);
