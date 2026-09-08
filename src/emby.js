@@ -1520,6 +1520,9 @@ function noContentResponse() {
 }
 const PLAYBACK_STATE_KEY = "playback-state-v1";
 const PLAYBACK_MAX_RESUME_ITEMS = 30;
+// 进度距片尾不足 2 分钟也视为“已看完”：部分客户端在结尾前几秒/一两分钟退出时
+// 不会上报 PlayedToCompletion，若仍按“没看完”处理会残留进度条并出现在“继续播放”里。
+const PLAYBACK_FINISH_TAIL_TICKS = 120 * 10_000_000;
 
 // 播放记录的后备存储：
 // - 优先用 KV 命名空间（PLAYBACK_KV）跨请求长期保存；
@@ -1698,6 +1701,18 @@ async function writePlaybackState(env, state, token) {
   }
 }
 
+// 是否算“已看完”：显式已播，或进度已到总时长 90% 以上，
+// 或距片尾不足 PLAYBACK_FINISH_TAIL_TICKS（2 分钟）。
+function isPlaybackFinished(record, runtimeTicks) {
+  if (!record) return false;
+  if (record.played) return true;
+  const positionTicks = Math.max(0, Number(record.positionTicks) || 0);
+  const runtime = Math.max(0, Number(runtimeTicks) || 0);
+  if (runtime <= 0 || positionTicks <= 0) return false;
+  if (positionTicks >= runtime * 0.9) return true;
+  return runtime - positionTicks <= PLAYBACK_FINISH_TAIL_TICKS;
+}
+
 function userDataForRecord(record) {
   const positionTicks = Math.max(0, Math.floor(Number(record && record.positionTicks) || 0));
   const played = Boolean(record && record.played);
@@ -1717,12 +1732,21 @@ function attachPlaybackUserData(item, state) {
   const record = state[item.Id];
   if (record) {
     const data = userDataForRecord(record);
-    const runtimeTicks = Math.max(0, Number(item.RunTimeTicks) || 0);
-    const positionTicks = Math.max(0, Number(data.PlaybackPositionTicks) || 0);
-    if (data.Played) {
+    const runtimeTicks =
+      Math.max(0, Number(item.RunTimeTicks) || 0) ||
+      Math.max(0, Number(record.runTimeTicks) || 0);
+    if (isPlaybackFinished(record, runtimeTicks)) {
+      // 已看完（含进度贴近片尾）：详情页/卡片上不再出现“继续播放”进度条，
+      // 直接呈现“已播放”。
+      data.Played = true;
+      data.PlayCount = Math.max(1, Math.floor(Number(data.PlayCount) || 0));
+      data.PlaybackPositionTicks = 0;
       data.PlayedPercentage = 100;
-    } else if (runtimeTicks > 0 && positionTicks > 0) {
-      data.PlayedPercentage = Math.min(99, Math.round((positionTicks / runtimeTicks) * 100));
+    } else {
+      const positionTicks = Math.max(0, Number(data.PlaybackPositionTicks) || 0);
+      if (runtimeTicks > 0 && positionTicks > 0) {
+        data.PlayedPercentage = Math.min(99, Math.round((positionTicks / runtimeTicks) * 100));
+      }
     }
     item.UserData = data;
   }
@@ -1755,12 +1779,16 @@ async function recordPlaybackEvent(path, request, env) {
   const runTimeTicks = Math.max(0, Number(
     body.RunTimeTicks ?? body.runTimeTicks ?? nowPlayingItem.RunTimeTicks ?? 0,
   ) || 0);
-  // 播完判断：客户端明确上报 PlayedToCompletion，或进度已到总时长 90% 以上
-  // （部分客户端停播时不带 PlayedToCompletion，用进度兜底也能标已播）。
+  // 播完判断：客户端明确上报 PlayedToCompletion，或进度已到总时长 90% 以上，
+  // 或进度距片尾已不足 2 分钟（部分客户端在结尾前退出时不带 PlayedToCompletion，
+  // 用这些兜底也能标已播，避免“差一点没看完”还留在继续播放里）。
   const playedToCompletion =
     body.PlayedToCompletion === true ||
     body.playedToCompletion === true ||
-    (runTimeTicks > 0 && positionTicks >= runTimeTicks * 0.9);
+    (runTimeTicks > 0 &&
+      positionTicks > 0 &&
+      (positionTicks >= runTimeTicks * 0.9 ||
+        runTimeTicks - positionTicks <= PLAYBACK_FINISH_TAIL_TICKS));
 
   const state = await readPlaybackState(env, token);
   const existing = state[itemId];
@@ -1773,6 +1801,10 @@ async function recordPlaybackEvent(path, request, env) {
   };
   record.itemId = itemId;
   record.lastPlayedDate = new Date().toISOString();
+  if (runTimeTicks > 0) {
+    // 记下客户端上报的总时长，之后判断“是否接近片尾/已看完”不需要再回源。
+    record.runTimeTicks = runTimeTicks;
+  }
 
   let touched = false;
   if (path === "/Sessions/Playing/Stopped") {
@@ -2321,20 +2353,41 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
         PLAYBACK_MAX_RESUME_ITEMS,
         Math.max(1, Number(url.searchParams.get("Limit")) || PLAYBACK_MAX_RESUME_ITEMS),
       );
-      const entries = Object.values(resumeState)
+      const candidates = Object.values(resumeState)
         .filter((record) => record && record.itemId && !record.played && Number(record.positionTicks) > 0)
-        .sort((a, b) => String(b.lastPlayedDate || "").localeCompare(String(a.lastPlayedDate || "")))
-        .slice(0, resumeLimit);
+        .sort((a, b) => String(b.lastPlayedDate || "").localeCompare(String(a.lastPlayedDate || "")));
       const resumeItems = [];
-      for (const record of entries) {
+      let stateChanged = false;
+      for (const record of candidates) {
+        if (resumeItems.length >= resumeLimit) break;
+        // 优先用播放时上报过的总时长判断是否已基本看完；没有才回源影片数据。
+        const recordRuntime = Math.max(0, Number(record.runTimeTicks) || 0);
+        if (recordRuntime > 0 && isPlaybackFinished(record, recordRuntime)) {
+          record.played = true;
+          record.positionTicks = 0;
+          record.playCount = Math.max(1, Math.floor(Number(record.playCount) || 0));
+          stateChanged = true;
+          continue;
+        }
         try {
           const movie = await getMovie(record.itemId, env, fetchImpl, token);
           if (!movie || (!movie.id && !movie.number)) continue;
-          resumeItems.push(attachPlaybackUserData(mapMovie(movie, request.url, env), resumeState));
+          const item = mapMovie(movie, request.url, env);
+          const runtimeTicks = recordRuntime || Math.max(0, Number(item.RunTimeTicks) || 0);
+          if (isPlaybackFinished(record, runtimeTicks)) {
+            // 已看完但只差片尾几秒/一两分钟：从“继续播放”里清掉，并补上“已播放”标记。
+            record.played = true;
+            record.positionTicks = 0;
+            record.playCount = Math.max(1, Math.floor(Number(record.playCount) || 0));
+            stateChanged = true;
+            continue;
+          }
+          resumeItems.push(attachPlaybackUserData(item, resumeState));
         } catch {
           // Item may no longer be resolvable upstream; skip silently.
         }
       }
+      if (stateChanged) await writePlaybackState(env, resumeState, token);
       return jsonResponse(itemQuery(resumeItems));
     } catch (error) {
       console.error(JSON.stringify({
@@ -2398,6 +2451,29 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       userDataState[userDataItemId] = record;
       await writePlaybackState(env, userDataState, token);
       return noContentResponse();
+    }
+    const userDataRecord = userDataState[userDataItemId];
+    if (userDataRecord && !userDataRecord.played && Number(userDataRecord.positionTicks) > 0) {
+      const recordRuntime = Math.max(0, Number(userDataRecord.runTimeTicks) || 0);
+      let runtimeTicks = recordRuntime;
+      if (runtimeTicks <= 0) {
+        try {
+          const userDataMovie = await getMovie(userDataItemId, env, fetchImpl, token);
+          if (userDataMovie && (userDataMovie.id || userDataMovie.number)) {
+            runtimeTicks = Math.max(0, Number(mapMovie(userDataMovie, request.url, env).RunTimeTicks) || 0);
+          }
+        } catch {
+          // 回源失败不阻断，保持原样返回
+        }
+      }
+      if (runtimeTicks > 0 && isPlaybackFinished(userDataRecord, runtimeTicks)) {
+        // 进度贴近片尾：补上“已播放”标记并清掉进度，避免详情/继续播放残留进度条。
+        userDataRecord.played = true;
+        userDataRecord.positionTicks = 0;
+        userDataRecord.playCount = Math.max(1, Math.floor(Number(userDataRecord.playCount) || 0));
+        userDataState[userDataItemId] = userDataRecord;
+        await writePlaybackState(env, userDataState, token);
+      }
     }
     return jsonResponse(userDataForRecord(userDataState[userDataItemId]));
   }
