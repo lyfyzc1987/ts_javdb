@@ -492,6 +492,37 @@ function virtualUser(env = {}, name = "JAVDB Guest", hasPassword = false) {
   };
 }
 
+// 上游请求统一加超时与一次重试：解析/数据接口首次冷启动或瞬时抖动时，
+// 客户端不会因为某个上游一直不返回而无限转圈。媒体流（播放/字幕/图片）
+// 是长连接，不走这里，避免中途被超时打断。
+const FETCH_TIMEOUT_MS = 10000;
+const FETCH_MAX_ATTEMPTS = 2;
+
+async function fetchWithTimeout(fetchImpl, url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetchImpl(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchWithRetry(fetchImpl, url, options = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= FETCH_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await fetchWithTimeout(fetchImpl, url, options);
+    } catch (error) {
+      lastError = error;
+      if (attempt < FETCH_MAX_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+      }
+    }
+  }
+  throw lastError;
+}
+
 async function javdbRequest(path, env, fetchImpl, options = {}) {
   const url = new URL(`${apiOrigin(env)}${path}`);
   if (options.query) {
@@ -510,7 +541,7 @@ async function javdbRequest(path, env, fetchImpl, options = {}) {
     headers.set("authorization", options.token);
   }
 
-  const response = await fetchImpl(url.toString(), {
+  const response = await fetchWithRetry(fetchImpl, url.toString(), {
     method: options.method || "GET",
     headers,
     body: options.body,
@@ -529,7 +560,7 @@ async function javdbRequest(path, env, fetchImpl, options = {}) {
 }
 
 async function upstreamJson(path, env, fetchImpl) {
-  const response = await fetchImpl(new URL(path, upstreamOrigin(env)).toString(), {
+  const response = await fetchWithRetry(fetchImpl, new URL(path, upstreamOrigin(env)).toString(), {
     headers: { accept: "application/json" },
     redirect: "follow",
   });
@@ -541,7 +572,7 @@ async function upstreamJson(path, env, fetchImpl) {
 }
 
 async function resolverJson(path, env, fetchImpl) {
-  const response = await fetchImpl(`${resolverOrigin(env)}${path}`, {
+  const response = await fetchWithRetry(fetchImpl, `${resolverOrigin(env)}${path}`, {
     headers: { accept: "application/json" },
     redirect: "follow",
   });
@@ -1116,10 +1147,21 @@ async function personMoviesPage(query, env, fetchImpl, token) {
     return { Items: [], TotalRecordCount: 0, StartIndex: startIndex };
   }
 
+  // 与分类列表一致：客户端点演员后也可能按“年份/名称/添加时间”排序。
+  // 需要排序时就把该演员的作品抓全（各分类都翻到底）再排序分页，
+  // 否则排序只会作用在某一页的局部数据上，看起来就是“排序不生效”。
+  // 默认“最新上架”顺序才走快速分页，边抓边够当前页就提前返回。
+  const sortOrder = /^asc/i.test(String(query.get("SortOrder") || "")) ? "asc" : "desc";
+  const sortComparators = buildSortComparators(query.get("SortBy"));
+  const needsFullCatalog = !isNaturalCatalogOrder(sortComparators, sortOrder);
+
   const matches = [];
   const seen = new Set();
+  const libraryByKey = new Map();
+  let fullyScanned = true;
+
   for (const library of libraryList) {
-    if (matches.length >= requiredCount) break;
+    if (!needsFullCatalog && matches.length >= requiredCount) break;
     let sourcePage = 1;
     let sourceExhausted = false;
     while (sourcePage <= SEARCH_MAX_SOURCE_PAGES && !sourceExhausted) {
@@ -1145,26 +1187,37 @@ async function personMoviesPage(query, env, fetchImpl, token) {
         const key = String(movie.id ?? movie.number ?? "");
         if (key && !seen.has(key)) {
           seen.add(key);
-          matches.push({ movie, library });
+          matches.push(movie);
+          libraryByKey.set(key, library);
         }
       }
+      // 这一页不足一页，说明已经翻到结果末尾
       if (movies.length < SEARCH_SOURCE_PAGE_SIZE) {
         sourceExhausted = true;
         break;
       }
+      if (!needsFullCatalog && matches.length >= requiredCount) break;
       sourcePage += 1;
+    }
+    if (!sourceExhausted) {
+      fullyScanned = false;
     }
   }
 
-  const pageMovies = matches.slice(startIndex, requiredCount);
+  const orderedMovies = needsFullCatalog
+    ? sortMoviesForClient(matches, sortComparators, sortOrder)
+    : matches;
+  const pageMovies = orderedMovies.slice(startIndex, requiredCount);
   return {
-    Items: pageMovies.map(({ movie, library }) => mapMovie(
+    Items: pageMovies.map((movie) => mapMovie(
       movie,
       query.requestUrl || "https://localhost/",
       env,
-      library.id,
+      libraryByKey.get(String(movie.id ?? movie.number ?? ""))?.id ||
+        (singleLibrary ? singleLibrary.id : ""),
     )),
-    TotalRecordCount: matches.length,
+    // 已把相关分类都翻到底时用真实数量；否则略多报，让客户端能继续往下翻页
+    TotalRecordCount: fullyScanned ? matches.length : matches.length + 1,
     StartIndex: startIndex,
   };
 }
@@ -1344,46 +1397,49 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
     DefaultAudioStreamIndex: 1,
     DefaultSubtitleStreamIndex: subtitleStreams.length > 0 ? 2 : undefined,
     MediaStreams: [
-      // ===== 媒体信息精简：只显示“标题 + STRM”，隐藏类型/分辨率/码率等明细 =====
-      // 视频流只保留“类型 + 序号”等必要结构，供客户端识别有视频轨；
-      // 原来的 Codec / DisplayTitle / Width / Height / AspectRatio / VideoRange / IsAVC 等
-      // “编码格式、分辨率”字段已按需求注释掉（见下方 // 注释），媒体信息不再显示
-      // “1080p H264 SDR / HLS / AAC 立体声”这类内容。
-      {
-        Type: "Video",
-        // Codec: isHls ? "hls" : "h264",
-        // CodecTag: isHls ? undefined : "avc1",
-        // DisplayTitle: height > 0 ? (height + "p H264 SDR") : "H264 SDR", // 原行（显示 分辨率+H264）
-        IsDefault: true,
-        IsForced: false,
-        IsExternal: false,
-        Index: 0,
-        // Width: width,
-        // Height: height || undefined,
-        // AspectRatio: "16:9",
-        // VideoRange: "SDR",
-        // VideoRangeType: "SDR",
-        // IsInterlaced: false,
-        // IsAVC: !isHls,
-        // IsAnamorphic: false,
-        // TimeBase: "1/10000000",
-      },
-      // 音频流同样只保留必要结构，隐藏编码/声道/采样率等明细。
-      {
-        Type: "Audio",
-        // Codec: "aac",
-        // CodecTag: "mp4a",
-        // Language: "und",
-        // DisplayLanguage: "Undetermined",
-        // DisplayTitle: "AAC stereo",
-        Index: 1,
-        // Channels: 2,
-        // ChannelLayout: "stereo",
-        // SampleRate: 48000,
-        IsDefault: true,
-        IsForced: false,
-        IsExternal: false,
-      },
+      // ===== 媒体信息精简（第 2 步）：视频轨/音频轨整段停用，不再下发给客户端 =====
+      // 上一版虽然隐藏了“编码/分辨率/码率”，但客户端媒体信息里仍会显示
+      // “视频 编号 0”“音频 编号 1 默认 true 强制 false 外部 false”这类行。
+      // 现按需求把视频流、音频流整段注释掉，媒体信息不再出现这两条轨道，
+      // 只保留外部字幕流（供播放器选择“字幕 1 / 字幕 2…”）。
+      // 需要恢复时，把下面两段“// 原视频流 / // 原音频流”中的代码取消注释即可。
+      //
+      // 原视频流（含 Type/Index/IsDefault/IsForced/IsExternal 结构字段）：
+      // {
+      //   Type: "Video",
+      //   // Codec: isHls ? "hls" : "h264",
+      //   // CodecTag: isHls ? undefined : "avc1",
+      //   // DisplayTitle: height > 0 ? (height + "p H264 SDR") : "H264 SDR", // 原行（显示 分辨率+H264）
+      //   IsDefault: true,
+      //   IsForced: false,
+      //   IsExternal: false,
+      //   Index: 0,
+      //   // Width: width,
+      //   // Height: height || undefined,
+      //   // AspectRatio: "16:9",
+      //   // VideoRange: "SDR",
+      //   // VideoRangeType: "SDR",
+      //   // IsInterlaced: false,
+      //   // IsAVC: !isHls,
+      //   // IsAnamorphic: false,
+      //   // TimeBase: "1/10000000",
+      // },
+      // 原音频流（含 Type/Index/IsDefault/IsForced/IsExternal 结构字段）：
+      // {
+      //   Type: "Audio",
+      //   // Codec: "aac",
+      //   // CodecTag: "mp4a",
+      //   // Language: "und",
+      //   // DisplayLanguage: "Undetermined",
+      //   // DisplayTitle: "AAC stereo",
+      //   Index: 1,
+      //   // Channels: 2,
+      //   // ChannelLayout: "stereo",
+      //   // SampleRate: 48000,
+      //   IsDefault: true,
+      //   IsForced: false,
+      //   IsExternal: false,
+      // },
       ...subtitleStreams,
     ],
   };
@@ -1577,6 +1633,17 @@ function virtualFolder(library) {
   };
 }
 
+// 详情页内“顺带解析播放源”的预算时间：超过即先返回元数据，播放时再完整解析。
+const ITEM_DETAIL_RESOLVE_BUDGET_MS = 2000;
+
+function withTimeout(promise, ms) {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("resolve timed out")), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+}
+
 async function itemResponse(id, request, env, fetchImpl, token) {
   // 演员条目：Id 为 person:<演员名> 时直接返回 Person 对象，不当作影片回源。
   const personNameFromId = personNameFromItemId(id);
@@ -1590,18 +1657,43 @@ async function itemResponse(id, request, env, fetchImpl, token) {
 
   const item = mapMovie(movie, request.url, env);
   attachPlaybackUserData(item, await readPlaybackState(env, token));
-  const [video, subtitles] = await Promise.all([
-    resolveVideo(movie, env, fetchImpl),
-    hasChineseSubtitles(movie)
-      ? resolveSubtitles(movie, env, fetchImpl).catch(() => [])
-      : Promise.resolve([]),
-  ]);
+
+  // 详情页不应被“解析播放源/字幕”这类慢请求拖住：解析服务首次冷启动时
+  // 会明显变慢（第二次通常命中缓存才快），旧逻辑在返回详情前一直等它，
+  // 导致第一次点开影片详情时客户端长时间转圈。
+  // 这里只给一小段预算时间，能在预算内解析完成（通常是缓存命中）就顺带
+  // 返回 MediaSources；超时/失败就立刻先返回影片元数据，等用户真正点播放时
+  // 由 /PlaybackInfo 再做完整解析。
+  let video = null;
+  let subtitles = [];
+  let resolutionFinished = false;
+  try {
+    [video, subtitles] = await withTimeout(
+      Promise.all([
+        resolveVideo(movie, env, fetchImpl),
+        hasChineseSubtitles(movie)
+          ? resolveSubtitles(movie, env, fetchImpl).catch(() => [])
+          : Promise.resolve([]),
+      ]),
+      ITEM_DETAIL_RESOLVE_BUDGET_MS,
+    );
+    resolutionFinished = true;
+  } catch {
+    video = null;
+    subtitles = [];
+  }
+
   if (!video) {
-    item.PlayAccess = "None";
-    item.MediaSources = [];
-    item.MediaStreams = [];
-    item.MediaSourceCount = 0;
-    item.HasSubtitles = false;
+    if (resolutionFinished) {
+      // 解析已完成但确实没有可播放源：明确标成不可播放，避免客户端去请求播放。
+      item.PlayAccess = "None";
+      item.MediaSources = [];
+      item.MediaStreams = [];
+      item.MediaSourceCount = 0;
+      item.HasSubtitles = false;
+    }
+    // 解析超时/失败时不清空 PlayAccess，只返回元数据；
+    // 播放动作会再走 PlaybackInfo，届时能拿到最新解析结果。
     return jsonResponse(item);
   }
   const source = mediaSource(
