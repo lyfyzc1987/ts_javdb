@@ -739,11 +739,17 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     tags.unshift("可播放");
   }
   const uniqueTags = [...new Set(tags)];
-  const actors = (movie.actors || []).filter(Boolean).map((actor) => ({
-    Name: actor.name || actor,
-    Type: "Actor",
-    Id: String(actor.id || actor.name || ""),
-  }));
+  // 演员信息：Id 用 person:<演员名> 编码。客户端在详情里点击演员后，
+  // 服务端能凭这个 Id 反查出演员名，再回源搜索出该演员“可播放”的作品。
+  // （原实现 Id 用的是 JavDB 演员数字 id，无法反查演员名，点击演员没有结果。）
+  const actors = (movie.actors || []).filter(Boolean).map((actor) => {
+    const actorName = actor.name || actor;
+    return {
+      Name: actorName,
+      Type: "Actor",
+      Id: actorName ? "person:" + actorName : String(actor.id || actorName || ""),
+    };
+  });
   const item = {
     Id: id,
     ServerId: serverId(env),
@@ -1044,6 +1050,125 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
     StartIndex: startIndex,
   };
 }
+// ================= 演员（Person）相关 =================
+// 客户端在影片详情里点演员，通常会先请求“演员”条目（Person），再请求
+// “该演员出演的作品”列表。这里把 People 的 Id 编成 person:<演员名>，
+// 方便按名字回源 JavDB 搜索；列表只保留“可播放”的作品，与分类规则一致。
+const PERSON_ID_PREFIX = "person:";
+
+// person:<演员名> -> 演员名；非 person: 前缀返回 null（当作普通影片 id 处理）
+function personNameFromItemId(value) {
+  const text = String(value || "");
+  if (text.startsWith(PERSON_ID_PREFIX)) {
+    return text.slice(PERSON_ID_PREFIX.length) || null;
+  }
+  return null;
+}
+
+function personIdForName(name) {
+  return PERSON_ID_PREFIX + name;
+}
+
+// 演员条目（供客户端打开演员详情页 / 展示演员名）
+function personItemDto(id, name, env) {
+  return {
+    Id: id,
+    Name: name,
+    ServerId: serverId(env),
+    Type: "Person",
+    IsFolder: false,
+    CanDelete: false,
+    CanDownload: false,
+    PlayAccess: "None",
+    ImageTags: {},
+    BackdropImageTags: [],
+    Overview: "",
+  };
+}
+
+// 按演员名回源搜索其“可播放”作品（跨分类汇总、去重后返回）。
+// 客户端点演员后带的请求一般是 /Items?PersonIds=person:<名字>&...
+async function personMoviesPage(query, env, fetchImpl, token) {
+  const startIndex = Math.max(0, Number(query.get("StartIndex") || 0));
+  const limit = Math.min(
+    DEFAULT_PAGE_SIZE,
+    Math.max(1, Number(query.get("Limit") || DEFAULT_PAGE_SIZE)),
+  );
+  const requiredCount = startIndex + limit;
+  // 若请求指定了某个分类（ParentId），只在该分类里搜；否则跨四个分类汇总，
+  // 因为同一个演员的作品可能分散在“中文字幕/有码/无码/欧美”里。
+  const requestedParentId = query.get("ParentId") || "";
+  const singleLibrary = LIBRARIES.find((lib) => lib.id === requestedParentId) || null;
+  const libraryList = singleLibrary ? [singleLibrary] : LIBRARIES;
+
+  const personIdValues = [];
+  for (const raw of query.getAll("PersonIds")) {
+    for (const part of String(raw).split(",")) {
+      const trimmed = part.trim();
+      if (trimmed) personIdValues.push(trimmed);
+    }
+  }
+  const personNames = personIdValues
+    .map((value) => personNameFromItemId(value) || value)
+    .filter(Boolean);
+  const searchTerm = personNames[0] || "";
+  if (!searchTerm) {
+    return { Items: [], TotalRecordCount: 0, StartIndex: startIndex };
+  }
+
+  const matches = [];
+  const seen = new Set();
+  for (const library of libraryList) {
+    if (matches.length >= requiredCount) break;
+    let sourcePage = 1;
+    let sourceExhausted = false;
+    while (sourcePage <= SEARCH_MAX_SOURCE_PAGES && !sourceExhausted) {
+      const payload = await javdbRequest("/v2/search", env, fetchImpl, {
+        query: {
+          q: searchTerm,
+          page: sourcePage,
+          type: "movie",
+          movie_filter_by: library.sourceFilter,
+          limit: SEARCH_SOURCE_PAGE_SIZE,
+        },
+        token: await apiToken(token, env),
+      });
+      const movies = moviesFromPayload(payload);
+      if (movies.length === 0) {
+        sourceExhausted = true;
+        break;
+      }
+      for (const movie of movies) {
+        if (!library.matches(movie)) {
+          continue;
+        }
+        const key = String(movie.id ?? movie.number ?? "");
+        if (key && !seen.has(key)) {
+          seen.add(key);
+          matches.push({ movie, library });
+        }
+      }
+      if (movies.length < SEARCH_SOURCE_PAGE_SIZE) {
+        sourceExhausted = true;
+        break;
+      }
+      sourcePage += 1;
+    }
+  }
+
+  const pageMovies = matches.slice(startIndex, requiredCount);
+  return {
+    Items: pageMovies.map(({ movie, library }) => mapMovie(
+      movie,
+      query.requestUrl || "https://localhost/",
+      env,
+      library.id,
+    )),
+    TotalRecordCount: matches.length,
+    StartIndex: startIndex,
+  };
+}
+
 
 async function resolveVideo(movie, env, fetchImpl) {
   const code = movie.number || movie.code || movie.id || movie.title;
@@ -1146,8 +1271,12 @@ async function resolveSubtitles(movie, env, fetchImpl) {
 
 function mediaSource(item, requestUrl, token, video, subtitles = []) {
   const isHls = /mpegurl|m3u8/i.test(video.sourceType || video.sourceUrl);
-  // 媒体信息里的“容器”提示统一显示成 HLS，而不是 M3U8。
-  const container = isHls ? "hls" : "mp4";
+  // ===== 媒体信息 STRM 化（旧逻辑以注释保留，便于恢复）=====
+  // 旧版：容器提示是 HLS / M3U8，客户端媒体信息里会显示 “HLS / M3U8”：
+  //   旧代码：const container = isHls ? "hls" : "mp4";
+  // 新版：改成 STRM 提示，让客户端把每条资源当成一个 .strm 远程文件。
+  // 真实播放地址仍是下方 streamExtension 生成的 .m3u8 / .mp4（未改动），播放不受影响。
+  const container = isHls ? "strm" : "mp4";
   // 实际播放/下载地址的后缀仍用 .m3u8 / .mp4，保持真实文件类型。
   const streamExtension = isHls ? "m3u8" : "mp4";
   const height = Number(video.quality || 0);
@@ -1215,36 +1344,42 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
     DefaultAudioStreamIndex: 1,
     DefaultSubtitleStreamIndex: subtitleStreams.length > 0 ? 2 : undefined,
     MediaStreams: [
+      // ===== 媒体信息精简：只显示“标题 + STRM”，隐藏类型/分辨率/码率等明细 =====
+      // 视频流只保留“类型 + 序号”等必要结构，供客户端识别有视频轨；
+      // 原来的 Codec / DisplayTitle / Width / Height / AspectRatio / VideoRange / IsAVC 等
+      // “编码格式、分辨率”字段已按需求注释掉（见下方 // 注释），媒体信息不再显示
+      // “1080p H264 SDR / HLS / AAC 立体声”这类内容。
       {
         Type: "Video",
-        Codec: isHls ? "hls" : "h264",
-        CodecTag: isHls ? undefined : "avc1",
-        DisplayTitle: height > 0 ? `${height}p H264 SDR` : "H264 SDR",
+        // Codec: isHls ? "hls" : "h264",
+        // CodecTag: isHls ? undefined : "avc1",
+        // DisplayTitle: height > 0 ? (height + "p H264 SDR") : "H264 SDR", // 原行（显示 分辨率+H264）
         IsDefault: true,
         IsForced: false,
         IsExternal: false,
         Index: 0,
-        Width: width,
-        Height: height || undefined,
-        AspectRatio: "16:9",
-        VideoRange: "SDR",
-        VideoRangeType: "SDR",
-        IsInterlaced: false,
-        IsAVC: !isHls,
-        IsAnamorphic: false,
-        TimeBase: "1/10000000",
+        // Width: width,
+        // Height: height || undefined,
+        // AspectRatio: "16:9",
+        // VideoRange: "SDR",
+        // VideoRangeType: "SDR",
+        // IsInterlaced: false,
+        // IsAVC: !isHls,
+        // IsAnamorphic: false,
+        // TimeBase: "1/10000000",
       },
+      // 音频流同样只保留必要结构，隐藏编码/声道/采样率等明细。
       {
         Type: "Audio",
-        Codec: "aac",
-        CodecTag: "mp4a",
-        Language: "und",
-        DisplayLanguage: "Undetermined",
-        DisplayTitle: "AAC stereo",
+        // Codec: "aac",
+        // CodecTag: "mp4a",
+        // Language: "und",
+        // DisplayLanguage: "Undetermined",
+        // DisplayTitle: "AAC stereo",
         Index: 1,
-        Channels: 2,
-        ChannelLayout: "stereo",
-        SampleRate: 48000,
+        // Channels: 2,
+        // ChannelLayout: "stereo",
+        // SampleRate: 48000,
         IsDefault: true,
         IsForced: false,
         IsExternal: false,
@@ -1443,6 +1578,11 @@ function virtualFolder(library) {
 }
 
 async function itemResponse(id, request, env, fetchImpl, token) {
+  // 演员条目：Id 为 person:<演员名> 时直接返回 Person 对象，不当作影片回源。
+  const personNameFromId = personNameFromItemId(id);
+  if (personNameFromId) {
+    return jsonResponse(personItemDto(id, personNameFromId, env));
+  }
   const movie = await getMovie(id, env, fetchImpl, token);
   if (!movie?.id && !movie?.number) {
     return errorResponse(404, "Movie not found");
@@ -2093,6 +2233,7 @@ function isHandledPath(path) {
     path === "/Genres" ||
     path === "/Studios" ||
     path === "/Persons" ||
+    /^\/Persons\/[^/]+$/i.test(path) ||
     path === "/SearchHints" ||
     path === "/Sessions" ||
     path === "/Sessions/Capabilities" ||
@@ -2326,6 +2467,16 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     try {
       const query = new URLSearchParams(url.search);
       query.requestUrl = request.url;
+      // 点击演员后的“该演员出演作品”列表：客户端会带 PersonIds=person:<演员名>。
+      // 走专门的演员检索，只返回可播放作品；没有 PersonIds 才是普通浏览/搜索。
+      if (query.has("PersonIds") && !query.get("SearchTerm")) {
+        const personResult = await personMoviesPage(query, env, fetchImpl, token);
+        const personState = await readPlaybackState(env, token);
+        personResult.Items = personResult.Items.map((item) =>
+          attachPlaybackUserData({ ...item, Path: item.Path }, personState),
+        );
+        return jsonResponse(personResult);
+      }
       const result = await getMoviePage(query, env, fetchImpl, token);
       const userDataState = await readPlaybackState(env, token);
       result.Items = result.Items.map((item) => attachPlaybackUserData({ ...item, Path: item.Path }, userDataState));
@@ -2396,6 +2547,12 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       }));
       return jsonResponse(emptyItemQuery());
     }
+  }
+  // 演员单条详情：/Persons/<演员名>（部分客户端点演员后先请求这个接口）
+  const personSingleMatch = path.match(/^\/Persons\/([^/]+)$/i);
+  if (personSingleMatch) {
+    const personName = decodeURIComponent(personSingleMatch[1]);
+    return jsonResponse(personItemDto(personIdForName(personName), personName, env));
   }
   if (
     path === "/Shows/NextUp" ||
