@@ -1691,9 +1691,24 @@ async function itemResponse(id, request, env, fetchImpl, token) {
       item.MediaStreams = [];
       item.MediaSourceCount = 0;
       item.HasSubtitles = false;
+      return jsonResponse(item);
     }
-    // 解析超时/失败时不清空 PlayAccess，只返回元数据；
-    // 播放动作会再走 PlaybackInfo，届时能拿到最新解析结果。
+    // 解析超时/未在预算内完成：仍返回一条占位媒体源，保证客户端显示“播放”按钮。
+    // 该占位地址只是入口，真正播放时会由 /PlaybackInfo 与 /Videos/{id}/stream
+    // 重新完整解析出真实播放地址，因此不影响实际播放。
+    const placeholder = mediaSource(
+      item,
+      request.url,
+      token || (guestAccessEnabled(env) ? guestToken(env) : ""),
+      { title: item.Name, sourceType: "video/mp4" },
+      [],
+    );
+    item.Path = placeholder.Path;
+    item.MediaSources = [placeholder];
+    item.MediaStreams = placeholder.MediaStreams;
+    item.MediaSourceCount = 1;
+    item.Container = placeholder.Container;
+    item.HasSubtitles = false;
     return jsonResponse(item);
   }
   const source = mediaSource(
