@@ -1,6 +1,9 @@
 const DEFAULT_API_ORIGIN = "https://jdforrepam.com/api";
 const DEFAULT_UPSTREAM_ORIGIN = "https://catembylegacy.fastcdn.dpdns.org";
-const DEFAULT_RESOLVER_ORIGIN = "https://javstrm.emby-59f.workers.dev";
+const DEFAULT_RESOLVER_ORIGIN = "https://catembylegacy.fastcdn.dpdns.org";
+// 原站公开解析接口为 /api/v/resolve（无需登录）；旧解析器路径为 /api/resolve，
+// 可用 JAVSTRM_RESOLVE_PATH 覆盖，便于随时切回或换源。
+const DEFAULT_RESOLVER_RESOLVE_PATH = "/api/v/resolve";
 const SIGNATURE_KEY = "lpw6vgqzsp";
 const SIGNATURE_SECRET =
   "71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa";
@@ -230,6 +233,12 @@ function upstreamOrigin(env) {
 
 function resolverOrigin(env) {
   return String(env.JAVSTRM_ORIGIN || DEFAULT_RESOLVER_ORIGIN).replace(/\/$/, "");
+}
+
+function resolverResolvePath(env) {
+  const value = String(env.JAVSTRM_RESOLVE_PATH || DEFAULT_RESOLVER_RESOLVE_PATH).trim();
+  if (!value) return DEFAULT_RESOLVER_RESOLVE_PATH;
+  return value.startsWith("/") ? value : `/${value}`;
 }
 
 function mediaHostAllowed(hostname, env) {
@@ -1230,7 +1239,7 @@ async function resolveVideo(movie, env, fetchImpl) {
   }
 
   const payload = await resolverJson(
-    `/api/resolve?code=${encodeURIComponent(code)}&lang=zh`,
+    `${resolverResolvePath(env)}?code=${encodeURIComponent(code)}&lang=zh`,
     env,
     fetchImpl,
   );
@@ -1966,7 +1975,7 @@ function userDataForRecord(record) {
   return {
     Played: played,
     PlayCount: Math.max(0, Math.floor(Number(record && record.playCount) || (played ? 1 : 0))),
-    IsFavorite: false,
+    IsFavorite: Boolean(record && record.favorite),
     PlaybackPositionTicks: positionTicks,
     LastPlayedDate: record && record.lastPlayedDate ? record.lastPlayedDate : null,
   };
@@ -2366,6 +2375,7 @@ function isHandledPath(path) {
     /^\/Users\/[^/]+\/PlayedItems\/[^/]+$/i.test(path) ||
     /^\/Users\/[^/]+\/UnplayedItems\/[^/]+$/i.test(path) ||
     /^\/Users\/[^/]+\/PlayingItems\/[^/]+$/i.test(path) ||
+    /^\/Users\/[^/]+\/FavoriteItems\/[^/]+$/i.test(path) ||
     path.toLowerCase().startsWith("/items/") ||
     path.toLowerCase().startsWith("/videos/") ||
     path.toLowerCase().startsWith("/emby-media/")
@@ -2434,7 +2444,7 @@ async function deviceBindingFailure(request, url, env, path) {
     return null;
   }
   // 播放进度上报/已播标记来自播放器，放行并允许带 token 上报，不做设备绑定拦截
-  if (/^\/(?:Sessions\/Playing(?:\/Progress|\/Stopped)?|Items\/[^/]+\/UserData|Users\/[^/]+\/(?:PlayedItems|UnplayedItems|PlayingItems)\/[^/]+)$/i.test(path)) {
+  if (/^\/(?:Sessions\/Playing(?:\/Progress|\/Stopped)?|Items\/[^/]+\/UserData|Users\/[^/]+\/(?:PlayedItems|UnplayedItems|PlayingItems|FavoriteItems)\/[^/]+)$/i.test(path)) {
     return null;
   }
   const record = await lookupSessionRecord(env, token);
@@ -2762,6 +2772,18 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     await writePlaybackState(env, playedState, token);
     return noContentResponse();
   }
+  // “移除播放记录 / 标记未播放”：Emby 官方接口就是
+  // DELETE /Users/{uid}/PlayedItems/{id}。旧代码只处理了 POST/PUT，
+  // 所以客户端一点“移除播放记录”就会拿到 404。
+  if (playedItemsMatch && request.method === "DELETE") {
+    const removedPlayedId = decodeURIComponent(playedItemsMatch[1]);
+    const removedPlayedState = await readPlaybackState(env, token);
+    if (removedPlayedState[removedPlayedId]) {
+      delete removedPlayedState[removedPlayedId];
+      await writePlaybackState(env, removedPlayedState, token);
+    }
+    return noContentResponse();
+  }
   const unplayedItemsMatch = path.match(/^\/Users\/[^/]+\/UnplayedItems\/([^/]+)$/i);
   if (unplayedItemsMatch && (request.method === "POST" || request.method === "DELETE")) {
     const unplayedItemId = decodeURIComponent(unplayedItemsMatch[1]);
@@ -2806,6 +2828,34 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       playingState[playingItemId] = playingRecord;
       await writePlaybackState(env, playingState, token);
     }
+    return noContentResponse();
+  }
+  // 结束播放：DELETE /Users/{uid}/PlayingItems/{id}
+  if (playingItemsMatch && request.method === "DELETE") {
+    const stoppedItemId = decodeURIComponent(playingItemsMatch[1]);
+    const stoppedState = await readPlaybackState(env, token);
+    if (stoppedState[stoppedItemId]) {
+      delete stoppedState[stoppedItemId];
+      await writePlaybackState(env, stoppedState, token);
+    }
+    return noContentResponse();
+  }
+  // 收藏 / 取消收藏：POST 与 DELETE /Users/{uid}/FavoriteItems/{id}
+  const favoriteItemsMatch = path.match(/^\/Users\/[^/]+\/FavoriteItems\/([^/]+)$/i);
+  if (favoriteItemsMatch && ["POST", "PUT", "DELETE"].includes(request.method)) {
+    const favoriteItemId = decodeURIComponent(favoriteItemsMatch[1]);
+    const favoriteState = await readPlaybackState(env, token);
+    const favoriteRecord = favoriteState[favoriteItemId] || {
+      itemId: favoriteItemId,
+      positionTicks: 0,
+      played: false,
+      playCount: 0,
+      lastPlayedDate: "",
+    };
+    favoriteRecord.itemId = favoriteItemId;
+    favoriteRecord.favorite = request.method !== "DELETE";
+    favoriteState[favoriteItemId] = favoriteRecord;
+    await writePlaybackState(env, favoriteState, token);
     return noContentResponse();
   }
   if (path === "/Movies/Recommendations") {
@@ -2977,6 +3027,24 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       status: upstream.status,
       headers: responseHeaders,
     });
+  }
+
+  // 兜底：不同客户端“移除播放记录/标记未播放/取消收藏”用的路径不完全一样，
+  // 只要是针对某个条目的 DELETE，就统一清掉该条目的播放记录并返回 204，
+  // 避免客户端因为打到没实现的路径而报 404。
+  if (request.method === "DELETE") {
+    const deleteFallback =
+      path.match(/^\/Items\/([^/]+)\/(?:UserData|PlayedItems|UnplayedItems|PlayingItems|FavoriteItems)$/i) ||
+      path.match(/^\/Users\/[^/]+\/(?:PlayedItems|UnplayedItems|PlayingItems|FavoriteItems)\/([^/]+)$/i);
+    if (deleteFallback) {
+      const deleteItemId = decodeURIComponent(deleteFallback[1]);
+      const deleteState = await readPlaybackState(env, token);
+      if (deleteState[deleteItemId]) {
+        delete deleteState[deleteItemId];
+        await writePlaybackState(env, deleteState, token);
+      }
+      return noContentResponse();
+    }
   }
 
   return errorResponse(404, "Emby endpoint not found");
