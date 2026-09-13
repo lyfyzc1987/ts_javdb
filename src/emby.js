@@ -1018,12 +1018,14 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
   const date = movie.release_date || movie.released_at || "";
   const year = Number.parseInt(String(date).slice(0, 4), 10);
   const duration = Number(movie.duration || 0);
-  const tags = (movie.tags || []).map(tagName).filter(Boolean);
+  // 上游返回的标签（巨乳 / 单体作品 / 4K 等）同时当作“类别”和“标签”用；
+  // “中文字幕”是本服务自己补的一个可点击筛选标签。
+  // 注意：不再补“可播放”这个标签（按需求，类别/标签里不显示它），
+  // 但点任意类别/标签搜出来的列表仍然只包含可播放的作品（由各片库的筛选保证）。
+  const sourceTags = [...new Set((movie.tags || []).map(tagName).filter(Boolean))];
+  const tags = sourceTags.slice();
   if (hasChineseSubtitles(movie)) {
     tags.unshift("中文字幕");
-  }
-  if (movie.can_play) {
-    tags.unshift("可播放");
   }
   const uniqueTags = [...new Set(tags)];
   // 演员信息：Id 用 person:<演员名> 编码。客户端在详情里点击演员后，
@@ -1060,6 +1062,10 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     RunTimeTicks: duration > 0 ? Math.round(duration * 60 * 10_000_000) : undefined,
     Genres: uniqueTags,
     Tags: uniqueTags,
+    // 详情页里的“类别 / 标签”是可点击的：Id 带前缀，客户端点下去会带
+    // GenreIds / TagIds 回来，服务端再按名字回源搜索。
+    GenreItems: uniqueTags.map((name) => ({ Name: name, Id: genreIdForName(name) })),
+    TagItems: uniqueTags.map((name) => ({ Name: name, Id: tagIdForName(name) })),
     People: actors,
     ImageTags: image ? { Primary: id } : {},
     BackdropImageTags: [],
@@ -1073,19 +1079,38 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     },
   };
 
-  if (movie.maker_name) {
-    item.Studios = [{ Name: movie.maker_name, Id: String(movie.maker_id || "") }];
+  // 片商 / 导演 / 系列：Id 同样带前缀，点进去也能按名字回源搜索
+  //（原来导演用的是数字 id，点开是空列表）。
+  const studioName = String(movie.maker_name || "").trim();
+  if (studioName) {
+    item.Studios = [{ Name: studioName, Id: studioIdForName(studioName) }];
+  } else if (movie.maker_id) {
+    item.Studios = [{ Name: String(movie.maker_id), Id: String(movie.maker_id) }];
   }
-  if (movie.director_name) {
+  const directorName = String(movie.director_name || "").trim();
+  if (directorName) {
     item.People.push({
-      Name: movie.director_name,
+      Name: directorName,
       Type: "Director",
-      Id: String(movie.director_id || movie.director_name),
+      Id: personIdForName(directorName),
+    });
+  } else if (movie.director_id) {
+    item.People.push({
+      Name: String(movie.director_id),
+      Type: "Director",
+      Id: String(movie.director_id),
     });
   }
-  if (movie.series_name) {
-    item.SeriesName = movie.series_name;
-    item.SeriesId = String(movie.series_id || "");
+  const seriesName = String(movie.series_name || "").trim();
+  if (seriesName) {
+    item.SeriesName = seriesName;
+    item.SeriesId = seriesIdForName(seriesName);
+    const seriesStudio = item.Studios && item.Studios[0];
+    if (seriesStudio) {
+      item.SeriesStudio = seriesStudio.Name;
+    }
+  } else if (movie.series_id) {
+    item.SeriesId = String(movie.series_id);
   }
 
   return item;
@@ -1369,6 +1394,78 @@ function personIdForName(name) {
   return PERSON_ID_PREFIX + name;
 }
 
+// ================= 类别 / 标签 / 片商 / 系列 =================
+// 详情页里这些字段都做成“点得动”的：Id 统一带前缀，
+// 客户端点击后会带 GenreIds / TagIds / StudioIds / SeriesId 回来，
+// 服务端凭前缀还原出名字，再像演员一样回源搜索“可播放”的作品。
+const GENRE_ID_PREFIX = "genre:";
+const TAG_ID_PREFIX = "tag:";
+const STUDIO_ID_PREFIX = "studio:";
+const SERIES_ID_PREFIX = "series:";
+// 本服务自己补的两个通用标签：点它们不按关键词搜，直接浏览对应片库。
+const CUSTOM_TAG_CHINESE_SUBTITLE = "中文字幕";
+const CUSTOM_TAG_PLAYABLE = "可播放";
+
+function genreIdForName(name) {
+  return GENRE_ID_PREFIX + name;
+}
+
+function tagIdForName(name) {
+  return TAG_ID_PREFIX + name;
+}
+
+function studioIdForName(name) {
+  return STUDIO_ID_PREFIX + name;
+}
+
+function seriesIdForName(name) {
+  return SERIES_ID_PREFIX + name;
+}
+
+// 把带前缀的 Id 还原成名字；没带前缀就原样返回（兼容客户端直接传名称）。
+function nameFromPrefixedId(value) {
+  const text = String(value || "").trim();
+  for (const prefix of [GENRE_ID_PREFIX, TAG_ID_PREFIX, STUDIO_ID_PREFIX, SERIES_ID_PREFIX]) {
+    if (text.startsWith(prefix)) {
+      return text.slice(prefix.length).trim();
+    }
+  }
+  return text;
+}
+
+function safeDecodeComponent(value) {
+  const text = String(value || "");
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+// /Items 上带这些参数，说明用户点了“类别 / 标签 / 片商 / 系列”。
+const COLLECTION_FILTER_PARAMS = [
+  "GenreIds",
+  "TagIds",
+  "StudioIds",
+  "SeriesId",
+  "Genres",
+  "Tags",
+  "Studios",
+  "Series",
+];
+
+function collectionFilterName(query) {
+  for (const param of COLLECTION_FILTER_PARAMS) {
+    const raw = query.get(param);
+    if (!raw) continue;
+    const first = String(raw).split(",")[0].trim();
+    if (!first) continue;
+    const name = nameFromPrefixedId(first);
+    if (name) return name;
+  }
+  return "";
+}
+
 // 演员条目（供客户端打开演员详情页 / 展示演员名）
 function personItemDto(id, name, env) {
   return {
@@ -1386,9 +1483,10 @@ function personItemDto(id, name, env) {
   };
 }
 
-// 按演员名回源搜索其“可播放”作品（跨分类汇总、去重后返回）。
-// 客户端点演员后带的请求一般是 /Items?PersonIds=person:<名字>&...
-async function personMoviesPage(query, env, fetchImpl, token) {
+// 按关键词回源搜索作品（跨分类汇总、去重后返回）。
+// searchTerm 可以是演员名、类别名、标签名、片商名或系列名；
+// 传空字符串表示不搜索、直接按“最新上架”浏览（“可播放 / 中文字幕”这类内置标签用）。
+async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cacheKind) {
   const startIndex = Math.max(0, Number(query.get("StartIndex") || 0));
   const limit = Math.min(
     DEFAULT_PAGE_SIZE,
@@ -1396,25 +1494,10 @@ async function personMoviesPage(query, env, fetchImpl, token) {
   );
   const requiredCount = startIndex + limit;
   // 若请求指定了某个分类（ParentId），只在该分类里搜；否则跨四个分类汇总，
-  // 因为同一个演员的作品可能分散在“中文字幕/有码/无码/欧美”里。
+  // 因为同一位演员 / 同一个标签的作品可能分散在“中文字幕/有码/无码/欧美”里。
   const requestedParentId = query.get("ParentId") || "";
   const singleLibrary = LIBRARIES.find((lib) => lib.id === requestedParentId) || null;
   const libraryList = singleLibrary ? [singleLibrary] : LIBRARIES;
-
-  const personIdValues = [];
-  for (const raw of query.getAll("PersonIds")) {
-    for (const part of String(raw).split(",")) {
-      const trimmed = part.trim();
-      if (trimmed) personIdValues.push(trimmed);
-    }
-  }
-  const personNames = personIdValues
-    .map((value) => personNameFromItemId(value) || value)
-    .filter(Boolean);
-  const searchTerm = personNames[0] || "";
-  if (!searchTerm) {
-    return { Items: [], TotalRecordCount: 0, StartIndex: startIndex };
-  }
 
   // 与分类列表一致：客户端点演员后也可能按“年份/名称/添加时间”排序。
   // 需要排序时就把该演员的作品抓全（各分类都翻到底）再排序分页，
@@ -1427,7 +1510,7 @@ async function personMoviesPage(query, env, fetchImpl, token) {
   const upstreamToken = await apiToken(token, env);
 
   const cacheKey = [
-    "person-page-v1",
+    `${cacheKind}-page-v1`,
     apiOrigin(env),
     upstreamToken ? "u" : "g",
     searchTerm,
@@ -1457,7 +1540,7 @@ async function personMoviesPage(query, env, fetchImpl, token) {
 
     if (needsFullCatalog) {
       // 需要全量排序：各分类同时抓取，缩短“按年份排序”这类请求的等待。
-      const scans = await Promise.all(libraryList.map((library) => scanPersonLibrary(library, {
+      const scans = await Promise.all(libraryList.map((library) => scanLibraryMovies(library, {
         searchTerm,
         env,
         fetchImpl,
@@ -1475,7 +1558,7 @@ async function personMoviesPage(query, env, fetchImpl, token) {
     } else {
       for (const library of libraryList) {
         if (matches.length >= requiredCount) break;
-        const scan = await scanPersonLibrary(library, {
+        const scan = await scanLibraryMovies(library, {
           searchTerm,
           env,
           fetchImpl,
@@ -1520,8 +1603,52 @@ async function personMoviesPage(query, env, fetchImpl, token) {
   };
 }
 
-// 按演员名在单个分类里检索其“可播放”作品。
-async function scanPersonLibrary(library, options) {
+// 点击“类别 / 标签 / 片商 / 系列”后的作品列表：把 Id 还原出的名字当关键词搜。
+async function collectionMoviesPage(query, env, fetchImpl, token, name) {
+  // “中文字幕 / 可播放”是本服务自己补的标签：不按关键词搜，直接浏览片库。
+  if (name === CUSTOM_TAG_CHINESE_SUBTITLE || name === CUSTOM_TAG_PLAYABLE) {
+    const browseQuery = new URLSearchParams(query);
+    for (const param of COLLECTION_FILTER_PARAMS) {
+      browseQuery.delete(param);
+    }
+    browseQuery.delete("SearchTerm");
+    browseQuery.requestUrl = query.requestUrl || "https://localhost/";
+    if (name === CUSTOM_TAG_CHINESE_SUBTITLE) {
+      browseQuery.set("ParentId", CHINESE_PLAYABLE_LIBRARY_ID);
+      return keywordMoviesPage(browseQuery, env, fetchImpl, token, "", "collection-cn");
+    }
+    // 四个分类里的影片都是“可播放”，去掉分类限制就等于全库浏览。
+    browseQuery.delete("ParentId");
+    return keywordMoviesPage(browseQuery, env, fetchImpl, token, "", "collection-all");
+  }
+  return keywordMoviesPage(query, env, fetchImpl, token, name, "collection");
+}
+
+// 演员：客户端点演员后带的请求一般是 /Items?PersonIds=person:<名字>&...
+async function personMoviesPage(query, env, fetchImpl, token) {
+  const personIdValues = [];
+  for (const raw of query.getAll("PersonIds")) {
+    for (const part of String(raw).split(",")) {
+      const trimmed = part.trim();
+      if (trimmed) personIdValues.push(trimmed);
+    }
+  }
+  const personNames = personIdValues
+    .map((value) => personNameFromItemId(value) || value)
+    .filter(Boolean);
+  const searchTerm = personNames[0] || "";
+  if (!searchTerm) {
+    return {
+      Items: [],
+      TotalRecordCount: 0,
+      StartIndex: Math.max(0, Number(query.get("StartIndex") || 0)),
+    };
+  }
+  return keywordMoviesPage(query, env, fetchImpl, token, searchTerm, "person");
+}
+
+// 在单个分类里抓取作品：给了关键词就回源搜索，没给关键词就按“最新上架”浏览。
+async function scanLibraryMovies(library, options) {
   const {
     searchTerm,
     env,
@@ -1533,21 +1660,33 @@ async function scanPersonLibrary(library, options) {
   } = options;
   const movies = [];
   const seen = new Set();
+  const byKeyword = Boolean(String(searchTerm || "").trim());
   const exhausted = await fetchPagesInParallel({
-    maxPages: SEARCH_MAX_SOURCE_PAGES,
-    pageSize: SEARCH_SOURCE_PAGE_SIZE,
+    maxPages: byKeyword ? SEARCH_MAX_SOURCE_PAGES : HOME_MAX_SOURCE_PAGES,
+    pageSize: byKeyword ? SEARCH_SOURCE_PAGE_SIZE : HOME_SOURCE_PAGE_SIZE,
     needAll,
     enough: () => alreadyCount + movies.length >= requiredCount,
-    fetchPage: (page) => javdbRequest("/v2/search", env, fetchImpl, {
-      query: {
-        q: searchTerm,
-        page,
-        type: "movie",
-        movie_filter_by: library.sourceFilter,
-        limit: SEARCH_SOURCE_PAGE_SIZE,
-      },
-      token: upstreamToken,
-    }).then(moviesFromPayload),
+    fetchPage: (page) => (byKeyword
+      ? javdbRequest("/v2/search", env, fetchImpl, {
+        query: {
+          q: searchTerm,
+          page,
+          type: "movie",
+          movie_filter_by: library.sourceFilter,
+          limit: SEARCH_SOURCE_PAGE_SIZE,
+        },
+        token: upstreamToken,
+      })
+      : javdbRequest("/v1/movies/latest", env, fetchImpl, {
+        query: {
+          page,
+          filter_by: library.sourceFilter,
+          type: library.sourceType,
+          limit: HOME_SOURCE_PAGE_SIZE,
+        },
+        token: upstreamToken,
+      })
+    ).then(moviesFromPayload),
     collect: (pageMovies) => {
       for (const movie of pageMovies) {
         if (!library.matches(movie)) continue;
@@ -2456,6 +2595,110 @@ async function favoriteItemsPage(query, env, fetchImpl, token) {
   };
 }
 
+// ================= 分类 / 片商 列表（客户端分类页用） =================
+// 客户端进入“分类”页会请求 /Genres，“片商”页会请求 /Studios。
+// 上游 /v1/tags、/v1/makers 本身就能给出清单，取一次缓存很久即可，
+// 不必为了汇总标签把整个片库都爬一遍。
+const FACET_CACHE_TTL_SECONDS = 6 * 60 * 60;
+// 年份 / 时长属于“筛选条件”，放进分类页里点开没有意义，这里过滤掉。
+const FACET_EXCLUDED_TAG_CATEGORIES = new Set(["year", "duration"]);
+
+async function upstreamFacetNames(kind, env, fetchImpl, token) {
+  const upstreamToken = await apiToken(token, env);
+  const cacheKey = ["facets-v1", kind, apiOrigin(env), upstreamToken ? "u" : "g"].join("|");
+  return LIST_CACHE.fetch(cacheKey, async () => {
+    const shared = await edgeCacheRead(EDGE_NAMESPACE_LIST, cacheKey);
+    if (Array.isArray(shared)) {
+      return shared;
+    }
+    const names = new Set();
+    const facetPath = kind === "studio" ? "/v1/makers" : "/v1/tags";
+    for (const type of ["0", "1", "2"]) {
+      try {
+        const payload = await javdbRequest(facetPath, env, fetchImpl, {
+          query: { type },
+          token: upstreamToken,
+        });
+        if (kind === "studio") {
+          for (const maker of payload?.makers || []) {
+            const name = String(maker?.name || "").trim();
+            if (name) names.add(name);
+          }
+        } else {
+          for (const group of payload?.tags || []) {
+            if (FACET_EXCLUDED_TAG_CATEGORIES.has(String(group?.category_id || ""))) {
+              continue;
+            }
+            for (const tag of group?.tags || []) {
+              const name = String(tag?.name || "").trim();
+              if (name) names.add(name);
+            }
+          }
+        }
+      } catch {
+        // 单个分类抓取失败不影响整体：能拿到多少算多少。
+      }
+    }
+    const list = [...names].sort((left, right) => left.localeCompare(right, "zh-Hans-CN"));
+    if (list.length) {
+      await edgeCacheWrite(EDGE_NAMESPACE_LIST, cacheKey, list, FACET_CACHE_TTL_SECONDS);
+    }
+    return list;
+  });
+}
+
+async function genreFacetNames(env, fetchImpl, token) {
+  try {
+    return await upstreamFacetNames("tag", env, fetchImpl, token);
+  } catch {
+    return [];
+  }
+}
+
+async function genreFacetItems(env, fetchImpl, token) {
+  const names = await genreFacetNames(env, fetchImpl, token);
+  return names.map((name) => ({
+    Name: name,
+    Id: genreIdForName(name),
+    ServerId: serverId(env),
+    Type: "Genre",
+    IsFolder: false,
+    ImageTags: {},
+    BackdropImageTags: [],
+  }));
+}
+
+async function studioFacetItems(env, fetchImpl, token) {
+  let names = [];
+  try {
+    names = await upstreamFacetNames("studio", env, fetchImpl, token);
+  } catch {
+    names = [];
+  }
+  return names.map((name) => ({
+    Name: name,
+    Id: studioIdForName(name),
+    ServerId: serverId(env),
+    Type: "Studio",
+    IsFolder: false,
+    ImageTags: {},
+    BackdropImageTags: [],
+  }));
+}
+
+// 单条影片元数据（不解析播放源）：批量取条目时用，保证标签/演员等字段齐全。
+async function movieItemById(id, requestUrl, env, fetchImpl, token) {
+  const personName = personNameFromItemId(id);
+  if (personName) {
+    return personItemDto(id, personName, env);
+  }
+  const movie = await getMovieCached(id, env, fetchImpl, token);
+  if (!movie || (!movie.id && !movie.number)) {
+    return null;
+  }
+  return mapMovie(movie, requestUrl, env);
+}
+
 function parseJsonBodyText(raw) {
   if (!raw) return {};
   try {
@@ -3255,6 +3498,52 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
         );
         return jsonResponse(personResult);
       }
+      // 点击“类别 / 标签 / 片商 / 系列”后的列表：客户端会带
+      // GenreIds / TagIds / StudioIds / SeriesId（或名称形式的 Genres / Tags / Studios）回来。
+      // 这里统一还原成名字，再走和演员一样的回源搜索，同样只返回可播放作品。
+      if (!query.get("SearchTerm") && !query.has("PersonIds")) {
+        const collectionName = collectionFilterName(query);
+        if (collectionName) {
+          const collectionResult = await collectionMoviesPage(
+            query,
+            env,
+            fetchImpl,
+            token,
+            collectionName,
+          );
+          const collectionState = await readPlaybackState(env, token);
+          collectionResult.Items = collectionResult.Items.map((item) =>
+            attachPlaybackUserData({ ...item, Path: item.Path }, collectionState),
+          );
+          return jsonResponse(collectionResult);
+        }
+      }
+      // 有些客户端用“批量取条目”的方式打开详情（/Items?Ids=xxx）。
+      // 这里也要带上标签 / 演员 / 片商 / 系列，否则详情页看起来就是“什么都没有”。
+      const batchIdsParam = query.get("Ids");
+      if (batchIdsParam && !query.get("SearchTerm")) {
+        const wantedIds = String(batchIdsParam)
+          .split(",")
+          .map((value) => safeDecodeComponent(value.trim()))
+          .filter(Boolean);
+        if (wantedIds.length) {
+          const batchState = await readPlaybackState(env, token);
+          const batchItems = [];
+          for (const wantedId of wantedIds.slice(0, 100)) {
+            const batchItem = await movieItemById(
+              wantedId,
+              request.url,
+              env,
+              fetchImpl,
+              token,
+            );
+            if (batchItem) {
+              batchItems.push(attachPlaybackUserData(batchItem, batchState));
+            }
+          }
+          return jsonResponse(itemQuery(batchItems));
+        }
+      }
       const result = await getMoviePage(query, env, fetchImpl, token);
       const userDataState = await readPlaybackState(env, token);
       result.Items = result.Items.map((item) => attachPlaybackUserData({ ...item, Path: item.Path }, userDataState));
@@ -3332,11 +3621,17 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     const personName = decodeURIComponent(personSingleMatch[1]);
     return jsonResponse(personItemDto(personIdForName(personName), personName, env));
   }
+  // 分类页 / 片商页：给客户端的列表填上真实条目。
+  // 点进去以后客户端会带 GenreIds / StudioIds 回来，再转成上游搜索。
+  if (path === "/Genres") {
+    return jsonResponse(itemQuery(await genreFacetItems(env, fetchImpl, token)));
+  }
+  if (path === "/Studios") {
+    return jsonResponse(itemQuery(await studioFacetItems(env, fetchImpl, token)));
+  }
   if (
     path === "/Shows/NextUp" ||
     path === "/Shows/Upcoming" ||
-    path === "/Genres" ||
-    path === "/Studios" ||
     path === "/Persons"
   ) {
     return jsonResponse(emptyItemQuery());
@@ -3539,7 +3834,13 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     return jsonResponse([]);
   }
   if (path === "/Items/Filters" || path === "/Items/Filters2") {
-    return jsonResponse({ Genres: [], Tags: [], OfficialRatings: [], Years: [] });
+    // 筛选面板里的“类型”也填上真实条目（同样来自上游标签清单，长缓存）。
+    return jsonResponse({
+      Genres: await genreFacetNames(env, fetchImpl, token),
+      Tags: [],
+      OfficialRatings: [],
+      Years: [],
+    });
   }
   if (path === "/Items/Counts") {
     return jsonResponse({
