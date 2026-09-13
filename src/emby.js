@@ -2852,6 +2852,7 @@ function isHandledPath(path) {
     /^\/Users\/[^/]+\/Items(?:\/|$)/i.test(path) ||
     /^\/Users\/[^/]+\/(?:PlayedItems|UnplayedItems|PlayingItems|FavoriteItems)(?:\/[^/]+)?$/i.test(path) ||
     /^\/Users\/[^/]+\/Resume(?:\/[^/]+)?$/i.test(path) ||
+    /^\/User(?:Played|Favorite)Items\/[^/]+$/i.test(path) ||
     path.toLowerCase().startsWith("/items/") ||
     path.toLowerCase().startsWith("/videos/") ||
     path.toLowerCase().startsWith("/emby-media/")
@@ -2961,6 +2962,10 @@ const DELETE_PATH_KEYWORDS = new Set([
   "progress",
   "viewing",
   "download",
+  "delete",
+  "remove",
+  "stop",
+  "start",
   "stream",
   "streaming",
   "original",
@@ -2987,25 +2992,121 @@ function deleteTargetIdFromPath(path) {
   return candidates.length ? candidates[candidates.length - 1] : "";
 }
 
-// 兜底：客户端的“移除播放记录 / 从继续观看中移除 / 取消收藏”路径写法五花八门，
-// 只要是一个针对条目的 DELETE，就清掉该条目的记录并返回 204，避免客户端报 404。
+// 各客户端“标记已播/未播 / 移除播放记录 / 从继续观看中移除 / 取消收藏”的写法五花八门
+// （/PlayedItems、/UnplayedItems、/UserData、/UserPlayedItems …），这里统一成一套
+// “条目级用户数据”处理，避免客户端拿到 404。
+async function applyItemUserDataAction(itemId, action, request, env, token) {
+  const method = request.method;
+  const state = await readPlaybackState(env, token);
+  const existing = state[itemId];
+  const isMarkAction =
+    action === "playeditems" || action === "unplayeditems" || action === "favoriteitems";
+  if (method === "DELETE" && (action === "playingitems" || action === "userdata")) {
+    // 结束播放 / 移除续播记录：整条删掉，条目立刻从“继续观看”消失。
+    if (existing) {
+      delete state[itemId];
+      await writePlaybackState(env, state, token);
+    }
+    return userDataForRecord(undefined);
+  }
+  if (!existing && !isMarkAction) {
+    // 本来就没有这条记录，就别凭空写一条（例如重复“结束播放”）。
+    return userDataForRecord(existing);
+  }
+  const record = existing || {
+    itemId,
+    positionTicks: 0,
+    played: false,
+    playCount: 0,
+    lastPlayedDate: "",
+  };
+  record.itemId = itemId;
+  if (action === "playeditems") {
+    if (method === "DELETE") {
+      record.played = false;
+      record.positionTicks = 0;
+    } else {
+      record.played = true;
+      record.positionTicks = 0;
+      record.playCount = Math.max(0, Math.floor(Number(record.playCount) || 0)) + 1;
+      record.lastPlayedDate = new Date().toISOString();
+    }
+  } else if (action === "unplayeditems") {
+    // “标记未播放”同样会把条目移出继续观看，顺手清掉进度。
+    record.played = false;
+    record.positionTicks = 0;
+  } else if (action === "favoriteitems") {
+    record.favorite = method !== "DELETE";
+  } else {
+    // UserData / Resume / Progress：按“清掉续播进度”处理。
+    record.positionTicks = 0;
+  }
+  state[itemId] = record;
+  await writePlaybackState(env, state, token);
+  return userDataForRecord(record);
+}
+
+// 路径里能看出客户端想做哪种操作时就照做，看不出就当成“移除续播记录”。
+function fallbackItemAction(path) {
+  const lower = String(path || "").toLowerCase();
+  if (lower.includes("unplayed")) return "unplayeditems";
+  if (lower.includes("played")) return "playeditems";
+  if (lower.includes("favorite")) return "favoriteitems";
+  if (lower.includes("playing") || lower.includes("progress") || lower.includes("stopped")) return "playingitems";
+  return "userdata";
+}
+
+// 从路径里取条目 Id：跳过用户 Id（/Users/{uid}/… 里的那一段），
+// 免得把用户名当成影片 Id 去改记录。
+function fallbackTargetId(path) {
+  const segments = String(path || "").split("?")[0].split("/").filter(Boolean);
+  const candidates = [];
+  for (let i = 0; i < segments.length; i += 1) {
+    const previous = (segments[i - 1] || "").toLowerCase();
+    let value = segments[i];
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      value = segments[i];
+    }
+    if (!value) continue;
+    if (DELETE_PATH_KEYWORDS.has(value.toLowerCase())) continue;
+    if (previous === "users" || previous === "me") continue;
+    candidates.push(value);
+  }
+  return candidates.length ? candidates[candidates.length - 1] : "";
+}
+
+// 兜底：只要是针对某一个条目的增删改，就当作成功处理，
+// 避免客户端在“移除播放记录 / 继续观看”时报 404。
 async function handleFallbackDelete(path, request, env, url) {
-  if (request.method !== "DELETE") {
+  const method = request.method;
+  if (method !== "DELETE" && method !== "POST" && method !== "PUT") {
     return null;
   }
   const requestPath = String(path || "");
   const looksLikeItemDelete = /^\/(?:Users|UserItems|Items|Videos|Sessions|emby-media)\//i.test(requestPath);
-  const targetId = deleteTargetIdFromPath(requestPath);
-  if (!looksLikeItemDelete && !targetId) {
+  if (method === "DELETE") {
+    const targetId = deleteTargetIdFromPath(requestPath);
+    if (!looksLikeItemDelete && !targetId) {
+      return null;
+    }
+    if (targetId) {
+      const token = getToken(request, url);
+      await applyItemUserDataAction(targetId, fallbackItemAction(requestPath), request, env, token);
+    }
+    return noContentResponse();
+  }
+  // POST/PUT 只在“看得出是在改某条目的用户数据”时兜底，
+  // 免得把 PlaybackInfo 之类的正常接口也吞掉。
+  const hasDataHint = /(userdata|played|unplayed|playing|progress|favorite|resume|stop|delete|remove)/i.test(requestPath);
+  const targetId = fallbackTargetId(requestPath);
+  if (!hasDataHint || (!targetId && !looksLikeItemDelete)) {
     return null;
   }
   if (targetId) {
     const token = getToken(request, url);
-    const state = await readPlaybackState(env, token);
-    if (state[targetId]) {
-      delete state[targetId];
-      await writePlaybackState(env, state, token);
-    }
+    await applyItemUserDataAction(targetId, fallbackItemAction(requestPath), request, env, token);
   }
   return noContentResponse();
 }
@@ -3490,8 +3591,38 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     }
   }
 
+  // 多种客户端把“标记已播/未播、收藏、结束播放、移除续播”写成
+  // /Items/{id}/PlayedItems 这类路径（带 /Users/{uid} 前缀的写法已在
+  // normalizeClientPath 里统一掉）。这里显式接住，免得落到 404。
+  const itemActionMatch = path.match(
+    /^\/Items\/([^/]+)\/(PlayedItems|UnplayedItems|PlayingItems|FavoriteItems)$/i,
+  );
+  if (itemActionMatch && ["POST", "PUT", "DELETE"].includes(request.method)) {
+    return jsonResponse(await applyItemUserDataAction(
+      decodeURIComponent(itemActionMatch[1]),
+      itemActionMatch[2].toLowerCase(),
+      request,
+      env,
+      token,
+    ));
+  }
+  // 旧版 / 第三方客户端的写法：/UserPlayedItems/{id}、/UserFavoriteItems/{id}
+  const legacyUserItemMatch = path.match(/^\/User(Played|Favorite)Items\/([^/]+)$/i);
+  if (legacyUserItemMatch) {
+    const legacyItemId = decodeURIComponent(legacyUserItemMatch[2]);
+    const legacyAction =
+      legacyUserItemMatch[1].toLowerCase() === "played" ? "playeditems" : "favoriteitems";
+    if (["POST", "PUT", "DELETE"].includes(request.method)) {
+      return jsonResponse(await applyItemUserDataAction(legacyItemId, legacyAction, request, env, token));
+    }
+    if (request.method === "GET") {
+      const legacyState = await readPlaybackState(env, token);
+      return jsonResponse(userDataForRecord(legacyState[legacyItemId]));
+    }
+  }
+
   // 统一兜底：走到这里说明前面所有具体删除处理都没匹配上。
-  // 退一步按“删除 = 清掉该条目的播放记录”处理，避免客户端报 404。
+  // 退一步按“删除/标记 = 清掉该条目的播放记录”处理，避免客户端报 404。
   const genericFallbackDelete = await handleFallbackDelete(path, request, env, url);
   if (genericFallbackDelete) {
     return genericFallbackDelete;
