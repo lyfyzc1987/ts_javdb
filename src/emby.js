@@ -509,10 +509,13 @@ function virtualUser(env = {}, name = "JAVDB Guest", hasPassword = false) {
 // 是长连接，不走这里，避免中途被超时打断。
 const FETCH_TIMEOUT_MS = 10000;
 const FETCH_MAX_ATTEMPTS = 2;
+// 播放源解析接口是第三方现场抓取：新片子第一次通常要 10 秒左右，比普通接口慢很多。
+// 单独放宽它的超时，避免刚好在 10 秒被掐断、白白重新来一遍。
+const RESOLVER_FETCH_TIMEOUT_MS = 15000;
 
-async function fetchWithTimeout(fetchImpl, url, options = {}) {
+async function fetchWithTimeout(fetchImpl, url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetchImpl(url, { ...options, signal: controller.signal });
   } finally {
@@ -520,11 +523,11 @@ async function fetchWithTimeout(fetchImpl, url, options = {}) {
   }
 }
 
-async function fetchWithRetry(fetchImpl, url, options = {}) {
+async function fetchWithRetry(fetchImpl, url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   let lastError;
   for (let attempt = 1; attempt <= FETCH_MAX_ATTEMPTS; attempt += 1) {
     try {
-      return await fetchWithTimeout(fetchImpl, url, options);
+      return await fetchWithTimeout(fetchImpl, url, options, timeoutMs);
     } catch (error) {
       lastError = error;
       if (attempt < FETCH_MAX_ATTEMPTS) {
@@ -535,6 +538,247 @@ async function fetchWithRetry(fetchImpl, url, options = {}) {
   throw lastError;
 }
 
+// ---------- 访问加速缓存 ----------
+// Worker 实例会被反复复用。这里把“影片元数据 / 播放源与字幕解析结果 / 分类列表页”
+// 在进程内缓存一小段时间，并把同一个 key 的并发请求合并成一次回源。
+// 效果：同一部片或同一页数据在一次浏览里只回源一次，翻页回退、返回再进、
+// 以及起播时的等待都会明显缩短。
+const MOVIE_CACHE_TTL_MS = 10 * 60 * 1000;
+const RESOLVE_CACHE_TTL_MS = 30 * 60 * 1000;
+const LIST_CACHE_TTL_MS = 60 * 1000;
+const MAX_MOVIE_CACHE_ENTRIES = 4000;
+const MAX_RESOLVE_CACHE_ENTRIES = 1000;
+const MAX_LIST_CACHE_ENTRIES = 400;
+
+function createTtlCache(ttlMs, maxEntries) {
+  const entries = new Map();
+  const pending = new Map();
+
+  const read = (key) => {
+    const entry = entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expires <= Date.now()) {
+      entries.delete(key);
+      return undefined;
+    }
+    // 命中后挪到末尾，容量满时优先淘汰最久没用到的键。
+    entries.delete(key);
+    entries.set(key, entry);
+    return entry.value;
+  };
+
+  const write = (key, value) => {
+    entries.set(key, { value, expires: Date.now() + ttlMs });
+    while (entries.size > maxEntries) {
+      entries.delete(entries.keys().next().value);
+    }
+  };
+
+  return {
+    read,
+    write,
+    // 手动丢弃某个 key（例如缓存里的直链已失效，需要重新解析）。
+    forget: (key) => {
+      entries.delete(key);
+      pending.delete(key);
+    },
+    // 同一个 key 的并发请求只回源一次；失败不缓存，等下次再试。
+    fetch: async (key, compute) => {
+      const cached = read(key);
+      if (cached !== undefined) return cached;
+      const running = pending.get(key);
+      if (running) return running;
+      const task = (async () => {
+        const value = await compute();
+        if (value !== undefined && value !== null) write(key, value);
+        return value;
+      })();
+      pending.set(key, task);
+      try {
+        return await task;
+      } finally {
+        pending.delete(key);
+      }
+    },
+  };
+}
+
+const MOVIE_CACHE = createTtlCache(MOVIE_CACHE_TTL_MS, MAX_MOVIE_CACHE_ENTRIES);
+const RESOLVE_VIDEO_CACHE = createTtlCache(RESOLVE_CACHE_TTL_MS, MAX_RESOLVE_CACHE_ENTRIES);
+const RESOLVE_SUBTITLE_CACHE = createTtlCache(RESOLVE_CACHE_TTL_MS, MAX_RESOLVE_CACHE_ENTRIES);
+const LIST_CACHE = createTtlCache(LIST_CACHE_TTL_MS, MAX_LIST_CACHE_ENTRIES);
+const API_TOKEN_CACHE = createTtlCache(60 * 1000, 500);
+
+// ---------- 边缘缓存（跨实例复用） ----------
+// 上面的缓存只活在“当前 Worker 实例”的内存里：实例重启、扩容、换节点后就全部失效，
+// 于是每次冷启动都要重新回源，“第一次总是慢”主要就慢在这里。
+// 下面把最热的几类结果（影片元数据 / 播放源解析 / 字幕列表 / 分类列表页）
+// 再写一份到 Cloudflare 的边缘缓存：不同客户端、不同实例都能直接命中；
+// 缓存键做哈希、不含登录信息，既不会串号也不会泄漏 token。
+let edgeCacheOrigin = "";
+
+const EDGE_NAMESPACE_MOVIE = "movie";
+const EDGE_NAMESPACE_VIDEO = "video";
+const EDGE_NAMESPACE_SUBTITLE = "subtitle";
+const EDGE_NAMESPACE_LIST = "list";
+
+function edgeCacheStore() {
+  try {
+    return typeof caches !== "undefined" && caches && caches.default ? caches.default : null;
+  } catch {
+    return null;
+  }
+}
+
+function edgeCacheRequest(namespace, key) {
+  if (!edgeCacheOrigin) {
+    return null;
+  }
+  try {
+    return new Request(
+      `${edgeCacheOrigin}/__emby-cache/v1/${namespace}/${md5(String(key))}`,
+      { method: "GET" },
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function edgeCacheRead(namespace, key) {
+  const store = edgeCacheStore();
+  const cacheKey = store ? edgeCacheRequest(namespace, key) : null;
+  if (!store || !cacheKey) {
+    return undefined;
+  }
+  try {
+    const hit = await store.match(cacheKey);
+    if (!hit) {
+      return undefined;
+    }
+    const value = await hit.json();
+    return value === undefined || value === null ? undefined : value;
+  } catch {
+    return undefined;
+  }
+}
+
+async function edgeCacheWrite(namespace, key, value, ttlSeconds) {
+  const store = edgeCacheStore();
+  const cacheKey = store ? edgeCacheRequest(namespace, key) : null;
+  if (!store || !cacheKey) {
+    return;
+  }
+  try {
+    const seconds = Math.max(30, Math.round(Number(ttlSeconds) || 30));
+    await store.put(cacheKey, new Response(JSON.stringify(value), {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        // 边缘缓存按响应头里的 max-age 决定存活时间。
+        "cache-control": `public, max-age=${seconds}`,
+      },
+    }));
+  } catch {
+    // 边缘缓存写失败（不支持、配额等）不能影响正常返回。
+  }
+}
+
+function forgetEdgeCache(namespace, key) {
+  const store = edgeCacheStore();
+  const cacheKey = store ? edgeCacheRequest(namespace, key) : null;
+  if (!store || !cacheKey) {
+    return;
+  }
+  try {
+    store.delete(cacheKey).catch(() => {});
+  } catch {
+    // 忽略：删不掉也不影响本次播放。
+  }
+}
+
+// 图片内容只跟“影片 + 尺寸”有关：把 api_key / UserId 这类随会话变化的参数剔除，
+// 不同客户端、不同登录状态就能共用同一份图片边缘缓存，命中率更高。
+function edgeImageCacheKey(url) {
+  const parts = [];
+  for (const name of ["maxWidth", "maxHeight", "width", "height", "quality", "tag"]) {
+    const value = url.searchParams.get(name);
+    if (value) {
+      parts.push(`${name}=${value}`);
+    }
+  }
+  return new Request(
+    `${url.origin}/__emby-cache/v1/image/${md5(`${url.pathname}|${parts.join("&")}`)}`,
+    { method: "GET" },
+  );
+}
+
+// 分类 / 演员列表页的两级缓存：内存命中直接返回；内存没有但边缘有就回填内存；
+// 两边都没有才回源上游（回源结果非空时再写一份到边缘）。
+async function cachedListPage(cacheKey, ttlSeconds, compute) {
+  return LIST_CACHE.fetch(cacheKey, async () => {
+    const shared = await edgeCacheRead(EDGE_NAMESPACE_LIST, cacheKey);
+    if (shared !== undefined) {
+      return shared;
+    }
+    const page = await compute();
+    if (page && Array.isArray(page.movies) && page.movies.length > 0) {
+      await edgeCacheWrite(EDGE_NAMESPACE_LIST, cacheKey, page, ttlSeconds);
+    }
+    return page;
+  });
+}
+
+// 并发抓取上游分页：原来一页一页顺序请求，首次打开分类/演员页要等很久。
+// 现在按页码小批量并发抓取、再按页码顺序合并，同时保留“够用就提前停止”的快速路径。
+const SOURCE_PAGE_CONCURRENCY = 6;
+
+async function fetchPagesInParallel(options) {
+  const {
+    maxPages,
+    pageSize,
+    needAll,
+    enough,
+    fetchPage,
+    collect,
+    concurrency = SOURCE_PAGE_CONCURRENCY,
+  } = options;
+
+  let sourcePage = 1;
+  while (sourcePage <= maxPages) {
+    if (!needAll && enough()) {
+      return false;
+    }
+    const batch = [];
+    for (let page = sourcePage; page < sourcePage + concurrency && page <= maxPages; page += 1) {
+      batch.push(page);
+    }
+    const results = await Promise.all(batch.map(async (page) => {
+      try {
+        return { page, movies: await fetchPage(page) };
+      } catch {
+        return { page, movies: null };
+      }
+    }));
+    results.sort((left, right) => left.page - right.page);
+
+    for (const result of results) {
+      if (result.movies === null) {
+        // 这一页抓取失败：不要继续往后翻，交给上层按“没翻到底”处理。
+        if (result.page === sourcePage) return false;
+        continue;
+      }
+      const movies = Array.isArray(result.movies) ? result.movies : [];
+      if (movies.length) {
+        collect(movies);
+      }
+      if (movies.length < pageSize) {
+        // 这一页不满一页，说明已经翻到结果末尾。
+        return true;
+      }
+    }
+    sourcePage += batch.length;
+  }
+  return false;
+}
 async function javdbRequest(path, env, fetchImpl, options = {}) {
   const url = new URL(`${apiOrigin(env)}${path}`);
   if (options.query) {
@@ -587,7 +831,7 @@ async function resolverJson(path, env, fetchImpl) {
   const response = await fetchWithRetry(fetchImpl, `${resolverOrigin(env)}${path}`, {
     headers: { accept: "application/json" },
     redirect: "follow",
-  });
+  }, RESOLVER_FETCH_TIMEOUT_MS);
   const text = await response.text();
   let payload;
   try {
@@ -852,15 +1096,17 @@ async function apiToken(token, env) {
   if (!value || value === guestToken(env)) {
     return "";
   }
-  const record = await lookupSessionRecord(env, value);
+  // 会话查询本身也是一次存储读取，这里缓存一小段时间，避免每个请求都查一遍。
   // 只有“真实 JavDB 会话”的 token 才透传给上游数据接口；
   // “本地信任登录”生成的随机 token 一律不带，避免被 JavDB 当成无效会话拒绝。
-  if (!record || record.trusted === true) {
-    return "";
-  }
-  return value;
+  return API_TOKEN_CACHE.fetch(value, async () => {
+    const record = await lookupSessionRecord(env, value);
+    if (!record || record.trusted === true) {
+      return "";
+    }
+    return value;
+  });
 }
-
 async function getMovie(id, env, fetchImpl, token = "") {
   const payload = await javdbRequest(
     `/v4/movies/${encodeURIComponent(id)}`,
@@ -871,6 +1117,24 @@ async function getMovie(id, env, fetchImpl, token = "") {
   return movieFromPayload(payload);
 }
 
+// 带缓存的影片元数据：详情页、图片、字幕、播放解析都会取同一部影片，
+// 缓存后同一部片在一次浏览里只回源一次。
+async function getMovieCached(id, env, fetchImpl, token = "") {
+  const upstreamToken = await apiToken(token, env);
+  const key = `${apiOrigin(env)}|${upstreamToken ? "u" : "g"}|${String(id)}`;
+  return MOVIE_CACHE.fetch(key, async () => {
+    const shared = await edgeCacheRead(EDGE_NAMESPACE_MOVIE, key);
+    if (shared !== undefined) {
+      return shared;
+    }
+    const movie = await getMovie(id, env, fetchImpl, token);
+    // 空结果 / 瞬时失败不写共享缓存，避免把“查不到”缓存十分钟。
+    if (movie && (movie.id || movie.number)) {
+      await edgeCacheWrite(EDGE_NAMESPACE_MOVIE, key, movie, MOVIE_CACHE_TTL_MS / 1000);
+    }
+    return movie;
+  });
+}
 // ---------- 分类列表排序 ----------
 // Emby 客户端浏览分类时可选“按年份/名称/添加时间”排序，并带 SortBy/SortOrder。
 // 原先这些参数被忽略，返回的一直是上游“最新上架”顺序，所以客户端里选排序没反应。
@@ -965,132 +1229,125 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
   const parentId = requestedParentId === ROOT_ID ? ROOT_ID : library.id;
   const requiredCount = startIndex + limit;
   const sortOrder = /^asc/i.test(String(query.get("SortOrder") || "")) ? "asc" : "desc";
-  const sortComparators = buildSortComparators(query.get("SortBy"));
+  const sortBy = String(query.get("SortBy") || "");
+  const sortComparators = buildSortComparators(sortBy);
   // 默认“最新上架”顺序走原有快速路径；
   // 一旦客户端明确要求“按年份/名称”等排序，就抓全量后再排序分页，保证排序真的生效。
   const needsFullCatalog = !isNaturalCatalogOrder(sortComparators, sortOrder);
+  const upstreamToken = await apiToken(token, env);
 
-  if (searchTerm) {
-    // 搜索：上游 /v2/search 每页最多返回 50 条，且里面混着“不可播放”的条目。
-    // 因此按页翻找、过滤并去重，把该片库里匹配的结果尽量都找出来，
-    // 避免客户端只能看到第一页里筛剩下的几条（例如明明有几十上百部，却只显示 2 部）。
-    const matchingMovies = [];
-    const seen = new Set();
-    let sourcePage = 1;
-    let sourceExhausted = false;
+  // 同一页数据短时间内直接复用：客户端返回再进、翻页回退、重复请求都不再回源。
+  const cacheKey = [
+    "movie-page-v1",
+    apiOrigin(env),
+    upstreamToken ? "u" : "g",
+    library.id,
+    searchTerm,
+    startIndex,
+    limit,
+    sortOrder,
+    sortBy,
+    needsFullCatalog ? "full" : "fast",
+  ].join("|");
 
-    while (
-      sourcePage <= SEARCH_MAX_SOURCE_PAGES &&
-      !sourceExhausted &&
-      (needsFullCatalog || matchingMovies.length < requiredCount)
-    ) {
-      const payload = await javdbRequest("/v2/search", env, fetchImpl, {
-        query: {
-          q: searchTerm,
-          page: sourcePage,
-          type: "movie",
-          movie_filter_by: library.sourceFilter,
-          limit: SEARCH_SOURCE_PAGE_SIZE,
-        },
-        token: await apiToken(token, env),
-      });
-      const movies = moviesFromPayload(payload);
-      if (movies.length === 0) {
-        sourceExhausted = true;
-        break;
-      }
-      for (const movie of movies) {
-        if (!library.matches(movie)) {
-          continue;
-        }
-        const key = String(movie.id ?? movie.number ?? "");
-        if (key && !seen.has(key)) {
-          seen.add(key);
-          matchingMovies.push(movie);
-        }
-      }
-      // 这一页不足一页，说明已经翻到结果末尾
-      if (movies.length < SEARCH_SOURCE_PAGE_SIZE) {
-        sourceExhausted = true;
-        break;
-      }
-      sourcePage += 1;
-    }
+  const page = await cachedListPage(cacheKey, LIST_CACHE_TTL_MS / 1000, () => loadMovieCatalogPage({
+    library,
+    searchTerm,
+    startIndex,
+    requiredCount,
+    needsFullCatalog,
+    sortComparators,
+    sortOrder,
+    env,
+    fetchImpl,
+    upstreamToken,
+  }));
 
-    const orderedMovies = needsFullCatalog
-      ? sortMoviesForClient(matchingMovies, sortComparators, sortOrder)
-      : matchingMovies;
-    const pageMovies = orderedMovies.slice(startIndex, requiredCount);
-    return {
-      Items: pageMovies.map((movie) => mapMovie(
-        movie,
-        query.requestUrl || "https://localhost/",
-        env,
-        parentId,
-      )),
-      // 已翻到末尾时用真实数量；否则略多报，让客户端能继续往下翻页
-      TotalRecordCount: sourceExhausted
-        ? matchingMovies.length
-        : matchingMovies.length + 1,
-      StartIndex: startIndex,
-    };
-  }
+  return {
+    Items: page.movies.map((movie) => mapMovie(
+      movie,
+      query.requestUrl || "https://localhost/",
+      env,
+      parentId,
+    )),
+    TotalRecordCount: page.totalRecordCount,
+    StartIndex: startIndex,
+  };
+}
+
+// 抓取分类/搜索结果（不依赖具体客户端地址，所以可以整块缓存复用）。
+// 过滤、去重、排序都基于原始影片对象，映射成 Emby 条目放到每次请求里做。
+async function loadMovieCatalogPage(options) {
+  const {
+    library,
+    searchTerm,
+    startIndex,
+    requiredCount,
+    needsFullCatalog,
+    sortComparators,
+    sortOrder,
+    env,
+    fetchImpl,
+    upstreamToken,
+  } = options;
 
   const matchingMovies = [];
   const seen = new Set();
-  let sourcePage = 1;
-  let hasMoreSource = true;
-  let sourceExhausted = false;
-
-  while (
-    sourcePage <= HOME_MAX_SOURCE_PAGES &&
-    hasMoreSource &&
-    (needsFullCatalog || matchingMovies.length < requiredCount)
-  ) {
-    const payload = await javdbRequest("/v1/movies/latest", env, fetchImpl, {
-      query: {
-        page: sourcePage,
-        filter_by: library.sourceFilter,
-        type: library.sourceType,
-        limit: HOME_SOURCE_PAGE_SIZE,
-      },
-      token: await apiToken(token, env),
-    });
-    const movies = moviesFromPayload(payload);
-    hasMoreSource = movies.length >= HOME_SOURCE_PAGE_SIZE;
+  const collect = (movies) => {
     for (const movie of movies) {
-      if (!library.matches(movie)) {
-        continue;
-      }
+      if (!library.matches(movie)) continue;
       const key = String(movie.id ?? movie.number ?? "");
       if (key && !seen.has(key)) {
         seen.add(key);
         matchingMovies.push(movie);
       }
     }
-    if (movies.length < HOME_SOURCE_PAGE_SIZE) {
-      sourceExhausted = true;
-      break;
-    }
-    sourcePage += 1;
-  }
+  };
+
+  const sourceExhausted = searchTerm
+    ? await fetchPagesInParallel({
+      maxPages: SEARCH_MAX_SOURCE_PAGES,
+      pageSize: SEARCH_SOURCE_PAGE_SIZE,
+      needAll: needsFullCatalog,
+      enough: () => matchingMovies.length >= requiredCount,
+      fetchPage: (page) => javdbRequest("/v2/search", env, fetchImpl, {
+        query: {
+          q: searchTerm,
+          page,
+          type: "movie",
+          movie_filter_by: library.sourceFilter,
+          limit: SEARCH_SOURCE_PAGE_SIZE,
+        },
+        token: upstreamToken,
+      }).then(moviesFromPayload),
+      collect,
+    })
+    : await fetchPagesInParallel({
+      maxPages: HOME_MAX_SOURCE_PAGES,
+      pageSize: HOME_SOURCE_PAGE_SIZE,
+      needAll: needsFullCatalog,
+      enough: () => matchingMovies.length >= requiredCount,
+      fetchPage: (page) => javdbRequest("/v1/movies/latest", env, fetchImpl, {
+        query: {
+          page,
+          filter_by: library.sourceFilter,
+          type: library.sourceType,
+          limit: HOME_SOURCE_PAGE_SIZE,
+        },
+        token: upstreamToken,
+      }).then(moviesFromPayload),
+      collect,
+    });
 
   const orderedMovies = needsFullCatalog
     ? sortMoviesForClient(matchingMovies, sortComparators, sortOrder)
     : matchingMovies;
-  const movies = orderedMovies.slice(startIndex, requiredCount);
-  const totalRecordCount = sourceExhausted
-    ? matchingMovies.length
-    : matchingMovies.length + 1;
   return {
-    Items: movies.map((movie) => mapMovie(
-      movie,
-      query.requestUrl || "https://localhost/",
-      env,
-      parentId,
-    )),
-    TotalRecordCount: totalRecordCount,
-    StartIndex: startIndex,
+    movies: orderedMovies.slice(startIndex, requiredCount),
+    // 已翻到末尾时用真实数量；否则略多报，让客户端能继续往下翻页
+    totalRecordCount: sourceExhausted
+      ? matchingMovies.length
+      : matchingMovies.length + 1,
   };
 }
 // ================= 演员（Person）相关 =================
@@ -1164,77 +1421,146 @@ async function personMoviesPage(query, env, fetchImpl, token) {
   // 否则排序只会作用在某一页的局部数据上，看起来就是“排序不生效”。
   // 默认“最新上架”顺序才走快速分页，边抓边够当前页就提前返回。
   const sortOrder = /^asc/i.test(String(query.get("SortOrder") || "")) ? "asc" : "desc";
-  const sortComparators = buildSortComparators(query.get("SortBy"));
+  const sortBy = String(query.get("SortBy") || "");
+  const sortComparators = buildSortComparators(sortBy);
   const needsFullCatalog = !isNaturalCatalogOrder(sortComparators, sortOrder);
+  const upstreamToken = await apiToken(token, env);
 
-  const matches = [];
-  const seen = new Set();
-  const libraryByKey = new Map();
-  let fullyScanned = true;
+  const cacheKey = [
+    "person-page-v1",
+    apiOrigin(env),
+    upstreamToken ? "u" : "g",
+    searchTerm,
+    singleLibrary ? singleLibrary.id : "all",
+    startIndex,
+    limit,
+    sortOrder,
+    sortBy,
+    needsFullCatalog ? "full" : "fast",
+  ].join("|");
 
-  for (const library of libraryList) {
-    if (!needsFullCatalog && matches.length >= requiredCount) break;
-    let sourcePage = 1;
-    let sourceExhausted = false;
-    while (sourcePage <= SEARCH_MAX_SOURCE_PAGES && !sourceExhausted) {
-      const payload = await javdbRequest("/v2/search", env, fetchImpl, {
-        query: {
-          q: searchTerm,
-          page: sourcePage,
-          type: "movie",
-          movie_filter_by: library.sourceFilter,
-          limit: SEARCH_SOURCE_PAGE_SIZE,
-        },
-        token: await apiToken(token, env),
-      });
-      const movies = moviesFromPayload(payload);
-      if (movies.length === 0) {
-        sourceExhausted = true;
-        break;
-      }
+  const page = await cachedListPage(cacheKey, LIST_CACHE_TTL_MS / 1000, async () => {
+    const matches = [];
+    const seen = new Set();
+    const libraryByKey = new Map();
+    let fullyScanned = true;
+
+    const merge = (library, movies) => {
       for (const movie of movies) {
-        if (!library.matches(movie)) {
-          continue;
-        }
         const key = String(movie.id ?? movie.number ?? "");
-        if (key && !seen.has(key)) {
-          seen.add(key);
-          matches.push(movie);
-          libraryByKey.set(key, library);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        matches.push(movie);
+        libraryByKey.set(key, library);
+      }
+    };
+
+    if (needsFullCatalog) {
+      // 需要全量排序：各分类同时抓取，缩短“按年份排序”这类请求的等待。
+      const scans = await Promise.all(libraryList.map((library) => scanPersonLibrary(library, {
+        searchTerm,
+        env,
+        fetchImpl,
+        upstreamToken,
+        needAll: true,
+        alreadyCount: 0,
+        requiredCount,
+      })));
+      scans.forEach((scan, index) => {
+        merge(libraryList[index], scan.movies);
+        if (!scan.exhausted) {
+          fullyScanned = false;
+        }
+      });
+    } else {
+      for (const library of libraryList) {
+        if (matches.length >= requiredCount) break;
+        const scan = await scanPersonLibrary(library, {
+          searchTerm,
+          env,
+          fetchImpl,
+          upstreamToken,
+          needAll: false,
+          alreadyCount: matches.length,
+          requiredCount,
+        });
+        merge(library, scan.movies);
+        if (!scan.exhausted) {
+          fullyScanned = false;
         }
       }
-      // 这一页不足一页，说明已经翻到结果末尾
-      if (movies.length < SEARCH_SOURCE_PAGE_SIZE) {
-        sourceExhausted = true;
-        break;
-      }
-      if (!needsFullCatalog && matches.length >= requiredCount) break;
-      sourcePage += 1;
     }
-    if (!sourceExhausted) {
-      fullyScanned = false;
-    }
-  }
 
-  const orderedMovies = needsFullCatalog
-    ? sortMoviesForClient(matches, sortComparators, sortOrder)
-    : matches;
-  const pageMovies = orderedMovies.slice(startIndex, requiredCount);
+    const orderedMovies = needsFullCatalog
+      ? sortMoviesForClient(matches, sortComparators, sortOrder)
+      : matches;
+    return {
+      movies: orderedMovies.slice(startIndex, requiredCount),
+      // 已把相关分类都翻到底时用真实数量；否则略多报，让客户端能继续往下翻页
+      totalRecordCount: fullyScanned ? matches.length : matches.length + 1,
+      // 用数组形式保存，方便写进边缘缓存（Map 没法 JSON 序列化）
+      libraryEntries: [...libraryByKey],
+    };
+  });
+
+  const libraryByKey = page.libraryEntries
+    ? new Map(page.libraryEntries)
+    : new Map(Object.entries(page.libraryByKey || {}));
+
   return {
-    Items: pageMovies.map((movie) => mapMovie(
+    Items: page.movies.map((movie) => mapMovie(
       movie,
       query.requestUrl || "https://localhost/",
       env,
       libraryByKey.get(String(movie.id ?? movie.number ?? ""))?.id ||
         (singleLibrary ? singleLibrary.id : ""),
     )),
-    // 已把相关分类都翻到底时用真实数量；否则略多报，让客户端能继续往下翻页
-    TotalRecordCount: fullyScanned ? matches.length : matches.length + 1,
+    TotalRecordCount: page.totalRecordCount,
     StartIndex: startIndex,
   };
 }
 
-
+// 按演员名在单个分类里检索其“可播放”作品。
+async function scanPersonLibrary(library, options) {
+  const {
+    searchTerm,
+    env,
+    fetchImpl,
+    upstreamToken,
+    needAll,
+    alreadyCount,
+    requiredCount,
+  } = options;
+  const movies = [];
+  const seen = new Set();
+  const exhausted = await fetchPagesInParallel({
+    maxPages: SEARCH_MAX_SOURCE_PAGES,
+    pageSize: SEARCH_SOURCE_PAGE_SIZE,
+    needAll,
+    enough: () => alreadyCount + movies.length >= requiredCount,
+    fetchPage: (page) => javdbRequest("/v2/search", env, fetchImpl, {
+      query: {
+        q: searchTerm,
+        page,
+        type: "movie",
+        movie_filter_by: library.sourceFilter,
+        limit: SEARCH_SOURCE_PAGE_SIZE,
+      },
+      token: upstreamToken,
+    }).then(moviesFromPayload),
+    collect: (pageMovies) => {
+      for (const movie of pageMovies) {
+        if (!library.matches(movie)) continue;
+        const key = String(movie.id ?? movie.number ?? "");
+        if (key && !seen.has(key)) {
+          seen.add(key);
+          movies.push(movie);
+        }
+      }
+    },
+  });
+  return { movies, exhausted };
+}
 async function resolveVideo(movie, env, fetchImpl) {
   const code = movie.number || movie.code || movie.id || movie.title;
   if (!code) {
@@ -1332,6 +1658,60 @@ async function resolveSubtitles(movie, env, fetchImpl) {
     ...subtitle,
     title: `字幕 ${index + 1}`,
   }));
+}
+
+// 播放源 / 字幕解析结果缓存：解析服务冷启动很慢，缓存后再次点开、详情页预解析、
+// 正式起播之间可以互相复用同一份结果，起播会明显更快。
+function movieResolveCode(movie) {
+  return String(movie?.number || movie?.code || movie?.id || movie?.title || "");
+}
+
+async function resolveVideoCached(movie, env, fetchImpl) {
+  const code = movieResolveCode(movie);
+  if (!code) {
+    return resolveVideo(movie, env, fetchImpl);
+  }
+  const key = `${resolverOrigin(env)}${resolverResolvePath(env)}|${code}`;
+  return RESOLVE_VIDEO_CACHE.fetch(key, async () => {
+    const shared = await edgeCacheRead(EDGE_NAMESPACE_VIDEO, key);
+    if (shared !== undefined) {
+      return shared;
+    }
+    const video = await resolveVideo(movie, env, fetchImpl);
+    if (video) {
+      await edgeCacheWrite(EDGE_NAMESPACE_VIDEO, key, video, RESOLVE_CACHE_TTL_MS / 1000);
+    }
+    return video;
+  });
+}
+
+async function resolveSubtitlesCached(movie, env, fetchImpl) {
+  const code = movieResolveCode(movie);
+  if (!code) {
+    return resolveSubtitles(movie, env, fetchImpl);
+  }
+  const key = `${upstreamOrigin(env)}|${code}`;
+  return RESOLVE_SUBTITLE_CACHE.fetch(key, async () => {
+    const shared = await edgeCacheRead(EDGE_NAMESPACE_SUBTITLE, key);
+    if (shared !== undefined) {
+      return shared;
+    }
+    const subtitles = await resolveSubtitles(movie, env, fetchImpl);
+    if (Array.isArray(subtitles) && subtitles.length > 0) {
+      await edgeCacheWrite(EDGE_NAMESPACE_SUBTITLE, key, subtitles, RESOLVE_CACHE_TTL_MS / 1000);
+    }
+    return subtitles;
+  });
+}
+// 丢掉一部影片的“播放源解析”缓存（内存 + 边缘），下次点开会重新解析。
+function forgetResolveVideoCache(movie, env) {
+  const code = movieResolveCode(movie);
+  if (!code) {
+    return;
+  }
+  const key = `${resolverOrigin(env)}${resolverResolvePath(env)}|${code}`;
+  RESOLVE_VIDEO_CACHE.forget(key);
+  forgetEdgeCache(EDGE_NAMESPACE_VIDEO, key);
 }
 
 function mediaSource(item, requestUrl, token, video, subtitles = []) {
@@ -1645,8 +2025,9 @@ function virtualFolder(library) {
   };
 }
 
-// 详情页内“顺带解析播放源”的预算时间：超过即先返回元数据，播放时再完整解析。
-const ITEM_DETAIL_RESOLVE_BUDGET_MS = 2000;
+// 详情页内“顺带解析播放源”的预算时间：超过就先返回元数据（播放时再完整解析），
+// 让第一次点开影片时更快看到详情页，而不是一直转圈等解析。
+const ITEM_DETAIL_RESOLVE_BUDGET_MS = 1200;
 
 function withTimeout(promise, ms) {
   let timer;
@@ -1662,7 +2043,7 @@ async function itemResponse(id, request, env, fetchImpl, token) {
   if (personNameFromId) {
     return jsonResponse(personItemDto(id, personNameFromId, env));
   }
-  const movie = await getMovie(id, env, fetchImpl, token);
+  const movie = await getMovieCached(id, env, fetchImpl, token);
   if (!movie?.id && !movie?.number) {
     return errorResponse(404, "Movie not found");
   }
@@ -1682,9 +2063,9 @@ async function itemResponse(id, request, env, fetchImpl, token) {
   try {
     [video, subtitles] = await withTimeout(
       Promise.all([
-        resolveVideo(movie, env, fetchImpl),
+        resolveVideoCached(movie, env, fetchImpl),
         hasChineseSubtitles(movie)
-          ? resolveSubtitles(movie, env, fetchImpl).catch(() => [])
+          ? resolveSubtitlesCached(movie, env, fetchImpl).catch(() => [])
           : Promise.resolve([]),
       ]),
       ITEM_DETAIL_RESOLVE_BUDGET_MS,
@@ -2058,7 +2439,7 @@ async function favoriteItemsPage(query, env, fetchImpl, token) {
       continue;
     }
     try {
-      const movie = await getMovie(record.itemId, env, fetchImpl, token);
+      const movie = await getMovieCached(record.itemId, env, fetchImpl, token);
       if (!movie || (!movie.id && !movie.number)) continue;
       items.push(attachPlaybackUserData(
         mapMovie(movie, query.requestUrl || "https://localhost/", env),
@@ -2177,7 +2558,22 @@ function isEmbyClientRequest(request) {
 }
 
 async function imageResponse(id, request, env, fetchImpl, token) {
-  const movie = await getMovie(id, env, fetchImpl, token);
+  // 图片是列表滚动时最密集的请求：先看 Cloudflare 边缘缓存能不能直接命中。
+  const edgeCache = typeof caches !== "undefined" && caches && caches.default
+    ? caches.default
+    : null;
+  const cacheKeyRequest = edgeCache && request.method === "GET"
+    ? edgeImageCacheKey(new URL(request.url))
+    : null;
+  if (edgeCache && cacheKeyRequest) {
+    try {
+      const hit = await edgeCache.match(cacheKeyRequest);
+      if (hit) {
+        return hit;
+      }
+    } catch {}
+  }
+  const movie = await getMovieCached(id, env, fetchImpl, token);
   const imageUrl = safeMediaUrl(movie?.cover_url || movie?.thumb_url, env);
   if (!imageUrl) {
     return errorResponse(404, "Movie image not found");
@@ -2192,7 +2588,8 @@ async function imageResponse(id, request, env, fetchImpl, token) {
   }
   const decoded = await decodeImageBody(upstream.body);
   const headers = new Headers({
-    "cache-control": "public, max-age=3600",
+    // 图片内容基本不变：长缓存 + 过期后仍可先用旧图，滚动列表时不再反复等待。
+    "cache-control": "public, max-age=604800, stale-while-revalidate=86400",
     "access-control-allow-origin": "*",
     "x-content-type-options": "nosniff",
   });
@@ -2210,16 +2607,23 @@ async function imageResponse(id, request, env, fetchImpl, token) {
       headers.set(name, value);
     }
   }
-  return new Response(request.method === "HEAD" ? null : decoded.body, {
+  const response = new Response(request.method === "HEAD" ? null : decoded.body, {
     status: upstream.status,
     headers,
   });
+  if (edgeCache && cacheKeyRequest && response.ok) {
+    // 写入边缘缓存放在响应之后，不额外拖慢这一次请求。
+    try {
+      edgeCache.put(cacheKeyRequest, response.clone()).catch(() => {});
+    } catch {}
+  }
+  return response;
 }
 
 async function subtitleResponse(id, index, request, env, fetchImpl, token) {
   try {
-    const movie = await getMovie(id, env, fetchImpl, token);
-    const subtitles = await resolveSubtitles(movie, env, fetchImpl);
+    const movie = await getMovieCached(id, env, fetchImpl, token);
+    const subtitles = await resolveSubtitlesCached(movie, env, fetchImpl);
     const subtitle = subtitles[index - 2] || subtitles[index - 1];
     if (!subtitle) {
       return errorResponse(404, "Movie subtitle not found");
@@ -2369,14 +2773,22 @@ async function streamResponse(id, request, env, fetchImpl, token) {
       }
     }
 
-    const resolvedVideo = await resolveVideo(
-      await getMovie(id, env, fetchImpl, token),
-      env,
-      fetchImpl,
-    );
+    const movieForStream = await getMovieCached(id, env, fetchImpl, token);
+    const resolvedVideo = await resolveVideoCached(movieForStream, env, fetchImpl);
     const response = await tryVideo(resolvedVideo);
     if (response) {
       return response;
+    }
+    // 缓存里那份直链已经失效（媒体源拒绝）：清掉缓存重新解析一次再试，
+    // 避免“一个人遇到过期的地址，之后所有人都用不了”。
+    if (resolvedVideo) {
+      forgetResolveVideoCache(movieForStream, env);
+      triedSources.clear();
+      const retriedVideo = await resolveVideoCached(movieForStream, env, fetchImpl);
+      const retriedResponse = await tryVideo(retriedVideo);
+      if (retriedResponse) {
+        return retriedResponse;
+      }
     }
     return errorResponse(
       lastStatus === 404 ? 404 : 502,
@@ -2600,6 +3012,8 @@ async function handleFallbackDelete(path, request, env, url) {
 
 export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   const url = new URL(request.url);
+  // 记下客户端访问用的域名：边缘缓存的键必须落在当前站点上。
+  edgeCacheOrigin = url.origin;
   if (browserPageBlocked(request)) {
     return notFoundPage();
   }
@@ -2784,7 +3198,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
           continue;
         }
         try {
-          const movie = await getMovie(record.itemId, env, fetchImpl, token);
+          const movie = await getMovieCached(record.itemId, env, fetchImpl, token);
           if (!movie || (!movie.id && !movie.number)) continue;
           const item = mapMovie(movie, request.url, env);
           const runtimeTicks = recordRuntime || Math.max(0, Number(item.RunTimeTicks) || 0);
@@ -2884,7 +3298,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       let runtimeTicks = recordRuntime;
       if (runtimeTicks <= 0) {
         try {
-          const userDataMovie = await getMovie(userDataItemId, env, fetchImpl, token);
+          const userDataMovie = await getMovieCached(userDataItemId, env, fetchImpl, token);
           if (userDataMovie && (userDataMovie.id || userDataMovie.number)) {
             runtimeTicks = Math.max(0, Number(mapMovie(userDataMovie, request.url, env).RunTimeTicks) || 0);
           }
@@ -3095,33 +3509,51 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   const playbackMatch = path.match(/^\/Items\/([^/]+)\/PlaybackInfo$/i);
   if (playbackMatch) {
     try {
-      const movie = await getMovie(decodeURIComponent(playbackMatch[1]), env, fetchImpl, token);
+      const movie = await getMovieCached(decodeURIComponent(playbackMatch[1]), env, fetchImpl, token);
       const item = mapMovie(movie, request.url, env);
-      const [video, subtitles] = await Promise.all([
-        resolveVideo(movie, env, fetchImpl),
-        resolveSubtitles(movie, env, fetchImpl).catch(() => []),
-      ]);
-      if (!video) {
-        return jsonResponse({ PlaySessionId: crypto.randomUUID(), MediaSources: [] });
+      const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
+      // 与详情页一致：给解析一小段预算时间，超时就先返回占位媒体源，让客户端马上能起播
+      // （真正播放时由 /Videos/{id}/stream 再做完整解析；后台解析完成后会写进缓存）。
+      let video = null;
+      let subtitles = [];
+      let resolutionFinished = false;
+      try {
+        [video, subtitles] = await withTimeout(
+          Promise.all([
+            resolveVideoCached(movie, env, fetchImpl),
+            hasChineseSubtitles(movie)
+              ? resolveSubtitlesCached(movie, env, fetchImpl).catch(() => [])
+              : Promise.resolve([]),
+          ]),
+          ITEM_DETAIL_RESOLVE_BUDGET_MS,
+        );
+        resolutionFinished = true;
+      } catch {
+        video = null;
+        subtitles = [];
       }
+
+      const mediaSources = video
+        ? [mediaSource(item, request.url, playbackToken, video, subtitles)]
+        : resolutionFinished
+          ? []
+          : [mediaSource(
+            item,
+            request.url,
+            playbackToken,
+            { title: item.Name, sourceType: "video/mp4" },
+            [],
+          )];
+
       return jsonResponse({
         PlaySessionId: crypto.randomUUID(),
         ItemId: item.Id,
-        MediaSources: [
-          mediaSource(
-            item,
-            request.url,
-            token || (guestAccessEnabled(env) ? guestToken(env) : ""),
-            video,
-            subtitles,
-          ),
-        ],
+        MediaSources: mediaSources,
       });
     } catch (error) {
       return errorResponse(502, error instanceof Error ? error.message : "Playback metadata unavailable");
     }
   }
-
   const downloadMatch = path.match(/^\/Items\/([^/]+)\/Download$/i);
   if (downloadMatch) {
     return streamResponse(
