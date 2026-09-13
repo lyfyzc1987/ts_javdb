@@ -204,7 +204,10 @@ export function createJavdbSignature(timestamp = Math.floor(Date.now() / 1000)) 
 }
 
 function jsonResponse(value, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(value), {
+  // 客户端（Gson/Jackson 等）按对象解析响应体，空 body 会直接抛
+  // “Expected start of the object '{', but had 'EOF'”。这里兜底保证
+  // 成功响应永远是合法 JSON。
+  return new Response(JSON.stringify(value === undefined ? {} : value), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
@@ -2009,6 +2012,69 @@ function attachPlaybackUserData(item, state) {
   return item;
 }
 
+// 收藏页：客户端会带 Filters=IsFavorite（或 IsFavorite=true）来取“我的收藏”。
+// 之前完全没实现，所以收藏页把整个中文字幕片库都列了出来。
+function wantsFavoriteOnly(query) {
+  if (/^(?:1|true|yes)$/i.test(String(query.get("IsFavorite") || "").trim())) {
+    return true;
+  }
+  const filters = String(query.get("Filters") || "").trim();
+  return /(?:^|[,\s|])isfavorite(?:$|[,\s|])/i.test(filters);
+}
+
+function favoriteIncludeKinds(query) {
+  const raw = String(query.get("IncludeItemTypes") || "").toLowerCase();
+  if (!raw) {
+    return { videos: true, persons: true };
+  }
+  return {
+    videos: /movie|video|series|episode|boxset|trailer/.test(raw),
+    persons: /person|people/.test(raw),
+  };
+}
+
+// 把收藏状态（影片 + 演员）整理成客户端要的 QueryResult。
+async function favoriteItemsPage(query, env, fetchImpl, token) {
+  const state = await readPlaybackState(env, token);
+  const kinds = favoriteIncludeKinds(query);
+  const startIndex = Math.max(0, Number(query.get("StartIndex") || 0));
+  const limit = Math.min(
+    DEFAULT_PAGE_SIZE,
+    Math.max(1, Number(query.get("Limit") || DEFAULT_PAGE_SIZE)),
+  );
+  const items = [];
+  for (const record of Object.values(state)) {
+    if (!record || !record.itemId || !record.favorite) {
+      continue;
+    }
+    const personName = personNameFromItemId(record.itemId);
+    if (personName) {
+      if (kinds.persons) {
+        items.push(personItemDto(record.itemId, personName, env));
+      }
+      continue;
+    }
+    if (!kinds.videos) {
+      continue;
+    }
+    try {
+      const movie = await getMovie(record.itemId, env, fetchImpl, token);
+      if (!movie || (!movie.id && !movie.number)) continue;
+      items.push(attachPlaybackUserData(
+        mapMovie(movie, query.requestUrl || "https://localhost/", env),
+        state,
+      ));
+    } catch {
+      // 单条回源失败就跳过，不影响整个收藏页
+    }
+  }
+  return {
+    Items: items.slice(startIndex, startIndex + limit),
+    TotalRecordCount: items.length,
+    StartIndex: startIndex,
+  };
+}
+
 function parseJsonBodyText(raw) {
   if (!raw) return {};
   try {
@@ -2372,10 +2438,8 @@ function isHandledPath(path) {
     /^\/Users\/[^/]+\/Views$/i.test(path) ||
     /^\/Users\/[^/]+\/Suggestions$/i.test(path) ||
     /^\/Users\/[^/]+\/Items(?:\/|$)/i.test(path) ||
-    /^\/Users\/[^/]+\/PlayedItems\/[^/]+$/i.test(path) ||
-    /^\/Users\/[^/]+\/UnplayedItems\/[^/]+$/i.test(path) ||
-    /^\/Users\/[^/]+\/PlayingItems\/[^/]+$/i.test(path) ||
-    /^\/Users\/[^/]+\/FavoriteItems\/[^/]+$/i.test(path) ||
+    /^\/Users\/[^/]+\/(?:PlayedItems|UnplayedItems|PlayingItems|FavoriteItems)(?:\/[^/]+)?$/i.test(path) ||
+    /^\/Users\/[^/]+\/Resume(?:\/[^/]+)?$/i.test(path) ||
     path.toLowerCase().startsWith("/items/") ||
     path.toLowerCase().startsWith("/videos/") ||
     path.toLowerCase().startsWith("/emby-media/")
@@ -2461,6 +2525,79 @@ async function deviceBindingFailure(request, url, env, path) {
   return null;
 }
 
+// 从删除类请求的路径里猜出条目 Id。不同客户端写法差异很大：
+//   /Users/{uid}/PlayedItems/{id}
+//   /Users/{uid}/Items/{id}/UserData
+//   /Items/{id}/UserData
+//   /Users/{uid}/Items/Resume/{id}
+const DELETE_PATH_KEYWORDS = new Set([
+  "users",
+  "items",
+  "useritems",
+  "videos",
+  "emby",
+  "me",
+  "userdata",
+  "playeditems",
+  "unplayeditems",
+  "playingitems",
+  "favoriteitems",
+  "resume",
+  "sessions",
+  "playing",
+  "stopped",
+  "progress",
+  "viewing",
+  "download",
+  "stream",
+  "streaming",
+  "original",
+  "playback",
+]);
+
+function deleteTargetIdFromPath(path) {
+  const segments = String(path || "")
+    .split("?")[0]
+    .split("/")
+    .filter(Boolean);
+  const candidates = [];
+  for (const segment of segments) {
+    let value = segment;
+    try {
+      value = decodeURIComponent(segment);
+    } catch {
+      value = segment;
+    }
+    if (value && !DELETE_PATH_KEYWORDS.has(value.toLowerCase())) {
+      candidates.push(value);
+    }
+  }
+  return candidates.length ? candidates[candidates.length - 1] : "";
+}
+
+// 兜底：客户端的“移除播放记录 / 从继续观看中移除 / 取消收藏”路径写法五花八门，
+// 只要是一个针对条目的 DELETE，就清掉该条目的记录并返回 204，避免客户端报 404。
+async function handleFallbackDelete(path, request, env, url) {
+  if (request.method !== "DELETE") {
+    return null;
+  }
+  const requestPath = String(path || "");
+  const looksLikeItemDelete = /^\/(?:Users|UserItems|Items|Videos|Sessions|emby-media)\//i.test(requestPath);
+  const targetId = deleteTargetIdFromPath(requestPath);
+  if (!looksLikeItemDelete && !targetId) {
+    return null;
+  }
+  if (targetId) {
+    const token = getToken(request, url);
+    const state = await readPlaybackState(env, token);
+    if (state[targetId]) {
+      delete state[targetId];
+      await writePlaybackState(env, state, token);
+    }
+  }
+  return noContentResponse();
+}
+
 export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   const url = new URL(request.url);
   if (browserPageBlocked(request)) {
@@ -2471,13 +2608,18 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     return jsonResponse(systemInfo(request.url, env));
   }
   if (!isHandledPath(requestPath)) {
+    // 删除类请求（移除播放记录/收藏）先按“删除即成功”兜底，避免客户端 404。
+    const earlyFallbackDelete = await handleFallbackDelete(requestPath, request, env, url);
+    if (earlyFallbackDelete) {
+      return earlyFallbackDelete;
+    }
     if (isEmbyClientRequest(request)) {
       console.error(JSON.stringify({
         message: "Unhandled Emby endpoint",
         method: request.method,
         path: requestPath,
       }));
-      return errorResponse(404, "Emby endpoint not found");
+      return errorResponse(404, `Emby endpoint not found: ${request.method} ${requestPath}`);
     }
     return null;
   }
@@ -2584,6 +2726,10 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     try {
       const query = new URLSearchParams(url.search);
       query.requestUrl = request.url;
+      // 收藏页（Filters=IsFavorite / IsFavorite=true）：只回收藏过的影片和演员。
+      if (wantsFavoriteOnly(query)) {
+        return jsonResponse(await favoriteItemsPage(query, env, fetchImpl, token));
+      }
       // 点击演员后的“该演员出演作品”列表：客户端会带 PersonIds=person:<演员名>。
       // 走专门的演员检索，只返回可播放作品；没有 PersonIds 才是普通浏览/搜索。
       if (query.has("PersonIds") && !query.get("SearchTerm")) {
@@ -2680,6 +2826,12 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   ) {
     return jsonResponse(emptyItemQuery());
   }
+  // 收藏列表：/Users/{uid}/FavoriteItems（部分客户端直接打这个地址）
+  if (/^\/Users\/[^/]+\/FavoriteItems$/i.test(path) && request.method === "GET") {
+    const favoriteQuery = new URLSearchParams(url.search);
+    favoriteQuery.requestUrl = request.url;
+    return jsonResponse(await favoriteItemsPage(favoriteQuery, env, fetchImpl, token));
+  }
   const userDataMatch = path.match(/^\/Items\/([^/]+)\/UserData$/i);
   if (userDataMatch) {
     const userDataItemId = decodeURIComponent(userDataMatch[1]);
@@ -2770,7 +2922,8 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     playedRecord.lastPlayedDate = new Date().toISOString();
     playedState[playedItemId] = playedRecord;
     await writePlaybackState(env, playedState, token);
-    return noContentResponse();
+    // Emby 这两个接口会回传更新后的 UserData，客户端按对象解析。
+    return jsonResponse(userDataForRecord(playedRecord));
   }
   // “移除播放记录 / 标记未播放”：Emby 官方接口就是
   // DELETE /Users/{uid}/PlayedItems/{id}。旧代码只处理了 POST/PUT，
@@ -2782,7 +2935,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       delete removedPlayedState[removedPlayedId];
       await writePlaybackState(env, removedPlayedState, token);
     }
-    return noContentResponse();
+    return jsonResponse(userDataForRecord(removedPlayedState[removedPlayedId]));
   }
   const unplayedItemsMatch = path.match(/^\/Users\/[^/]+\/UnplayedItems\/([^/]+)$/i);
   if (unplayedItemsMatch && (request.method === "POST" || request.method === "DELETE")) {
@@ -2797,9 +2950,11 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     };
     unplayedRecord.itemId = unplayedItemId;
     unplayedRecord.played = false;
+    // 标记未播放时一并清掉进度，否则条目仍会留在“继续观看”里。
+    unplayedRecord.positionTicks = 0;
     unplayedState[unplayedItemId] = unplayedRecord;
     await writePlaybackState(env, unplayedState, token);
-    return noContentResponse();
+    return jsonResponse(userDataForRecord(unplayedRecord));
   }
   const playingItemsMatch = path.match(/^\/Users\/[^/]+\/PlayingItems\/([^/]+)$/i);
   if (playingItemsMatch && (request.method === "POST" || request.method === "PUT")) {
@@ -2856,7 +3011,14 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     favoriteRecord.favorite = request.method !== "DELETE";
     favoriteState[favoriteItemId] = favoriteRecord;
     await writePlaybackState(env, favoriteState, token);
-    return noContentResponse();
+    // 关键修复：Emby 的收藏/取消收藏会回传更新后的 UserData，客户端按对象解析；
+    // 旧实现返回 204 空响应，于是点“收藏演员 / 收藏影片”时报
+    // SerializationException: Expected start of the object '{', but had 'EOF'。
+    return jsonResponse(userDataForRecord(favoriteRecord));
+  }
+  if (favoriteItemsMatch && request.method === "GET") {
+    const favoriteItemId = decodeURIComponent(favoriteItemsMatch[1]);
+    return jsonResponse(userDataForRecord((await readPlaybackState(env, token))[favoriteItemId]));
   }
   if (path === "/Movies/Recommendations") {
     return jsonResponse([]);
@@ -2912,6 +3074,13 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     } catch (error) {
       return errorResponse(502, error instanceof Error ? error.message : "Search unavailable");
     }
+  }
+
+  // 统一兜底：走到这里说明前面所有具体删除处理都没匹配上。
+  // 退一步按“删除 = 清掉该条目的播放记录”处理，避免客户端报 404。
+  const genericFallbackDelete = await handleFallbackDelete(path, request, env, url);
+  if (genericFallbackDelete) {
+    return genericFallbackDelete;
   }
 
   const imageMatch = path.match(/^\/Items\/([^/]+)\/Images\/Primary$/i);
@@ -3029,24 +3198,11 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     });
   }
 
-  // 兜底：不同客户端“移除播放记录/标记未播放/取消收藏”用的路径不完全一样，
-  // 只要是针对某个条目的 DELETE，就统一清掉该条目的播放记录并返回 204，
-  // 避免客户端因为打到没实现的路径而报 404。
-  if (request.method === "DELETE") {
-    const deleteFallback =
-      path.match(/^\/Items\/([^/]+)\/(?:UserData|PlayedItems|UnplayedItems|PlayingItems|FavoriteItems)$/i) ||
-      path.match(/^\/Users\/[^/]+\/(?:PlayedItems|UnplayedItems|PlayingItems|FavoriteItems)\/([^/]+)$/i);
-    if (deleteFallback) {
-      const deleteItemId = decodeURIComponent(deleteFallback[1]);
-      const deleteState = await readPlaybackState(env, token);
-      if (deleteState[deleteItemId]) {
-        delete deleteState[deleteItemId];
-        await writePlaybackState(env, deleteState, token);
-      }
-      return noContentResponse();
-    }
+  const lateFallbackDelete = await handleFallbackDelete(path, request, env, url);
+  if (lateFallbackDelete) {
+    return lateFallbackDelete;
   }
 
-  return errorResponse(404, "Emby endpoint not found");
+  return errorResponse(404, `Emby endpoint not found: ${request.method} ${path}`);
 }
 
