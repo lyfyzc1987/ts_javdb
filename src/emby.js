@@ -1057,7 +1057,10 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     VideoType: "VideoFile",
     Container: "mp4",
     Overview: movie.summary || "",
-    PremiereDate: date || undefined,
+    PremiereDate: (() => {
+      const d = String(date || "").trim();
+      return d ? (d.includes("T") ? d : d + "T00:00:00.000Z") : undefined;
+    })(),
     ProductionYear: Number.isFinite(year) ? year : undefined,
     RunTimeTicks: duration > 0 ? Math.round(duration * 60 * 10_000_000) : undefined,
     Genres: uniqueTags,
@@ -1111,6 +1114,15 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     }
   } else if (movie.series_id) {
     item.SeriesId = String(movie.series_id);
+  }
+  // 系列也放进“类别 / 标签”：详情页标签栏里能直接看到系列名，
+  // 点了按系列名回源搜索（搜索结果同样只会是可播放作品）。
+  if (seriesName && !uniqueTags.includes(seriesName)) {
+    uniqueTags.push(seriesName);
+    item.Genres = uniqueTags.slice();
+    item.Tags = uniqueTags.slice();
+    item.GenreItems.push({ Name: seriesName, Id: genreIdForName(seriesName) });
+    item.TagItems.push({ Name: seriesName, Id: tagIdForName(seriesName) });
   }
 
   return item;
@@ -2302,6 +2314,9 @@ const PLAYBACK_MAX_RESUME_ITEMS = 30;
 // 进度距片尾不足 2 分钟也视为“已看完”：部分客户端在结尾前几秒/一两分钟退出时
 // 不会上报 PlayedToCompletion，若仍按“没看完”处理会残留进度条并出现在“继续播放”里。
 const PLAYBACK_FINISH_TAIL_TICKS = 120 * 10_000_000;
+// 移除播放记录后的“抑制期”：客户端常在移除后不久又补发一次旧的进度/停止
+// 上报，把刚删掉的条目又写回“继续观看”。这段时间内忽略该条目的残留上报。
+const PLAYBACK_DELETE_SUPPRESS_MS = 5 * 60 * 1000;
 
 // 播放记录的后备存储：
 // - 优先用 KV 命名空间（PLAYBACK_KV）跨请求长期保存；
@@ -2478,6 +2493,44 @@ async function writePlaybackState(env, state, token) {
       error: error instanceof Error ? error.message : String(error),
     }));
   }
+}
+
+// 移除一条播放记录：删掉条目，并记下“刚被移除”的时间戳，
+// 抑制随后补发的旧进度上报把该条目又写回“继续观看”。
+function removedMarker(state, itemId) {
+  const raw = state && state.__removedAt && state.__removedAt[itemId];
+  if (!raw) return null;
+  if (typeof raw === "number") return { at: raw, positionTicks: 0, played: false };
+  if (typeof raw === "object") return {
+    at: Number(raw.at) || 0,
+    positionTicks: Math.max(0, Number(raw.positionTicks) || 0),
+    played: raw.played === true,
+  };
+  return null;
+}
+
+function clearRemovedMarker(state, itemId) {
+  if (state && state.__removedAt) delete state.__removedAt[itemId];
+}
+
+function removePlaybackRecord(state, itemId) {
+  if (!state || !itemId) return false;
+  const old = state[itemId];
+  let changed = false;
+  if (old) {
+    delete state[itemId];
+    changed = true;
+  }
+  if (!state.__removedAt || typeof state.__removedAt !== "object") {
+    state.__removedAt = {};
+  }
+  state.__removedAt[itemId] = {
+    at: Date.now(),
+    positionTicks: Math.max(0, Number(old && old.positionTicks) || 0),
+    played: Boolean(old && old.played),
+  };
+  if (!old) changed = true;
+  return changed;
 }
 
 // 是否算“已看完”：显式已播，或进度已到总时长 90% 以上，
@@ -2737,6 +2790,20 @@ async function recordPlaybackEvent(path, request, env) {
         runTimeTicks - positionTicks <= PLAYBACK_FINISH_TAIL_TICKS));
 
   const state = await readPlaybackState(env, token);
+  const marker = removedMarker(state, itemId);
+  if (marker) {
+    const fresh = Date.now() - marker.at < PLAYBACK_DELETE_SUPPRESS_MS;
+    // 区分“刚移除后补发的旧进度”和“用户真的重新播放了”:
+    // 新的播放开始、进度明显超过被移除时的位置、或直接上报看完都算重新播放;
+    // 其余的旧上报在抑制期内忽略,避免记录“过一会又出现”。
+    const jumpedAhead = positionTicks > marker.positionTicks + PLAYBACK_FINISH_TAIL_TICKS;
+    const restarted = path === "/Sessions/Playing" || jumpedAhead || (!marker.played && playedToCompletion);
+    if (!fresh || restarted) {
+      clearRemovedMarker(state, itemId);
+    } else {
+      return;
+    }
+  }
   const existing = state[itemId];
   const record = existing || {
     itemId,
@@ -3245,9 +3312,9 @@ async function applyItemUserDataAction(itemId, action, request, env, token) {
   const isMarkAction =
     action === "playeditems" || action === "unplayeditems" || action === "favoriteitems";
   if (method === "DELETE" && (action === "playingitems" || action === "userdata")) {
-    // 结束播放 / 移除续播记录：整条删掉，条目立刻从“继续观看”消失。
-    if (existing) {
-      delete state[itemId];
+    // 结束播放 / 移除续播记录：整条删掉，条目立刻从“继续观看”消失；
+    // 同时记下“刚移除”时间戳，抑制客户端随后补发的旧进度把记录写回来。
+    if (removePlaybackRecord(state, itemId)) {
       await writePlaybackState(env, state, token);
     }
     return userDataForRecord(undefined);
@@ -3647,8 +3714,9 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     const userDataItemId = decodeURIComponent(userDataMatch[1]);
     const userDataState = await readPlaybackState(env, token);
     if (request.method === "DELETE") {
-      delete userDataState[userDataItemId];
-      await writePlaybackState(env, userDataState, token);
+      if (removePlaybackRecord(userDataState, userDataItemId)) {
+        await writePlaybackState(env, userDataState, token);
+      }
       return noContentResponse();
     }
     if (request.method === "POST" || request.method === "PUT") {
@@ -3741,8 +3809,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   if (playedItemsMatch && request.method === "DELETE") {
     const removedPlayedId = decodeURIComponent(playedItemsMatch[1]);
     const removedPlayedState = await readPlaybackState(env, token);
-    if (removedPlayedState[removedPlayedId]) {
-      delete removedPlayedState[removedPlayedId];
+    if (removePlaybackRecord(removedPlayedState, removedPlayedId)) {
       await writePlaybackState(env, removedPlayedState, token);
     }
     return jsonResponse(userDataForRecord(removedPlayedState[removedPlayedId]));
@@ -3799,8 +3866,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   if (playingItemsMatch && request.method === "DELETE") {
     const stoppedItemId = decodeURIComponent(playingItemsMatch[1]);
     const stoppedState = await readPlaybackState(env, token);
-    if (stoppedState[stoppedItemId]) {
-      delete stoppedState[stoppedItemId];
+    if (removePlaybackRecord(stoppedState, stoppedItemId)) {
       await writePlaybackState(env, stoppedState, token);
     }
     return noContentResponse();
