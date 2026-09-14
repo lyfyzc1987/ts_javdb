@@ -1012,10 +1012,38 @@ function movieDisplayName(movie) {
   return title || number || String(movie?.id || "");
 }
 
+function movieDisplayDate(movie) {
+  const raw = String(
+    movie?.release_date ||
+    movie?.released_at ||
+    movie?.delivery_date ||
+    movie?.online_date ||
+    movie?.publish_date ||
+    movie?.published_at ||
+    movie?.date ||
+    movie?.created_at ||
+    ""
+  ).trim();
+  if (!raw) return "";
+  const match = raw.match(/(\d{4}-\d{2}-\d{2})/);
+  return match ? match[1] : "";
+}
+
+function movieOverviewWithDate(movie) {
+  const summary = String(movie?.summary || "").trim();
+  const date = movieDisplayDate(movie);
+  if (!date) return summary;
+  const line = `配信開始日 ${date}`;
+  if (!summary) return line;
+  if (summary.startsWith(line) || summary.includes(line)) return summary;
+  return `${line}\n${summary}`;
+}
+
 function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRARY_ID) {
   const id = String(movie.id ?? movie.number ?? "");
   const image = movie.cover_url || movie.thumb_url || "";
-  const date = movie.release_date || movie.released_at || "";
+  const displayDate = movieDisplayDate(movie);
+  const date = displayDate || movie.release_date || movie.released_at || "";
   const year = Number.parseInt(String(date).slice(0, 4), 10);
   const duration = Number(movie.duration || 0);
   // 上游返回的标签（巨乳 / 单体作品 / 4K 等）同时当作“类别”和“标签”用；
@@ -1056,12 +1084,13 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     MediaType: "Video",
     VideoType: "VideoFile",
     Container: "mp4",
-    Overview: movie.summary || "",
+    Overview: movieOverviewWithDate(movie),
     PremiereDate: (() => {
-      const d = String(date || "").trim();
+      const d = String(displayDate || date || "").trim();
       return d ? (d.includes("T") ? d : d + "T00:00:00.000Z") : undefined;
     })(),
     ProductionYear: Number.isFinite(year) ? year : undefined,
+    ReleaseDate: displayDate || undefined,
     RunTimeTicks: duration > 0 ? Math.round(duration * 60 * 10_000_000) : undefined,
     Genres: uniqueTags,
     Tags: uniqueTags,
@@ -4135,4 +4164,3 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
 
   return errorResponse(404, `Emby endpoint not found: ${request.method} ${path}`);
 }
-
