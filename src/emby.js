@@ -1029,14 +1029,9 @@ function movieDisplayDate(movie) {
   return match ? match[1] : "";
 }
 
-function movieOverviewWithDate(movie) {
-  const summary = String(movie?.summary || "").trim();
+function movieTagline(movie) {
   const date = movieDisplayDate(movie);
-  if (!date) return summary;
-  const line = `配信開始日 ${date}`;
-  if (!summary) return line;
-  if (summary.startsWith(line) || summary.includes(line)) return summary;
-  return `${line}\n${summary}`;
+  return date ? `配信開始日 ${date}` : "";
 }
 
 function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRARY_ID) {
@@ -1084,7 +1079,8 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     MediaType: "Video",
     VideoType: "VideoFile",
     Container: "mp4",
-    Overview: movieOverviewWithDate(movie),
+    Tagline: movieTagline(movie) || undefined,
+    Overview: String(movie?.summary || "").trim(),
     PremiereDate: (() => {
       const d = String(displayDate || date || "").trim();
       return d ? (d.includes("T") ? d : d + "T00:00:00.000Z") : undefined;
