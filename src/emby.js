@@ -1039,15 +1039,6 @@ function movieTaglines(movie) {
   return tagline ? [tagline] : undefined;
 }
 
-function movieOverviewWithDateFallback(movie) {
-  const summary = String(movie?.summary || "").trim();
-  const tagline = movieTagline(movie);
-  if (!tagline) return summary;
-  if (!summary) return tagline;
-  if (summary.startsWith(tagline) || summary.includes(tagline)) return summary;
-  return `${tagline}\n\n${summary}`;
-}
-
 function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRARY_ID) {
   const id = String(movie.id ?? movie.number ?? "");
   const image = movie.cover_url || movie.thumb_url || "";
@@ -1095,7 +1086,7 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     Container: "mp4",
     Tagline: movieTagline(movie) || undefined,
     Taglines: movieTaglines(movie),
-    Overview: movieOverviewWithDateFallback(movie),
+    Overview: String(movie?.summary || "").trim(),
     PremiereDate: (() => {
       const d = String(displayDate || date || "").trim();
       return d ? (d.includes("T") ? d : d + "T00:00:00.000Z") : undefined;
