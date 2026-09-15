@@ -1008,11 +1008,104 @@ function imageContentType(imageUrl, declaredType, detectedType) {
 // 若标题本身已带番号前缀（如 “ABC-123 xxx”），就不再重复拼接。
 function movieDisplayName(movie) {
   const title = String(movie?.title || movie?.name || "").trim();
-  const number = String(movie?.number || movie?.code || "").trim();
-  if (number && title && !title.toUpperCase().startsWith(number.toUpperCase())) {
-    return `${number} ${title}`.trim();
+  return joinNumberAndTitle(movieNumber(movie), title) || String(movie?.id || "");
+}
+
+// 番号(品番)常见形态:ABC-123 / ABC123 / 123456_789 / 259LUXU-1234。
+// 只认“字母+数字”或“数字+分隔符+数字”这类明确的番号样式,避免把普通标题误当番号。
+// 从标题里切出候选番号:按非字母数字的字符切开(含全角括号、顿号等)。
+const NUMBER_TOKEN_SPLITTER = /[^A-Za-z0-9_-]+/;
+const NUMBER_TOKEN_PATTERNS = [
+  /^[A-Za-z]{2,6}-\d{2,5}$/,
+  /^[A-Za-z]{2,6}\d{2,5}$/,
+  /^\d{4,6}[-_]\d{2,4}$/,
+  /^\d{2,4}[A-Za-z]{2,6}[-_]?\d{2,5}$/,
+];
+
+function looksLikeMovieNumber(token) {
+  return NUMBER_TOKEN_PATTERNS.some((pattern) => pattern.test(token));
+}
+
+// 取影片番号:优先用上游字段,字段缺失时从标题里兜底提取。
+// (上游个别条目 number/number_letter 为空,以前会让客户端标题丢掉 JUR-799 这类番号。)
+function movieNumber(movie) {
+  const explicit = String(
+    movie?.number || movie?.number_letter || movie?.code || "",
+  ).trim();
+  if (explicit) {
+    return explicit;
   }
-  return title || number || String(movie?.id || "");
+  const candidates = [
+    movie?.title,
+    movie?.origin_title,
+    movie?.original_title,
+    movie?.name,
+  ];
+  for (const raw of candidates) {
+    const text = String(raw || "").trim();
+    if (!text) continue;
+    const whole = text.toUpperCase();
+    if (looksLikeMovieNumber(whole)) {
+      return whole;
+    }
+    for (const token of text.split(NUMBER_TOKEN_SPLITTER)) {
+      const value = token.toUpperCase().trim();
+      if (value && looksLikeMovieNumber(value)) {
+        return value;
+      }
+    }
+  }
+  return "";
+}
+
+// 把番号和标题拼成展示名:标题里已经有同一个番号(含 JUR799 / JUR-799 这类写法差异)
+// 就不再重复拼接;番号出现在标题中段或结尾时,统一把它提到最前面。
+function joinNumberAndTitle(number, title) {
+  const text = String(title || "").trim();
+  const code = String(number || "").trim();
+  if (!code) return text;
+  if (!text) return code;
+  const pattern = movieNumberMatcher(code);
+  const match = pattern ? pattern.exec(text) : null;
+  if (!match) {
+    return (code + " " + text).trim();
+  }
+  if (match.index === 0) {
+    return text;
+  }
+  const stripped = (text.slice(0, match.index) + text.slice(match.index + match[0].length))
+    .replace(EDGE_SEPARATORS, " ")
+    .trim();
+  return stripped ? (code + " " + stripped).trim() : code;
+}
+
+// 番号匹配:忽略大小写,并允许 JUR-799 / JUR799 / JUR 799 之间的分隔符差异。
+const EDGE_SEPARATORS = /^[\s\-_\u3001,\uFF0C\u3002:\uFF1A\[\]\(\)\uFF08\uFF09]+|[\s\-_\u3001,\uFF0C\u3002:\uFF1A\[\]\(\)\uFF08\uFF09]+$/g;
+
+function movieNumberMatcher(code) {
+  const parts = [];
+  for (const ch of String(code || "")) {
+    if (/[A-Za-z0-9]/.test(ch)) {
+      parts.push(ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    } else {
+      parts.push("[\\s\\-_]*");
+    }
+  }
+  if (!parts.length) return null;
+  try {
+    return new RegExp(parts.join(""), "i");
+  } catch {
+    return null;
+  }
+}
+
+// 原始标题同样带上番号:部分客户端(Emby 安卓/TV)优先显示 OriginalTitle,
+// 以前显示的是没有番号的日文原标题,看起来就像标题不完整。
+function movieOriginalTitle(movie) {
+  const origin = String(
+    movie?.origin_title || movie?.original_title || movie?.title || "",
+  ).trim();
+  return joinNumberAndTitle(movieNumber(movie), origin);
 }
 
 function movieDisplayDate(movie) {
@@ -1075,7 +1168,7 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     ServerId: serverId(env),
     ParentId: parentId,
     Name: movieDisplayName(movie),
-    OriginalTitle: movie.title || movie.number || id,
+    OriginalTitle: movieOriginalTitle(movie) || movie.title || id,
     SortName: movieDisplayName(movie),
     Type: "Movie",
     IsFolder: false,
@@ -1747,7 +1840,7 @@ async function scanLibraryMovies(library, options) {
   return { movies, exhausted };
 }
 async function resolveVideo(movie, env, fetchImpl) {
-  const code = movie.number || movie.code || movie.id || movie.title;
+  const code = movieNumber(movie) || movie.id || movie.title;
   if (!code) {
     return null;
   }
@@ -1795,7 +1888,7 @@ function subtitleCodec(subtitle) {
 }
 
 async function resolveSubtitles(movie, env, fetchImpl) {
-  const code = movie.number || movie.code || movie.id || movie.title;
+  const code = movieNumber(movie) || movie.id || movie.title;
   if (!code) {
     return [];
   }
@@ -1848,7 +1941,7 @@ async function resolveSubtitles(movie, env, fetchImpl) {
 // 播放源 / 字幕解析结果缓存：解析服务冷启动很慢，缓存后再次点开、详情页预解析、
 // 正式起播之间可以互相复用同一份结果，起播会明显更快。
 function movieResolveCode(movie) {
-  return String(movie?.number || movie?.code || movie?.id || movie?.title || "");
+  return String(movieNumber(movie) || movie?.id || movie?.title || "");
 }
 
 async function resolveVideoCached(movie, env, fetchImpl) {
@@ -1882,7 +1975,8 @@ async function resolveSubtitlesCached(movie, env, fetchImpl) {
       return shared;
     }
     const subtitles = await resolveSubtitles(movie, env, fetchImpl);
-    if (Array.isArray(subtitles) && subtitles.length > 0) {
+    // 空结果同样缓存:能确定“这部片没有字幕”,下次不用再等一次冷启动回源。
+    if (Array.isArray(subtitles)) {
       await edgeCacheWrite(EDGE_NAMESPACE_SUBTITLE, key, subtitles, RESOLVE_CACHE_TTL_MS / 1000);
     }
     return subtitles;
@@ -1897,6 +1991,131 @@ function forgetResolveVideoCache(movie, env) {
   const key = `${resolverOrigin(env)}${resolverResolvePath(env)}|${code}`;
   RESOLVE_VIDEO_CACHE.forget(key);
   forgetEdgeCache(EDGE_NAMESPACE_VIDEO, key);
+}
+
+// ---------- 字幕加速 ----------
+// 1) 字幕流令牌:mediaSource 生成字幕流时把真实字幕地址登记下来,DeliveryUrl 上带一个 sid。
+//    客户端取字幕时凭 sid 直接命中,不用再回源解析一遍字幕列表(字幕列表冷启动约 1.5s)。
+// 2) 字幕文件优先直连字幕 CDN(实测 150-400ms),直连失败才回退上游代下接口(冷启动约 2.5s)。
+// 3) 取回的字幕字节按地址缓存,二次起播 / 拖动进度条直接命中,不再等第二次回源。
+const SUBTITLE_STREAM_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_SUBTITLE_STREAM_TOKENS = 4000;
+const MAX_SUBTITLE_BODY_CACHE_ENTRIES = 200;
+const SUBTITLE_FETCH_TIMEOUT_MS = 8000;
+
+function createTtlMap(ttlMs, maxEntries) {
+  const entries = new Map();
+  const read = (key) => {
+    const entry = entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expires <= Date.now()) {
+      entries.delete(key);
+      return undefined;
+    }
+    entries.delete(key);
+    entries.set(key, entry);
+    return entry.value;
+  };
+  const write = (key, value) => {
+    entries.set(key, { value, expires: Date.now() + ttlMs });
+    while (entries.size > maxEntries) {
+      entries.delete(entries.keys().next().value);
+    }
+  };
+  return { read, write, forget: (key) => entries.delete(key) };
+}
+
+const SUBTITLE_STREAM_TOKENS = createTtlMap(SUBTITLE_STREAM_TTL_MS, MAX_SUBTITLE_STREAM_TOKENS);
+const SUBTITLE_BODY_CACHE = createTtlMap(SUBTITLE_STREAM_TTL_MS, MAX_SUBTITLE_BODY_CACHE_ENTRIES);
+
+function subtitleStreamCodec(subtitle) {
+  return subtitle?.codec || subtitleCodec(subtitle);
+}
+
+// 登记一条件字幕并返回 sid:内容为 { itemId, url, codec, title }
+function subtitleStreamToken(itemId, subtitle, index) {
+  const token = md5(`${itemId}|${index}|${subtitle.url}|${subtitle.codec}`);
+  SUBTITLE_STREAM_TOKENS.write(token, {
+    itemId: String(itemId),
+    url: subtitle.url,
+    codec: subtitle.codec,
+    title: subtitle.title,
+  });
+  return token;
+}
+
+// 凭 sid 取回登记过的字幕;令牌过期或换实例时返回 null,调用方按序号重新解析。
+function subtitleFromToken(sid, itemId) {
+  const entry = SUBTITLE_STREAM_TOKENS.read(String(sid || ""));
+  if (!entry) return null;
+  if (itemId && String(entry.itemId) !== String(itemId)) return null;
+  return entry;
+}
+
+// 先直连字幕 CDN,失败再回退上游代下接口。
+async function fetchSubtitleBody(subtitle, env, fetchImpl) {
+  const direct = await fetchSubtitleBytes(subtitle.url, fetchImpl);
+  if (direct) return direct;
+  const target = new URL("/api/subtitle/file", upstreamOrigin(env));
+  target.searchParams.set("url", subtitle.url);
+  return fetchSubtitleBytes(target.toString(), fetchImpl);
+}
+
+// 判断一段文本是否像字幕(SRT / VTT / ASS),避免把上游的 JSON 错误体当成字幕。
+function looksLikeSubtitleText(text) {
+  const head = String(text || "").slice(0, 4096);
+  return head.includes("-->") || /^\uFEFF?WEBVTT/i.test(head) ||
+    head.includes("[Script Info]") || head.includes("[Events]");
+}
+
+async function fetchSubtitleBytes(url, fetchImpl) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), SUBTITLE_FETCH_TIMEOUT_MS);
+  });
+  const task = (async () => {
+    try {
+      const response = await fetchImpl(url, {
+        headers: {
+          accept: "text/vtt,application/x-subrip,text/plain,*/*;q=0.8",
+          referer: "https://www.javdb.com/",
+          "user-agent": "Mozilla/5.0",
+        },
+        redirect: "follow",
+      });
+      if (!response || !response.ok || response.status === 204) {
+        return null;
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (!bytes.length) {
+        return null;
+      }
+      const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+      if (!looksLikeSubtitleText(text)) {
+        return null;
+      }
+      return { bytes, contentType: response.headers.get("content-type") || "" };
+    } catch {
+      return null;
+    }
+  })();
+  try {
+    return await Promise.race([task, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 字幕字节的内存缓存:字幕文件很小,缓存后同一条字幕不再回源。
+async function cachedSubtitleBody(subtitle, env, fetchImpl) {
+  const key = md5(`${upstreamOrigin(env)}|${subtitle.url}|${subtitleStreamCodec(subtitle)}`);
+  const cached = SUBTITLE_BODY_CACHE.read(key);
+  if (cached) return cached;
+  const result = await fetchSubtitleBody(subtitle, env, fetchImpl);
+  if (result && result.bytes) {
+    SUBTITLE_BODY_CACHE.write(key, result);
+  }
+  return result;
 }
 
 function mediaSource(item, requestUrl, token, video, subtitles = []) {
@@ -1943,6 +2162,8 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
       requestUrl,
     );
     deliveryUrl.searchParams.set("api_key", token);
+    // 带上字幕令牌:客户端取字幕时凭它直接拿到真实地址,不用再解析一次字幕列表。
+    deliveryUrl.searchParams.set("sid", subtitleStreamToken(item.Id, subtitle, index));
     return {
       Type: "Subtitle",
       Codec: subtitle.codec,
@@ -2221,6 +2442,17 @@ function virtualFolder(library) {
 // 详情页内“顺带解析播放源”的预算时间：超过就先返回元数据（播放时再完整解析），
 // 让第一次点开影片时更快看到详情页，而不是一直转圈等解析。
 const ITEM_DETAIL_RESOLVE_BUDGET_MS = 1200;
+// 起播(/PlaybackInfo)时客户端马上就要播放,字幕流必须跟着这次响应一起下发,
+// 否则会出现“视频已经播了、字幕还在加载”。这里比详情页多给一点时间。
+const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 2000;
+
+// 后台预热:不阻塞当前响应,把播放源与字幕列表解析完写进缓存,
+// 下次(真正点播放时)直接命中,起播和字幕出现都更快。
+function prewarmResolve(movie, env, fetchImpl) {
+  if (!movie?.id && !movie?.number) return;
+  void resolveVideoCached(movie, env, fetchImpl).catch(() => {});
+  void resolveSubtitlesCached(movie, env, fetchImpl).catch(() => {});
+}
 
 function withTimeout(promise, ms) {
   let timer;
@@ -2257,9 +2489,7 @@ async function itemResponse(id, request, env, fetchImpl, token) {
     [video, subtitles] = await withTimeout(
       Promise.all([
         resolveVideoCached(movie, env, fetchImpl),
-        hasChineseSubtitles(movie)
-          ? resolveSubtitlesCached(movie, env, fetchImpl).catch(() => [])
-          : Promise.resolve([]),
+        resolveSubtitlesCached(movie, env, fetchImpl).catch(() => []),
       ]),
       ITEM_DETAIL_RESOLVE_BUDGET_MS,
     );
@@ -2267,6 +2497,9 @@ async function itemResponse(id, request, env, fetchImpl, token) {
   } catch {
     video = null;
     subtitles = [];
+    // 预算内没解析完:放到后台继续解析(内部会合并重复请求并写进缓存),
+    // 用户真正点播放时 /PlaybackInfo 就能直接命中,不用再从冷启动等一次。
+    prewarmResolve(movie, env, fetchImpl);
   }
 
   if (!video) {
@@ -3233,37 +3466,42 @@ async function imageResponse(id, request, env, fetchImpl, token) {
 
 async function subtitleResponse(id, index, request, env, fetchImpl, token) {
   try {
-    const movie = await getMovieCached(id, env, fetchImpl, token);
-    const subtitles = await resolveSubtitlesCached(movie, env, fetchImpl);
-    const subtitle = subtitles[index - 2] || subtitles[index - 1];
+    // 首选:详情/起播信息里登记过的 sid -> 直接用真实地址,省掉一次字幕列表解析。
+    const requestUrl = new URL(request.url);
+    let subtitle = subtitleFromToken(requestUrl.searchParams.get("sid"), id);
     if (!subtitle) {
+      // 兜底(令牌过期 / 换了 Worker 实例):按序号重新解析字幕列表。
+      const movie = await getMovieCached(id, env, fetchImpl, token);
+      const subtitles = await resolveSubtitlesCached(movie, env, fetchImpl);
+      const resolved = subtitles[index - 2] || subtitles[index - 1];
+      if (!resolved) {
+        return errorResponse(404, "Movie subtitle not found");
+      }
+      subtitle = {
+        itemId: String(id),
+        url: resolved.url,
+        codec: resolved.codec,
+        title: resolved.title,
+      };
+    }
+
+    // 直连字幕 CDN 优先(实测 0.2s 左右),拿到就先返回;
+    // 直连不通才回退上游代下接口,不会因为直连失败影响播放。
+    const fetched = await cachedSubtitleBody(subtitle, env, fetchImpl);
+    if (!fetched) {
       return errorResponse(404, "Movie subtitle not found");
     }
 
-    const target = new URL("/api/subtitle/file", upstreamOrigin(env));
-    target.searchParams.set("url", subtitle.url);
-    const upstream = await fetchImpl(target.toString(), {
-      method: request.method,
-      headers: {
-        accept: "text/vtt,application/x-subrip,text/plain,*/*;q=0.8",
-        "user-agent": "Mozilla/5.0",
-      },
-      redirect: "follow",
-    });
-    if (!upstream.ok) {
-      return errorResponse(404, "Movie subtitle not found");
-    }
-
-    const contentType = subtitle.codec === "vtt"
+    const codec = subtitleStreamCodec(subtitle);
+    const contentType = codec === "vtt"
       ? "text/vtt; charset=utf-8"
       : "application/x-subrip; charset=utf-8";
-    return new Response(request.method === "HEAD" ? null : upstream.body, {
-      status: upstream.status,
-      statusText: upstream.statusText,
+    return new Response(request.method === "HEAD" ? null : fetched.bytes, {
+      status: 200,
       headers: {
         "access-control-allow-origin": "*",
         "cache-control": "public, max-age=3600",
-        "content-disposition": `inline; filename="subtitle.${subtitle.codec}"`,
+        "content-disposition": 'inline; filename="subtitle.' + codec + '"',
         "content-type": contentType,
         "x-content-type-options": "nosniff",
       },
@@ -4361,16 +4599,15 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
         [video, subtitles] = await withTimeout(
           Promise.all([
             resolveVideoCached(movie, env, fetchImpl),
-            hasChineseSubtitles(movie)
-              ? resolveSubtitlesCached(movie, env, fetchImpl).catch(() => [])
-              : Promise.resolve([]),
+            resolveSubtitlesCached(movie, env, fetchImpl).catch(() => []),
           ]),
-          ITEM_DETAIL_RESOLVE_BUDGET_MS,
+          PLAYBACK_INFO_RESOLVE_BUDGET_MS,
         );
         resolutionFinished = true;
       } catch {
         video = null;
         subtitles = [];
+        prewarmResolve(movie, env, fetchImpl);
       }
 
       const mediaSources = video
