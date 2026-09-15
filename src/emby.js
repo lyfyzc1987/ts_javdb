@@ -1,6 +1,6 @@
 const DEFAULT_API_ORIGIN = "https://jdforrepam.com/api";
 const DEFAULT_UPSTREAM_ORIGIN = "https://catembylegacy.fastcdn.dpdns.org";
-const DEFAULT_RESOLVER_ORIGIN = "https://memojavstrm.emby-59f.workers.dev/";
+const DEFAULT_RESOLVER_ORIGIN = "https://catembylegacy.fastcdn.dpdns.org";
 // 原站公开解析接口为 /api/v/resolve（无需登录）；旧解析器路径为 /api/resolve，
 // 可用 JAVSTRM_RESOLVE_PATH 覆盖，便于随时切回或换源。
 const DEFAULT_RESOLVER_RESOLVE_PATH = "/api/v/resolve";
@@ -1083,7 +1083,7 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     LocationType: "Remote",
     MediaType: "Video",
     VideoType: "VideoFile",
-    Container: "mp4",
+    Container: "strm",
     Tagline: movieTagline(movie) || undefined,
     Taglines: movieTaglines(movie),
     Overview: String(movie?.summary || "").trim(),
@@ -1901,27 +1901,35 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
   // ===== 媒体信息 STRM 化（旧逻辑以注释保留，便于恢复）=====
   // 旧版：容器提示是 HLS / M3U8，客户端媒体信息里会显示 “HLS / M3U8”：
   //   旧代码：const container = isHls ? "hls" : "mp4";
-  // 新版：改成 STRM 提示，让客户端把每条资源当成一个 .strm 远程文件。
+  // 新版：统一改成 STRM 提示，让客户端把每条资源当成一个 .strm 远程文件。
   // 真实播放地址仍是下方 streamExtension 生成的 .m3u8 / .mp4（未改动），播放不受影响。
-  const container = isHls ? "strm" : "mp4";
+  const container = "strm";
   // 实际播放/下载地址的后缀仍用 .m3u8 / .mp4，保持真实文件类型。
   const streamExtension = isHls ? "m3u8" : "mp4";
   const height = Number(video.quality || 0);
   const width = height > 0 ? Math.round((height * 16) / 9 / 2) * 2 : undefined;
-  const streamUrl = new URL(
-    publicRoutePath(
+  const buildStreamUrl = (extension) => {
+    const url = new URL(
+      publicRoutePath(
+        requestUrl,
+        `/Videos/${encodeURIComponent(item.Id)}/stream.${extension}`,
+      ),
       requestUrl,
-      `/Videos/${encodeURIComponent(item.Id)}/stream.${streamExtension}`,
-    ),
-    requestUrl,
-  );
-  streamUrl.searchParams.set("api_key", token);
-  streamUrl.searchParams.set("static", "true");
-  streamUrl.searchParams.set("mediaSourceId", item.Id);
-  if (video.sourceUrl) {
-    streamUrl.searchParams.set("source", video.sourceUrl);
-    streamUrl.searchParams.set("sourceType", video.sourceType || "video/mp4");
-  }
+    );
+    url.searchParams.set("api_key", token);
+    url.searchParams.set("static", "true");
+    url.searchParams.set("mediaSourceId", item.Id);
+    if (video.sourceUrl) {
+      url.searchParams.set("source", video.sourceUrl);
+      url.searchParams.set("sourceType", video.sourceType || "video/mp4");
+    }
+    return url;
+  };
+  // 真正播放用的地址：后缀仍是 .mp4 / .m3u8，播放器靠它判断文件类型。
+  const streamUrl = buildStreamUrl(streamExtension);
+  // 展示用的地址：非 HLS 时后缀改成 .strm，客户端“媒体信息”读这个字段，
+  // 不会再出现 mp4 提示。HLS 保持 .m3u8（本来就没有 mp4 字样，避免影响播放引擎判断）。
+  const displayUrl = buildStreamUrl(isHls ? streamExtension : container);
   const subtitleStreams = subtitles.map((subtitle, index) => {
     const streamIndex = index + 2;
     const deliveryUrl = new URL(
@@ -1953,7 +1961,7 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
   return {
     Id: item.Id,
     Name: video.title,
-    Path: streamUrl.toString(),
+    Path: displayUrl.toString(),
     DirectStreamUrl: `${streamUrl.pathname}${streamUrl.search}`,
     Protocol: "Http",
     Type: "Default",
