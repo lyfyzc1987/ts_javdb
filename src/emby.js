@@ -408,6 +408,9 @@ function routePath(requestUrl) {
 function normalizeClientPath(path) {
   return path
     .replace(/^\/Users\/[^/]+\/Items(?=\/|$)/i, "/Items")
+    // 有些客户端的“继续观看”走 /Users/{uid}/Resume，之前会落到 404，
+    // 客户端于是退回自己本地缓存的列表——表现就是“移除了又出现”。
+    .replace(/^\/Users\/[^/]+\/Resume(?:\/.*)?$/i, "/Items/Resume")
     .replace(/^\/Users\/[^/]+\/Suggestions$/i, "/Suggestions");
 }
 
@@ -2355,7 +2358,15 @@ const PLAYBACK_MAX_RESUME_ITEMS = 30;
 const PLAYBACK_FINISH_TAIL_TICKS = 120 * 10_000_000;
 // 移除播放记录后的“抑制期”：客户端常在移除后不久又补发一次旧的进度/停止
 // 上报，把刚删掉的条目又写回“继续观看”。这段时间内忽略该条目的残留上报。
-const PLAYBACK_DELETE_SUPPRESS_MS = 5 * 60 * 1000;
+// 抑制信息放在独立的“墓碑”key 里（见下），所以迟到的整份覆盖也冲不掉它。
+// 抑制期要够长：客户端补发残留上报的时间点很不固定（重开 App、切后台回来…）。
+// 真的重播另有出口（开始播放事件 / 进度明显往前播），不会因为抑制期长就记不上。
+const PLAYBACK_DELETE_SUPPRESS_MS = 2 * 60 * 60 * 1000;
+// 墓碑保留 30 天：脏写回把老记录带回来时，读取阶段也能按时间戳剪掉。
+const PLAYBACK_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const PLAYBACK_MAX_TOMBSTONES = 300;
+// 同一实例内墓碑的短时缓存：进度上报很频繁，避免每次都多读一次 KV。
+const PLAYBACK_TOMBSTONE_CACHE_MS = 5 * 1000;
 
 // 播放记录的后备存储：
 // - 优先用 KV 命名空间（PLAYBACK_KV）跨请求长期保存；
@@ -2485,20 +2496,38 @@ async function storeStoredLoginPassword(env, username, password) {
   }
 }
 
+// token -> 存储 key 的解析结果缓存：同一条请求链里会反复解析（读状态、写状态、
+// 立墓碑），命中缓存可以少几次 KV 读取。用户名还没落到 KV 时不缓存，避免把
+// 播放记录归错账号。
+const MEMORY_PLAYBACK_KEYS = new Map();
+const PLAYBACK_KEY_CACHE_MS = 5 * 60 * 1000;
+
 async function playbackStateKey(env, token) {
   const scope = String(token || "").trim();
   if (!scope || scope === guestToken(env)) {
     return PLAYBACK_STATE_KEY;
   }
-  const username = await lookupSessionUsername(env, scope);
-  if (username) {
-    return `${PLAYBACK_STATE_KEY}:u:${md5(username)}`;
+  const cached = MEMORY_PLAYBACK_KEYS.get(scope);
+  if (cached && Date.now() - cached.at < PLAYBACK_KEY_CACHE_MS) {
+    return cached.key;
   }
-  return `${PLAYBACK_STATE_KEY}:${playbackTokenPart(scope)}`;
+  const username = await lookupSessionUsername(env, scope);
+  const key = username
+    ? `${PLAYBACK_STATE_KEY}:u:${md5(username)}`
+    : `${PLAYBACK_STATE_KEY}:${playbackTokenPart(scope)}`;
+  if (username) {
+    MEMORY_PLAYBACK_KEYS.set(scope, { key, at: Date.now() });
+    if (MEMORY_PLAYBACK_KEYS.size > MAX_MEMORY_PLAYBACK_STATES) {
+      const oldestKey = MEMORY_PLAYBACK_KEYS.keys().next().value;
+      if (oldestKey !== undefined) {
+        MEMORY_PLAYBACK_KEYS.delete(oldestKey);
+      }
+    }
+  }
+  return key;
 }
 
-async function readPlaybackState(env, token) {
-  const key = await playbackStateKey(env, token);
+async function loadPlaybackStateByKey(env, key) {
   const memoryState = MEMORY_PLAYBACK_STATES.get(key);
   const kv = playbackKv(env);
   if (!kv) {
@@ -2519,8 +2548,13 @@ async function readPlaybackState(env, token) {
   return memoryState && typeof memoryState === "object" ? memoryState : {};
 }
 
-async function writePlaybackState(env, state, token) {
+async function readPlaybackState(env, token) {
   const key = await playbackStateKey(env, token);
+  const state = await loadPlaybackStateByKey(env, key);
+  return pruneStalePlaybackRecords(env, key, state);
+}
+
+async function writePlaybackStateByKey(env, key, state) {
   rememberPlaybackState(key, state || {});
   const kv = playbackKv(env);
   if (!kv) return;
@@ -2534,42 +2568,273 @@ async function writePlaybackState(env, state, token) {
   }
 }
 
-// 移除一条播放记录：删掉条目，并记下“刚被移除”的时间戳，
-// 抑制随后补发的旧进度上报把该条目又写回“继续观看”。
-function removedMarker(state, itemId) {
-  const raw = state && state.__removedAt && state.__removedAt[itemId];
+async function writePlaybackState(env, state, token) {
+  await writePlaybackStateByKey(env, await playbackStateKey(env, token), state);
+}
+
+// —— 移除播放记录用的“墓碑” ——
+// 墓碑和进度记录分成两个 key 存。旧做法是把“刚移除过”的时间戳塞在同一份
+// 进度数据里：客户端往往几个请求同时在跑（进度上报、刷新列表、收藏…），
+// 每个都是“整份读出 → 改一条 → 整份写回”，于是一份删除前的旧快照被迟到的
+// 写回盖回存储，刚移除的记录就又冒出来了（就是“移除后过一会又出现”的主因）。
+// 拆开后：覆盖只可能发生在进度记录上，墓碑始终还在，读取时能把脏数据剪掉。
+const PLAYBACK_TOMBSTONE_SUFFIX = ":removed-v2";
+const MAX_MEMORY_TOMBSTONE_STORES = 200;
+const MEMORY_PLAYBACK_TOMBSTONES = new Map();
+
+function playbackTombstoneKey(stateKey) {
+  return `${stateKey}${PLAYBACK_TOMBSTONE_SUFFIX}`;
+}
+
+function normalizeTombstone(raw) {
   if (!raw) return null;
-  if (typeof raw === "number") return { at: raw, positionTicks: 0, played: false };
-  if (typeof raw === "object") return {
-    at: Number(raw.at) || 0,
+  if (typeof raw === "number") {
+    return raw > 0 ? { at: raw, positionTicks: 0, played: false } : null;
+  }
+  if (typeof raw !== "object") return null;
+  const at = Number(raw.at) || 0;
+  if (!at) return null;
+  return {
+    at,
     positionTicks: Math.max(0, Number(raw.positionTicks) || 0),
     played: raw.played === true,
   };
-  return null;
 }
 
-function clearRemovedMarker(state, itemId) {
-  if (state && state.__removedAt) delete state.__removedAt[itemId];
-}
-
-function removePlaybackRecord(state, itemId) {
-  if (!state || !itemId) return false;
-  const old = state[itemId];
+function pruneTombstoneStore(store) {
+  const now = Date.now();
   let changed = false;
-  if (old) {
-    delete state[itemId];
+  for (const id of Object.keys(store || {})) {
+    const marker = normalizeTombstone(store[id]);
+    if (!marker || now - marker.at > PLAYBACK_TOMBSTONE_RETENTION_MS) {
+      delete store[id];
+      changed = true;
+      continue;
+    }
+    store[id] = marker;
+  }
+  const ids = Object.keys(store || {});
+  if (ids.length > PLAYBACK_MAX_TOMBSTONES) {
+    const byAge = ids.sort((a, b) => store[a].at - store[b].at);
+    for (const id of byAge.slice(0, byAge.length - PLAYBACK_MAX_TOMBSTONES)) {
+      delete store[id];
+    }
     changed = true;
   }
-  if (!state.__removedAt || typeof state.__removedAt !== "object") {
-    state.__removedAt = {};
+  return changed;
+}
+
+function rememberTombstones(key, store) {
+  try {
+    MEMORY_PLAYBACK_TOMBSTONES.set(key, { store: store || {}, at: Date.now() });
+    if (MEMORY_PLAYBACK_TOMBSTONES.size > MAX_MEMORY_TOMBSTONE_STORES) {
+      const oldestKey = MEMORY_PLAYBACK_TOMBSTONES.keys().next().value;
+      if (oldestKey !== undefined) {
+        MEMORY_PLAYBACK_TOMBSTONES.delete(oldestKey);
+      }
+    }
+  } catch {
+    // 内存兜底失败不能影响主流程
   }
-  state.__removedAt[itemId] = {
+}
+
+async function readTombstones(env, stateKey, opts = {}) {
+  const key = playbackTombstoneKey(stateKey);
+  const cached = MEMORY_PLAYBACK_TOMBSTONES.get(key);
+  const fallback = cached && cached.store && typeof cached.store === "object"
+    ? cached.store
+    : {};
+  const kv = playbackKv(env);
+  if (!kv) return fallback;
+  // 短时缓存：进度上报很频繁，不能每次都多读一次 KV。
+  // 即使因此晚几秒才拿到别的实例刚写的墓碑也没关系：脏记录的时间戳早于移除
+  // 时间，缓存过期后下一次读取仍会被剪掉。
+  if (!opts.fresh && cached && Date.now() - cached.at < PLAYBACK_TOMBSTONE_CACHE_MS) {
+    return cached.store && typeof cached.store === "object" ? cached.store : {};
+  }
+  try {
+    const value = await kv.get(key, "json");
+    const store = value && typeof value === "object" ? value : {};
+    pruneTombstoneStore(store);
+    rememberTombstones(key, store);
+    return store;
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Playback tombstones read failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+  return fallback;
+}
+
+async function writeTombstones(env, stateKey, store) {
+  const key = playbackTombstoneKey(stateKey);
+  pruneTombstoneStore(store);
+  rememberTombstones(key, store || {});
+  const kv = playbackKv(env);
+  if (!kv) return;
+  try {
+    await kv.put(key, JSON.stringify(store || {}));
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Playback tombstones write failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
+
+function recordTimestampMs(record) {
+  if (!record) return 0;
+  const raw = record.lastPlayedDate || record.lastActivityDate || "";
+  const value = Date.parse(String(raw));
+  return Number.isNaN(value) ? 0 : value;
+}
+
+// 脏写回把“已移除”的旧记录带回来时，在读取阶段按墓碑剪掉。
+// 判据是时间戳而不是“抑制期是否结束”：早于移除时刻的数据永远是旧数据。
+async function pruneStalePlaybackRecords(env, stateKey, state) {
+  if (!state || typeof state !== "object") return {};
+  let stateChanged = Boolean(state.__removedAt);
+  if (stateChanged) {
+    // 旧版本把抑制标记塞在同一份数据里，已废弃：顺手清掉（无需迁移）
+    delete state.__removedAt;
+  }
+  const store = await readTombstones(env, stateKey);
+  const ids = Object.keys(store);
+  if (!ids.length) {
+    if (stateChanged) await writePlaybackStateByKey(env, stateKey, state);
+    return state;
+  }
+  const clearedIds = [];
+  for (const itemId of ids) {
+    const marker = store[itemId];
+    const record = state[itemId];
+    if (!record || typeof record !== "object") continue;
+    if (!(Number(record.positionTicks) > 0 || Boolean(record.played))) {
+      // 只剩收藏等状态，跟“继续观看”无关，不动它
+      continue;
+    }
+    if (recordTimestampMs(record) > marker.at) {
+      // 比移除动作更晚：用户确实又播过了，墓碑作废
+      delete store[itemId];
+      clearedIds.push(itemId);
+      continue;
+    }
+    if (record.favorite === true) {
+      // 收藏过：保留收藏状态，只清掉被带回来的进度与已播标记
+      record.positionTicks = 0;
+      record.played = false;
+    } else {
+      delete state[itemId];
+    }
+    stateChanged = true;
+  }
+  if (clearedIds.length) {
+    // 作废墓碑前重新读一次最新表，别把别的实例刚立的其它墓碑一起覆盖掉
+    const latest = await readTombstones(env, stateKey, { fresh: true });
+    for (const id of clearedIds) delete latest[id];
+    await writeTombstones(env, stateKey, latest);
+  }
+  if (stateChanged) await writePlaybackStateByKey(env, stateKey, state);
+  return state;
+}
+
+// 从记录里删掉某条目（收藏状态单独保留：移除播放记录不该把收藏一起删掉）
+function dropPlaybackRecord(state, itemId) {
+  const old = state && state[itemId];
+  if (!old) return null;
+  delete state[itemId];
+  if (old.favorite === true) {
+    state[itemId] = {
+      itemId,
+      positionTicks: 0,
+      played: false,
+      playCount: Math.max(0, Math.floor(Number(old.playCount) || 0)),
+      lastPlayedDate: old.lastPlayedDate || "",
+      favorite: true,
+    };
+  }
+  return old;
+}
+
+// 移除一条播放记录：删条目 + 立墓碑（两者分开存，互相盖不掉）
+async function removePlaybackRecord(env, token, state, itemId) {
+  if (!state || !itemId) return false;
+  const old = dropPlaybackRecord(state, itemId);
+  const key = await playbackStateKey(env, token);
+  // 写入前强制读一次最新的墓碑表，避免把别的实例刚立的墓碑覆盖掉
+  const store = await readTombstones(env, key, { fresh: true });
+  store[itemId] = {
     at: Date.now(),
     positionTicks: Math.max(0, Number(old && old.positionTicks) || 0),
     played: Boolean(old && old.played),
   };
-  if (!old) changed = true;
-  return changed;
+  // 即使当时手上没有这条记录也要立墓碑：并发的旧快照可能正把它写回来。
+  await writeTombstones(env, key, store);
+  return Boolean(old);
+}
+
+// 统一的闸门：返回 true 表示这次写入属于“移除之后补发的残留”，应当忽略。
+async function playbackWriteSuppressed(env, token, itemId, opts = {}) {
+  if (!itemId) return false;
+  const key = await playbackStateKey(env, token);
+  const store = await readTombstones(env, key);
+  const marker = normalizeTombstone(store[itemId]);
+  if (!marker) return false;
+  const fresh = Date.now() - marker.at < PLAYBACK_DELETE_SUPPRESS_MS;
+  const positionTicks = Math.max(0, Number(opts.positionTicks) || 0);
+  // 进度明显超过被移除时所在的位置 = 真的又往前播了；“看完”上报同理
+  // （除非移除的那条本来就已播，那多半是补发）。
+  const advanced = positionTicks > marker.positionTicks + PLAYBACK_FINISH_TAIL_TICKS;
+  const finished = opts.playedToCompletion === true && !marker.played;
+  if (fresh && opts.restarted !== true && !advanced && !finished) {
+    return true;
+  }
+  // 作废墓碑前强制读一次最新表（这条路径很少走到），避免把别的实例刚立的
+  // 其它条目墓碑一起覆盖掉。
+  const latest = await readTombstones(env, key, { fresh: true });
+  if (latest[itemId]) {
+    delete latest[itemId];
+    await writeTombstones(env, key, latest);
+  }
+  return false;
+}
+
+// 客户端写用户数据时，参数可能在 body，也可能拼在 query string 上
+// （?Played=true 或 ?UserData.Played=true 这类写法），这里统一取值。
+function pickUserDataValue(body, params, names) {
+  const source = body && typeof body === "object" ? body : {};
+  const fromObject = (obj) => {
+    if (!obj || typeof obj !== "object") return undefined;
+    for (const name of names) {
+      if (obj[name] !== undefined) return obj[name];
+    }
+    return undefined;
+  };
+  const direct = fromObject(source);
+  if (direct !== undefined) return direct;
+  for (const wrapper of ["UserData", "UserItemDataDto", "userItemDataDto"]) {
+    const inner = fromObject(source[wrapper]);
+    if (inner !== undefined) return inner;
+  }
+  if (params && typeof params.get === "function") {
+    for (const name of names) {
+      const plain = params.get(name);
+      if (plain !== null && plain !== "") return plain;
+      for (const prefix of ["UserData.", "UserItemDataDto.", "userData."]) {
+        const prefixed = params.get(prefix + name);
+        if (prefixed !== null && prefixed !== "") return prefixed;
+      }
+    }
+  }
+  return undefined;
+}
+
+function isTruthyUserDataFlag(value) {
+  if (typeof value === "string") {
+    return /^(?:1|true|yes|on)$/i.test(value.trim());
+  }
+  return Boolean(value);
 }
 
 // 是否算“已看完”：显式已播，或进度已到总时长 90% 以上，
@@ -2828,21 +3093,18 @@ async function recordPlaybackEvent(path, request, env) {
       (positionTicks >= runTimeTicks * 0.9 ||
         runTimeTicks - positionTicks <= PLAYBACK_FINISH_TAIL_TICKS));
 
-  const state = await readPlaybackState(env, token);
-  const marker = removedMarker(state, itemId);
-  if (marker) {
-    const fresh = Date.now() - marker.at < PLAYBACK_DELETE_SUPPRESS_MS;
-    // 区分“刚移除后补发的旧进度”和“用户真的重新播放了”:
-    // 新的播放开始、进度明显超过被移除时的位置、或直接上报看完都算重新播放;
-    // 其余的旧上报在抑制期内忽略,避免记录“过一会又出现”。
-    const jumpedAhead = positionTicks > marker.positionTicks + PLAYBACK_FINISH_TAIL_TICKS;
-    const restarted = path === "/Sessions/Playing" || jumpedAhead || (!marker.played && playedToCompletion);
-    if (!fresh || restarted) {
-      clearRemovedMarker(state, itemId);
-    } else {
-      return;
-    }
+  // 区分“刚移除后补发的旧进度”和“用户真的重新播放了”：
+  // 不带 EventName 的 /Sessions/Playing 才是“开始播放”，暂停 / 继续 / 拖动进度
+  // 条都会带 EventName，旧逻辑把这些也当成重新播放，播放器还开着就会解除抑制。
+  const sessionEvent = String(body.EventName || body.eventName || "").trim();
+  if (await playbackWriteSuppressed(env, token, itemId, {
+    positionTicks,
+    playedToCompletion,
+    restarted: path === "/Sessions/Playing" && !sessionEvent,
+  })) {
+    return;
   }
+  const state = await readPlaybackState(env, token);
   const existing = state[itemId];
   const record = existing || {
     itemId,
@@ -3352,15 +3614,25 @@ async function applyItemUserDataAction(itemId, action, request, env, token) {
     action === "playeditems" || action === "unplayeditems" || action === "favoriteitems";
   if (method === "DELETE" && (action === "playingitems" || action === "userdata")) {
     // 结束播放 / 移除续播记录：整条删掉，条目立刻从“继续观看”消失；
-    // 同时记下“刚移除”时间戳，抑制客户端随后补发的旧进度把记录写回来。
-    if (removePlaybackRecord(state, itemId)) {
-      await writePlaybackState(env, state, token);
-    }
+    // 同时立墓碑（单独存储），抑制客户端随后补发的残留上报。
+    await removePlaybackRecord(env, token, state, itemId);
+    await writePlaybackState(env, state, token);
     return userDataForRecord(undefined);
+  }
+  if (action === "unplayeditems") {
+    // “标记未播放”等于把条目移出继续观看，按移除处理（同样立墓碑）。
+    await removePlaybackRecord(env, token, state, itemId);
+    await writePlaybackState(env, state, token);
+    return userDataForRecord(state[itemId]);
   }
   if (!existing && !isMarkAction) {
     // 本来就没有这条记录，就别凭空写一条（例如重复“结束播放”）。
     return userDataForRecord(existing);
+  }
+  if (action !== "favoriteitems" && await playbackWriteSuppressed(env, token, itemId, {
+    playedToCompletion: action === "playeditems" && method !== "DELETE",
+  })) {
+    return userDataForRecord(state[itemId]);
   }
   const record = existing || {
     itemId,
@@ -3380,10 +3652,6 @@ async function applyItemUserDataAction(itemId, action, request, env, token) {
       record.playCount = Math.max(0, Math.floor(Number(record.playCount) || 0)) + 1;
       record.lastPlayedDate = new Date().toISOString();
     }
-  } else if (action === "unplayeditems") {
-    // “标记未播放”同样会把条目移出继续观看，顺手清掉进度。
-    record.played = false;
-    record.positionTicks = 0;
   } else if (action === "favoriteitems") {
     record.favorite = method !== "DELETE";
   } else {
@@ -3753,9 +4021,8 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     const userDataItemId = decodeURIComponent(userDataMatch[1]);
     const userDataState = await readPlaybackState(env, token);
     if (request.method === "DELETE") {
-      if (removePlaybackRecord(userDataState, userDataItemId)) {
-        await writePlaybackState(env, userDataState, token);
-      }
+      await removePlaybackRecord(env, token, userDataState, userDataItemId);
+      await writePlaybackState(env, userDataState, token);
       return noContentResponse();
     }
     if (request.method === "POST" || request.method === "PUT") {
@@ -3765,6 +4032,33 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
       } catch {
         body = {};
       }
+      // 有的客户端把这些参数拼在 query string 上而不是放 body
+      const playedParam = pickUserDataValue(body, url.searchParams, ["Played", "played"]);
+      const positionParam = pickUserDataValue(body, url.searchParams, [
+        "PlaybackPositionTicks",
+        "playbackPositionTicks",
+        "PositionTicks",
+        "positionTicks",
+      ]);
+      const playCountParam = pickUserDataValue(body, url.searchParams, ["PlayCount", "playCount"]);
+      const favoriteParam = pickUserDataValue(body, url.searchParams, [
+        "IsFavorite",
+        "isFavorite",
+        "Favorite",
+      ]);
+      const incomingPosition = Math.max(0, Number(positionParam) || 0);
+      const incomingPlayed = playedParam === undefined
+        ? undefined
+        : isTruthyUserDataFlag(playedParam);
+      if (incomingPosition > 0 || incomingPlayed === true) {
+        // 客户端退出后常会补发一次“最后的进度”，刚移除过的条目不能被它复活
+        if (await playbackWriteSuppressed(env, token, userDataItemId, {
+          positionTicks: incomingPosition,
+          playedToCompletion: incomingPlayed === true,
+        })) {
+          return noContentResponse();
+        }
+      }
       const record = userDataState[userDataItemId] || {
         itemId: userDataItemId,
         positionTicks: 0,
@@ -3772,23 +4066,28 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
         playCount: 0,
         lastPlayedDate: "",
       };
-      if (body.Played !== undefined) {
-        record.played = Boolean(body.Played);
+      record.itemId = userDataItemId;
+      if (incomingPlayed !== undefined) {
+        record.played = incomingPlayed;
         if (record.played) {
           record.positionTicks = 0;
           if (record.playCount <= 0) {
             record.playCount = 1;
           }
+          record.lastPlayedDate = new Date().toISOString();
         }
       }
-      if (body.PlaybackPositionTicks !== undefined) {
-        record.positionTicks = Math.max(0, Number(body.PlaybackPositionTicks) || 0);
+      if (positionParam !== undefined) {
+        record.positionTicks = incomingPosition;
+        if (incomingPosition > 0) {
+          record.lastPlayedDate = new Date().toISOString();
+        }
       }
-      if (body.PlayCount !== undefined) {
-        record.playCount = Math.max(0, Math.floor(Number(body.PlayCount) || 0));
+      if (playCountParam !== undefined) {
+        record.playCount = Math.max(0, Math.floor(Number(playCountParam) || 0));
       }
-      if (body.IsFavorite !== undefined) {
-        record.favorite = Boolean(body.IsFavorite);
+      if (favoriteParam !== undefined) {
+        record.favorite = isTruthyUserDataFlag(favoriteParam);
       }
       record.lastPlayedDate = record.lastPlayedDate || new Date().toISOString();
       userDataState[userDataItemId] = record;
@@ -3825,6 +4124,10 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   if (playedItemsMatch && (request.method === "POST" || request.method === "PUT")) {
     const playedItemId = decodeURIComponent(playedItemsMatch[1]);
     const playedState = await readPlaybackState(env, token);
+    if (await playbackWriteSuppressed(env, token, playedItemId, { playedToCompletion: true })) {
+      // 刚移除过：客户端补发的“已播放”不写回，直接回当前状态
+      return jsonResponse(userDataForRecord(playedState[playedItemId]));
+    }
     const playedRecord = playedState[playedItemId] || {
       itemId: playedItemId,
       positionTicks: 0,
@@ -3848,29 +4151,19 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   if (playedItemsMatch && request.method === "DELETE") {
     const removedPlayedId = decodeURIComponent(playedItemsMatch[1]);
     const removedPlayedState = await readPlaybackState(env, token);
-    if (removePlaybackRecord(removedPlayedState, removedPlayedId)) {
-      await writePlaybackState(env, removedPlayedState, token);
-    }
+    await removePlaybackRecord(env, token, removedPlayedState, removedPlayedId);
+    await writePlaybackState(env, removedPlayedState, token);
     return jsonResponse(userDataForRecord(removedPlayedState[removedPlayedId]));
   }
   const unplayedItemsMatch = path.match(/^\/Users\/[^/]+\/UnplayedItems\/([^/]+)$/i);
   if (unplayedItemsMatch && (request.method === "POST" || request.method === "DELETE")) {
     const unplayedItemId = decodeURIComponent(unplayedItemsMatch[1]);
     const unplayedState = await readPlaybackState(env, token);
-    const unplayedRecord = unplayedState[unplayedItemId] || {
-      itemId: unplayedItemId,
-      positionTicks: 0,
-      played: false,
-      playCount: 0,
-      lastPlayedDate: "",
-    };
-    unplayedRecord.itemId = unplayedItemId;
-    unplayedRecord.played = false;
-    // 标记未播放时一并清掉进度，否则条目仍会留在“继续观看”里。
-    unplayedRecord.positionTicks = 0;
-    unplayedState[unplayedItemId] = unplayedRecord;
+    // “标记未播放”就是把条目移出继续观看：删记录 + 立墓碑，
+    // 否则客户端紧接着补发的旧进度会把它又写回来。
+    await removePlaybackRecord(env, token, unplayedState, unplayedItemId);
     await writePlaybackState(env, unplayedState, token);
-    return jsonResponse(userDataForRecord(unplayedRecord));
+    return jsonResponse(userDataForRecord(unplayedState[unplayedItemId]));
   }
   const playingItemsMatch = path.match(/^\/Users\/[^/]+\/PlayingItems\/([^/]+)$/i);
   if (playingItemsMatch && (request.method === "POST" || request.method === "PUT")) {
@@ -3882,9 +4175,20 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
     }
     const playingItemId = decodeURIComponent(playingItemsMatch[1]);
     const playingPosition = Math.max(0, Number(
-      playingBody.PositionTicks ?? playingBody.positionTicks ?? 0,
+      pickUserDataValue(playingBody, url.searchParams, [
+        "PositionTicks",
+        "positionTicks",
+        "PlaybackPositionTicks",
+        "playbackPositionTicks",
+      ]) ?? 0,
     ) || 0);
     if (playingPosition > 0) {
+      // 这条接口就是“上报续播位置”，是记录复活最常见的来源之一
+      if (await playbackWriteSuppressed(env, token, playingItemId, {
+        positionTicks: playingPosition,
+      })) {
+        return noContentResponse();
+      }
       const playingState = await readPlaybackState(env, token);
       const playingRecord = playingState[playingItemId] || {
         itemId: playingItemId,
@@ -3905,9 +4209,8 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch) {
   if (playingItemsMatch && request.method === "DELETE") {
     const stoppedItemId = decodeURIComponent(playingItemsMatch[1]);
     const stoppedState = await readPlaybackState(env, token);
-    if (removePlaybackRecord(stoppedState, stoppedItemId)) {
-      await writePlaybackState(env, stoppedState, token);
-    }
+    await removePlaybackRecord(env, token, stoppedState, stoppedItemId);
+    await writePlaybackState(env, stoppedState, token);
     return noContentResponse();
   }
   // 收藏 / 取消收藏：POST 与 DELETE /Users/{uid}/FavoriteItems/{id}
