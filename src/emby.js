@@ -317,6 +317,16 @@ function sourceVariants(payload) {
   return sourceUrlValue(data) ? [data] : [];
 }
 
+function videoVariantLabel(source, index, total) {
+  const label = String(source?.label || "").trim();
+  if (label) return label;
+  const variant = String(source?.variant || "").trim();
+  if (variant === "original") return "原版";
+  if (/reduc|mosaic|compress|small/i.test(variant)) return "压缩版";
+  if (variant) return variant;
+  return `线路 ${index + 1}`;
+}
+
 function safeMediaContentType(value) {
   const type = String(value || "").toLowerCase();
   return /^(?:video\/[a-z0-9.+-]+|application\/(?:vnd\.apple\.|x-)?mpegurl)$/.test(type)
@@ -1305,16 +1315,9 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     });
   }
   const seriesName = String(movie.series_name || "").trim();
-  if (seriesName) {
-    item.SeriesName = seriesName;
-    item.SeriesId = seriesIdForName(seriesName);
-    const seriesStudio = item.Studios && item.Studios[0];
-    if (seriesStudio) {
-      item.SeriesStudio = seriesStudio.Name;
-    }
-  } else if (movie.series_id) {
-    item.SeriesId = String(movie.series_id);
-  }
+  // 不再写 SeriesName / SeriesId：Emby 客户端详情页会优先用 SeriesName 当大标题，
+  // 于是出现“标题只剩系列名”（例如 GVH-385 只显示系列名）的情况。
+  // 片名统一走 Name，系列仍放在下面的“类别 / 标签”里，点击照样能按系列名搜到可播放作品。
   // 系列也放进“类别 / 标签”：详情页标签栏里能直接看到系列名，
   // 点了按系列名回源搜索（搜索结果同样只会是可播放作品）。
   if (seriesName && !uniqueTags.includes(seriesName)) {
@@ -1948,10 +1951,16 @@ async function resolveVideo(movie, env, fetchImpl) {
   if (!variant) {
     return null;
   }
+  const orderedVariants = [variant, ...variants.filter((item) => item !== variant)];
+  if (orderedVariants.length > 1) {
+    orderedVariants.forEach((item, index) => {
+      item.sourceName = videoVariantLabel(item, index, orderedVariants.length);
+    });
+  }
 
   return {
     ...variant,
-    alternates: variants.filter((item) => item !== variant),
+    alternates: orderedVariants.slice(1),
   };
 }
 
@@ -2191,7 +2200,7 @@ async function cachedSubtitleBody(subtitle, env, fetchImpl) {
   return result;
 }
 
-function mediaSource(item, requestUrl, token, video, subtitles = []) {
+function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = item.Id) {
   const isHls = /mpegurl|m3u8/i.test(video.sourceType || video.sourceUrl);
   // ===== 媒体信息 STRM 化（旧逻辑以注释保留，便于恢复）=====
   // 旧版：容器提示是 HLS / M3U8，客户端媒体信息里会显示 “HLS / M3U8”：
@@ -2201,6 +2210,7 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
   const container = "strm";
   // 实际播放/下载地址的后缀仍用 .m3u8 / .mp4，保持真实文件类型。
   const streamExtension = isHls ? "m3u8" : "mp4";
+  const mediaSourceId = String(sourceId || item.Id);
   const height = Number(video.quality || 0);
   const width = height > 0 ? Math.round((height * 16) / 9 / 2) * 2 : undefined;
   const buildStreamUrl = (extension) => {
@@ -2213,7 +2223,7 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
     );
     url.searchParams.set("api_key", token);
     url.searchParams.set("static", "true");
-    url.searchParams.set("mediaSourceId", item.Id);
+    url.searchParams.set("mediaSourceId", mediaSourceId);
     if (video.sourceUrl) {
       url.searchParams.set("source", video.sourceUrl);
       url.searchParams.set("sourceType", video.sourceType || "video/mp4");
@@ -2256,8 +2266,8 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
     };
   });
   return {
-    Id: item.Id,
-    Name: video.title,
+    Id: mediaSourceId,
+    Name: String(video.sourceName || video.title || item.Name || "").trim() || item.Name || "",
     Path: displayUrl.toString(),
     DirectStreamUrl: `${streamUrl.pathname}${streamUrl.search}`,
     Protocol: "Http",
@@ -2322,6 +2332,72 @@ function mediaSource(item, requestUrl, token, video, subtitles = []) {
       ...subtitleStreams,
     ],
   };
+}
+
+function playbackVariants(video) {
+  const list = [];
+  if (video && typeof video === "object") {
+    list.push(video);
+  }
+  if (Array.isArray(video?.alternates)) {
+    list.push(...video.alternates);
+  }
+  const seen = new Set();
+  return list.filter((variant) => {
+    if (!variant || typeof variant !== "object") return false;
+    const sourceKey = String(variant.sourceUrl || variant.inlinePlaylist || "");
+    const key = [sourceKey, variant.variant || "", variant.sourceType || ""].join("|");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function mediaSourceIdForIndex(itemId, index) {
+  const base = String(itemId || "");
+  return index <= 0 ? base : base + "-" + String(index + 1);
+}
+
+function mediaSourceVariantIndex(itemId, mediaSourceId) {
+  const base = String(itemId || "");
+  const value = String(mediaSourceId || "").trim();
+  if (!value || value === base) return 0;
+  const prefix = base + "-";
+  if (!value.startsWith(prefix)) return -1;
+  const number = Number(value.slice(prefix.length));
+  return Number.isInteger(number) && number > 1 ? number - 1 : -1;
+}
+
+function selectedPlaybackVideo(video, itemId, requestUrl) {
+  const variants = playbackVariants(video);
+  if (variants.length <= 1) return video;
+  const requestedIndex = mediaSourceVariantIndex(
+    itemId,
+    requestUrl.searchParams.get("mediaSourceId"),
+  );
+  if (requestedIndex <= 0 || requestedIndex >= variants.length) return video;
+  const selected = variants[requestedIndex];
+  return {
+    ...selected,
+    alternates: variants.filter((item, index) => index !== requestedIndex),
+  };
+}
+
+function mediaSourcesForVideo(item, requestUrl, token, video, subtitles = []) {
+  const variants = playbackVariants(video);
+  return variants.map((variant, index) =>
+    mediaSource(
+      item,
+      requestUrl,
+      token,
+      {
+        ...variant,
+        sourceName: variant.sourceName ||
+          (variants.length > 1 ? videoVariantLabel(variant, index, variants.length) : ""),
+      },
+      subtitles,
+      mediaSourceIdForIndex(item.Id, index),
+    ));
 }
 
 function authenticationResponse(request, env, user, token) {
@@ -2512,9 +2588,10 @@ function virtualFolder(library) {
   };
 }
 
-// 详情页内“顺带解析播放源”的预算时间：超过就先返回元数据（播放时再完整解析），
-// 让第一次点开影片时更快看到详情页，而不是一直转圈等解析。
-const ITEM_DETAIL_RESOLVE_BUDGET_MS = 1200;
+// 详情页“顺带解析播放源”的预算：超过就先返回元数据（真正播放时再完整解析）。
+// 这份预算只约束播放源解析本身——字幕不再计入（见 itemResponse），
+// 否则字幕稍慢就会把已经解析好的播放源一起丢掉，客户端详情页只能看到一条占位源。
+const ITEM_DETAIL_RESOLVE_BUDGET_MS = 3000;
 // 起播(/PlaybackInfo)时客户端马上就要播放,字幕流必须跟着这次响应一起下发,
 // 否则会出现“视频已经播了、字幕还在加载”。这里比详情页多给一点时间。
 const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 3500;
@@ -2530,6 +2607,12 @@ function prewarmResolve(movie, env, fetchImpl, ctx = null) {
   ]);
   // Worker 响应返回后后台任务可能被直接杀掉:有 ctx.waitUntil 就登记上,
   // 让预解析真正跑完,下次点播放时字幕能直接命中缓存。
+  keepAlive(task, ctx);
+}
+
+// 把后台任务登记到响应生命周期上:Worker 返回响应后可能被立刻回收,
+// 只有 ctx.waitUntil 才能真正跑完并写进缓存。
+function keepAlive(task, ctx) {
   try {
     if (ctx && typeof ctx.waitUntil === "function") {
       ctx.waitUntil(task);
@@ -2568,6 +2651,25 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
+// 带“已完成状态”的包装:整体超时时可以取回已经解析完的那部分结果,
+// 而不是把已经拿到的播放源一起丢掉。
+function trackResolution(promise) {
+  const record = { done: false, value: undefined };
+  const tracked = promise.then(
+    (value) => {
+      record.done = true;
+      record.value = value;
+      return value;
+    },
+    () => {
+      record.done = true;
+      record.value = undefined;
+      return undefined;
+    },
+  );
+  return { tracked, record };
+}
+
 async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   // 演员条目：Id 为 person:<演员名> 时直接返回 Person 对象，不当作影片回源。
   const personNameFromId = personNameFromItemId(id);
@@ -2585,18 +2687,20 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   // 详情页不应被“解析播放源/字幕”这类慢请求拖住：解析服务首次冷启动时
   // 会明显变慢（第二次通常命中缓存才快），旧逻辑在返回详情前一直等它，
   // 导致第一次点开影片详情时客户端长时间转圈。
-  // 这里只给一小段预算时间，能在预算内解析完成（通常是缓存命中）就顺带
-  // 返回 MediaSources；超时/失败就立刻先返回影片元数据，等用户真正点播放时
-  // 由 /PlaybackInfo 再做完整解析。
+  // 现在给播放源一份单独预算（超时先返回元数据，等点播放时由 /PlaybackInfo
+  // 完整解析），字幕完全不参与这份预算。
   let video = null;
   let subtitles = [];
   let resolutionFinished = false;
+  // 播放源与字幕彻底分开：
+  // 旧写法把两者塞进同一个 Promise.all 再整体超时，字幕稍慢（冷启动约 1.5s）
+  // 就会连已经解析好的播放源一起丢掉，只回退成 1 条占位源，
+  // 客户端详情页因此只显示一个播放源。
+  // 现在播放源单独用一份预算（能拿全所有播放源）；字幕永不阻塞详情页——
+  // 先读缓存，没命中就后台预热，真正起播时由 /PlaybackInfo 随流下发。
   try {
-    [video, subtitles] = await withTimeout(
-      Promise.all([
-        resolveVideoCached(movie, env, fetchImpl),
-        resolveSubtitlesCached(movie, env, fetchImpl).catch(() => []),
-      ]),
+    video = await withTimeout(
+      resolveVideoCached(movie, env, fetchImpl),
       ITEM_DETAIL_RESOLVE_BUDGET_MS,
     );
     resolutionFinished = true;
@@ -2604,10 +2708,16 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     video = null;
     // 预算内没解析完:放进后台继续解析(内部会合并重复请求并写进缓存),
     // 用户真正点播放时 /PlaybackInfo 就能直接命中,不用再从冷启动等一次。
-    // 同时看一眼字幕缓存:已经预解析过的就直接带上,不再白等。
-    subtitles = await peekCachedSubtitles(movie, env);
     prewarmResolve(movie, env, fetchImpl, ctx);
   }
+  // 字幕只取缓存:已经预解析过的就直接带上,不再白等。
+  subtitles = await peekCachedSubtitles(movie, env);
+  if (resolutionFinished && !subtitles.length) {
+    // 播放源已在预算内返回:后台把字幕也解析好缓存起来,不占用本次响应时间。
+    keepAlive(resolveSubtitlesCached(movie, env, fetchImpl).catch(() => []), ctx);
+  }
+
+  const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
 
   if (!video) {
     if (resolutionFinished) {
@@ -2622,32 +2732,34 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     // 解析超时/未在预算内完成：仍返回一条占位媒体源，保证客户端显示“播放”按钮。
     // 该占位地址只是入口，真正播放时会由 /PlaybackInfo 与 /Videos/{id}/stream
     // 重新完整解析出真实播放地址，因此不影响实际播放。
-    const placeholder = mediaSource(
+    const placeholders = mediaSourcesForVideo(
       item,
       request.url,
-      token || (guestAccessEnabled(env) ? guestToken(env) : ""),
+      playbackToken,
       { title: item.Name, sourceType: "video/mp4" },
       subtitles,
     );
+    const placeholder = placeholders[0];
     item.Path = placeholder.Path;
-    item.MediaSources = [placeholder];
+    item.MediaSources = placeholders;
     item.MediaStreams = placeholder.MediaStreams;
-    item.MediaSourceCount = 1;
+    item.MediaSourceCount = placeholders.length;
     item.Container = placeholder.Container;
     item.HasSubtitles = subtitles.length > 0;
     return jsonResponse(item);
   }
-  const source = mediaSource(
+  const mediaSources = mediaSourcesForVideo(
     item,
     request.url,
-    token || (guestAccessEnabled(env) ? guestToken(env) : ""),
+    playbackToken,
     video,
     subtitles,
   );
+  const source = mediaSources[0];
   item.Path = source.Path;
-  item.MediaSources = [source];
+  item.MediaSources = mediaSources;
   item.MediaStreams = source.MediaStreams;
-  item.MediaSourceCount = 1;
+  item.MediaSourceCount = mediaSources.length;
   item.Container = source.Container;
   item.HasSubtitles = subtitles.length > 0;
   return jsonResponse(item);
@@ -2716,6 +2828,74 @@ const MAX_MEMORY_PLAYBACK_STATES = 500;
 function playbackKv(env) {
   const kv = env && env.PLAYBACK_KV;
   return kv && typeof kv.get === "function" && typeof kv.put === "function" ? kv : null;
+}
+
+// —— 零配置持久化兜底 ——
+// 不少部署是把这份代码直接粘进 Cloudflare，并没有在设置里绑定 PLAYBACK_KV。
+// 那种情况下播放记录只能留在某个 Worker 实例的内存里：实例一被回收，
+// “移除播放记录”就等于没做——刷新后条目又被迟到的旧上报带回来。
+// Workers 自带的 Cache API（caches.default）不需要任何绑定，同一机房里的实例共享，
+// 所以拿它当 KV 缺席时的备用存储，删除才真的留得住。
+// 存进边缘缓存的两类数据：
+//   playback  —— 播放进度 / 已播 / 收藏等播放状态；
+//   tombstone —— “已移除”墓碑（比状态更关键：它负责挡住迟到的脏写回）。
+const EDGE_NAMESPACE_PLAYBACK = "playback";
+const EDGE_NAMESPACE_TOMBSTONE = "tombstone";
+const PLAYBACK_CACHE_TTL_S = 30 * 24 * 60 * 60;
+
+// 统一入口：优先 KV（绑定了就跨机房长期保存），没绑定时退到边缘缓存。
+async function durableJsonRead(env, namespace, key) {
+  const kv = playbackKv(env);
+  if (kv) {
+    try {
+      const value = await kv.get(key, "json");
+      if (value !== null && value !== undefined) {
+        return value;
+      }
+      // KV 明确回答“没有”：不再往下看边缘缓存，免得拿到迁移前的过期副本。
+      return null;
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "Playback store read failed",
+        error: error instanceof Error ? error.message : String(error),
+      }));
+      // 读失败：调用方保留内存里的旧副本。
+      return undefined;
+    }
+  }
+  // 没有 KV 绑定：退到 Workers 自带的 Cache API（同样不需要任何配置）。
+  const store = edgeCacheStore();
+  const cacheKey = store ? edgeCacheRequest(namespace, key) : null;
+  if (!store || !cacheKey) {
+    // 连 Cache API 都没有（例如本机 Node 环境）：交回调用方走内存兜底。
+    return undefined;
+  }
+  try {
+    const hit = await store.match(cacheKey);
+    if (!hit) {
+      return null;
+    }
+    const value = await hit.json();
+    return value === undefined ? null : value;
+  } catch {
+    return undefined;
+  }
+}
+
+async function durableJsonWrite(env, namespace, key, value) {
+  const kv = playbackKv(env);
+  if (kv) {
+    try {
+      await kv.put(key, JSON.stringify(value));
+      return;
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "Playback store write failed",
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+  await edgeCacheWrite(namespace, key, value, PLAYBACK_CACHE_TTL_S);
 }
 
 const MEMORY_PLAYBACK_STATES = new Map();
@@ -2869,21 +3049,10 @@ async function playbackStateKey(env, token) {
 
 async function loadPlaybackStateByKey(env, key) {
   const memoryState = MEMORY_PLAYBACK_STATES.get(key);
-  const kv = playbackKv(env);
-  if (!kv) {
-    return memoryState && typeof memoryState === "object" ? memoryState : {};
-  }
-  try {
-    const value = await kv.get(key, "json");
-    if (value && typeof value === "object") {
-      rememberPlaybackState(key, value);
-      return value;
-    }
-  } catch (error) {
-    console.error(JSON.stringify({
-      message: "Playback state read failed",
-      error: error instanceof Error ? error.message : String(error),
-    }));
+  const value = await durableJsonRead(env, EDGE_NAMESPACE_PLAYBACK, key);
+  if (value && typeof value === "object") {
+    rememberPlaybackState(key, value);
+    return value;
   }
   return memoryState && typeof memoryState === "object" ? memoryState : {};
 }
@@ -2906,16 +3075,7 @@ async function writePlaybackStateByKey(env, key, state) {
     await writeTombstones(env, key, store);
   }
   rememberPlaybackState(key, next);
-  const kv = playbackKv(env);
-  if (!kv) return;
-  try {
-    await kv.put(key, JSON.stringify(next));
-  } catch (error) {
-    console.error(JSON.stringify({
-      message: "Playback state write failed",
-      error: error instanceof Error ? error.message : String(error),
-    }));
-  }
+  await durableJsonWrite(env, EDGE_NAMESPACE_PLAYBACK, key, next);
 }
 
 async function writePlaybackState(env, state, token) {
@@ -3030,43 +3190,29 @@ async function readTombstones(env, stateKey, opts = {}) {
   const fallback = cached && cached.store && typeof cached.store === "object"
     ? cached.store
     : {};
-  const kv = playbackKv(env);
-  if (!kv) return fallback;
-  // 短时缓存：进度上报很频繁，不能每次都多读一次 KV。
+  // 短时缓存：进度上报很频繁，不能每次都多读一次持久化存储。
   // 即使因此晚几秒才拿到别的实例刚写的墓碑也没关系：脏记录的时间戳早于移除
   // 时间，缓存过期后下一次读取仍会被剪掉。
   if (!opts.fresh && cached && Date.now() - cached.at < PLAYBACK_TOMBSTONE_CACHE_MS) {
     return cached.store && typeof cached.store === "object" ? cached.store : {};
   }
-  try {
-    const value = await kv.get(key, "json");
-    const store = value && typeof value === "object" ? value : {};
-    pruneTombstoneStore(store);
-    rememberTombstones(key, store);
-    return store;
-  } catch (error) {
-    console.error(JSON.stringify({
-      message: "Playback tombstones read failed",
-      error: error instanceof Error ? error.message : String(error),
-    }));
+  const value = await durableJsonRead(env, EDGE_NAMESPACE_TOMBSTONE, key);
+  if (value === undefined) {
+    // 读取失败：沿用上一次的表，绝不把它当成“墓碑全没了”。
+    return fallback;
   }
-  return fallback;
+  const store = value && typeof value === "object" ? value : {};
+  pruneTombstoneStore(store);
+  // 即使读到的是空表也要记进内存缓存（短时），保持原有的“同实例 5 秒”语义。
+  rememberTombstones(key, store);
+  return store;
 }
 
 async function writeTombstones(env, stateKey, store) {
   const key = playbackTombstoneKey(stateKey);
   pruneTombstoneStore(store);
   rememberTombstones(key, store || {});
-  const kv = playbackKv(env);
-  if (!kv) return;
-  try {
-    await kv.put(key, JSON.stringify(store || {}));
-  } catch (error) {
-    console.error(JSON.stringify({
-      message: "Playback tombstones write failed",
-      error: error instanceof Error ? error.message : String(error),
-    }));
-  }
+  await durableJsonWrite(env, EDGE_NAMESPACE_TOMBSTONE, key, store || {});
 }
 
 function recordTimestampMs(record) {
@@ -3821,7 +3967,7 @@ async function streamResponse(id, request, env, fetchImpl, token) {
 
     const movieForStream = await getMovieCached(id, env, fetchImpl, token);
     const resolvedVideo = await resolveVideoCached(movieForStream, env, fetchImpl);
-    const response = await tryVideo(resolvedVideo);
+    const response = await tryVideo(selectedPlaybackVideo(resolvedVideo, id, requestUrl));
     if (response) {
       return response;
     }
@@ -3831,7 +3977,7 @@ async function streamResponse(id, request, env, fetchImpl, token) {
       forgetResolveVideoCache(movieForStream, env);
       triedSources.clear();
       const retriedVideo = await resolveVideoCached(movieForStream, env, fetchImpl);
-      const retriedResponse = await tryVideo(retriedVideo);
+      const retriedResponse = await tryVideo(selectedPlaybackVideo(retriedVideo, id, requestUrl));
       if (retriedResponse) {
         return retriedResponse;
       }
@@ -4800,36 +4946,44 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
       const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
       // 与详情页一致：给解析一小段预算时间，超时就先返回占位媒体源，让客户端马上能起播
       // （真正播放时由 /Videos/{id}/stream 再做完整解析；后台解析完成后会写进缓存）。
-      let video = null;
-      let subtitles = [];
-      let resolutionFinished = false;
+      const videoResolution = trackResolution(resolveVideoCached(movie, env, fetchImpl));
+      const subtitleResolution = trackResolution(
+        resolveSubtitlesCached(movie, env, fetchImpl).catch(() => []),
+      );
+      // 播放源与字幕一起给预算，但超时时分别取回“已经完成”的那部分：
+      // 慢字幕不能再把已经解析好的播放源一起丢掉。
       try {
-        [video, subtitles] = await withTimeout(
-          Promise.all([
-            resolveVideoCached(movie, env, fetchImpl),
-            resolveSubtitlesCached(movie, env, fetchImpl).catch(() => []),
-          ]),
+        await withTimeout(
+          Promise.all([videoResolution.tracked, subtitleResolution.tracked]),
           PLAYBACK_INFO_RESOLVE_BUDGET_MS,
         );
-        resolutionFinished = true;
       } catch {
-        video = null;
-        // 超时也不能让字幕白等:先带上已经缓存好的字幕流,同时后台继续解析。
-        subtitles = await peekCachedSubtitles(movie, env);
+        // 忽略:超时后下面按各自的实际完成情况取值。
+      }
+      const video = videoResolution.record.done ? videoResolution.record.value : null;
+      const resolutionFinished = videoResolution.record.done;
+      const subtitles = subtitleResolution.record.done
+        ? subtitleResolution.record.value || []
+        : await peekCachedSubtitles(movie, env);
+      if (!resolutionFinished) {
+        // 播放源没赶上预算:后台继续解析,下次起播直接命中缓存。
         prewarmResolve(movie, env, fetchImpl, ctx);
+      } else if (!subtitleResolution.record.done) {
+        // 播放源已经拿到:让字幕在后台继续解析完并写进缓存。
+        keepAlive(subtitleResolution.tracked, ctx);
       }
 
       const mediaSources = video
-        ? [mediaSource(item, request.url, playbackToken, video, subtitles)]
+        ? mediaSourcesForVideo(item, request.url, playbackToken, video, subtitles)
         : resolutionFinished
           ? []
-          : [mediaSource(
+          : mediaSourcesForVideo(
             item,
             request.url,
             playbackToken,
             { title: item.Name, sourceType: "video/mp4" },
             subtitles,
-          )];
+          );
 
       const playSessionId = crypto.randomUUID();
       // 记住这次播放用的会话号:之后“移除播放记录”才能认出哪些上报是残留。
