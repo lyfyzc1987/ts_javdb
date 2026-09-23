@@ -53,6 +53,7 @@ const MEDIA_HOSTS = new Set([
   "jdforrepam.com",
   "tp.spfcas.com",
   "h1.gzankun.com",
+  "static.worldstatic.com",
 ]);
 const MEDIA_SUFFIXES = [".spfcas.com", ".gzankun.com"];
 const INLINE_HLS_CONTENT_TYPES = new Set([
@@ -64,7 +65,7 @@ const INLINE_HLS_CONTENT_TYPES = new Set([
 // 旧上限会把稍大的备用线路直接过滤掉，客户端就只剩一条播放源。
 const MAX_INLINE_HLS_LENGTH = 12_000_000;
 // 修改播放源结构后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v3";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v4";
 const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
 const HOME_MAX_SOURCE_PAGES = 40;
@@ -1945,6 +1946,7 @@ async function resolveVideo(movie, env, fetchImpl) {
           : item.sourceType || item.source_type || item.mimeType ||
             item.mime_type || "video/mp4",
         inlinePlaylist,
+        label: String(item.label || item.displayName || "").trim(),
         variant: item.variant || item.name || item.id,
         title: movieDisplayName(movie) || code,
         quality: Number(item.quality || item.height || 0),
@@ -2570,10 +2572,10 @@ function virtualFolder(library) {
 // 详情页“顺带解析播放源”的预算：超过就先返回元数据（真正播放时再完整解析）。
 // 这份预算只约束播放源解析本身——字幕不再计入（见 itemResponse），
 // 否则字幕稍慢就会把已经解析好的播放源一起丢掉，客户端详情页只能看到一条占位源。
-const ITEM_DETAIL_RESOLVE_BUDGET_MS = 3000;
+const ITEM_DETAIL_RESOLVE_BUDGET_MS = 6000;
 // 起播(/PlaybackInfo)时客户端马上就要播放,字幕流必须跟着这次响应一起下发,
 // 否则会出现“视频已经播了、字幕还在加载”。这里比详情页多给一点时间。
-const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 3500;
+const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 8000;
 
 // 后台预热:不阻塞当前响应,把播放源与字幕列表解析完写进缓存,
 // 下次(真正点播放时)直接命中,起播和字幕出现都更快。
@@ -3048,11 +3050,7 @@ async function writePlaybackStateByKey(env, key, state) {
   // 条目被旧快照写回存储（这是“移除后过一会又出现”的最后一道防线，也是跨实例
   // 并发时唯一能兜住的检查）。这里强制读最新的墓碑表，不做缓存复用。
   const store = await readTombstones(env, key, { fresh: true });
-  const filtered = filterStateByTombstones(next, store);
-  if (filtered.cleared.length) {
-    // 用户真的重新播放了（新会话 / 重新开始）：作废对应的墓碑
-    await writeTombstones(env, key, store);
-  }
+  filterStateByTombstones(next, store);
   rememberPlaybackState(key, next);
   await durableJsonWrite(env, EDGE_NAMESPACE_PLAYBACK, key, next);
 }
@@ -3123,6 +3121,8 @@ function normalizeTombstone(raw) {
     positionTicks: Math.max(0, Number(raw.positionTicks) || 0),
     played: raw.played === true,
     playSessionId: String(raw.playSessionId || ""),
+    pendingPlaySessionId: String(raw.pendingPlaySessionId || ""),
+    pendingAt: Math.max(0, Number(raw.pendingAt) || 0),
   };
 }
 
@@ -3215,9 +3215,10 @@ function suppressPlaybackRecord(state, itemId, record) {
 
 // 按墓碑过滤一份播放记录。纯内存操作：不读写 KV，也不调用 writePlaybackStateByKey，
 // 所以“读阶段”和“写阶段”可以共用同一套判据而不会互相递归。
-// 返回 changed=记录是否被改动；cleared=可以作废的墓碑（用户真的重新播放了）。
+// 返回 changed=记录是否被改动。墓碑只能由 playbackWriteSuppressed 明确放行，
+// 读取阶段绝不能因为 startedAt 或新会话号自行作废墓碑。
 function filterStateByTombstones(state, store) {
-  const result = { changed: false, cleared: [] };
+  const result = { changed: false };
   if (!state || typeof state !== "object" || !store || typeof store !== "object") {
     return result;
   }
@@ -3228,24 +3229,6 @@ function filterStateByTombstones(state, store) {
     if (!record || typeof record !== "object") continue;
     if (!(Number(record.positionTicks) > 0 || Boolean(record.played))) {
       // 只剩收藏等状态，跟“继续观看”无关，不动它
-      continue;
-    }
-    // 同一个播放会话的后续进度上报永远属于“移除前那次播放”:即使进度一直在往前走、
-    // 时间戳一直在更新,也不能让它复活(这就是“移除后过一会又出现”的主因)。
-    const recordSession = String(record.playSessionId || "");
-    const markerSession = String(marker.playSessionId || "");
-    if (recordSession && markerSession && recordSession === markerSession) {
-      suppressPlaybackRecord(state, itemId, record);
-      result.changed = true;
-      continue;
-    }
-    // 只有一次明确的“从 0 重新开始播放”(带 startedAt)才算用户又播了。
-    // 新会话号不能单独作准：客户端刷新、重建播放器时也会换会话号，并补发旧进度。
-    const startedAt = Date.parse(String(record.startedAt || ""));
-    const restarted = Number.isFinite(startedAt) && startedAt > marker.at;
-    if (restarted) {
-      delete store[itemId];
-      result.cleared.push(itemId);
       continue;
     }
     suppressPlaybackRecord(state, itemId, record);
@@ -3266,12 +3249,6 @@ async function pruneStalePlaybackRecords(env, stateKey, state) {
   const store = await readTombstones(env, stateKey);
   const filtered = filterStateByTombstones(state, store);
   stateChanged = stateChanged || filtered.changed;
-  if (filtered.cleared.length) {
-    // 作废墓碑前重新读一次最新表，别把别的实例刚立的其它墓碑一起覆盖掉
-    const latest = await readTombstones(env, stateKey, { fresh: true });
-    for (const id of filtered.cleared) delete latest[id];
-    await writeTombstones(env, stateKey, latest);
-  }
   if (stateChanged) await writePlaybackStateByKey(env, stateKey, state);
   return state;
 }
@@ -3307,10 +3284,38 @@ async function removePlaybackRecord(env, token, state, itemId) {
     played: Boolean(old && old.played),
     // 记下移除时正在使用的播放会话:同一会话之后的进度上报都属于残留。
     playSessionId: String((old && old.playSessionId) || lastPlaySession(key, itemId) || ""),
+    pendingPlaySessionId: "",
+    pendingAt: 0,
   };
   // 即使当时手上没有这条记录也要立墓碑：并发的旧快照可能正把它写回来。
   await writeTombstones(env, key, store);
   return Boolean(old);
+}
+
+const PLAYBACK_REPLAY_CONFIRM_TICKS = 5 * 60 * 10_000_000;
+
+function isPlausiblePlaybackRestart(marker, opts) {
+  const pendingSession = String(marker && marker.pendingPlaySessionId || "");
+  const playSessionId = String(opts && opts.playSessionId || "");
+  const positionTicks = Math.max(0, Number(opts && opts.positionTicks) || 0);
+  if (!pendingSession || !playSessionId || pendingSession !== playSessionId || positionTicks <= 0) {
+    return false;
+  }
+  const removedPosition = Math.max(0, Number(marker.positionTicks) || 0);
+  // 真重播必须先出现同一会话、接近开头的低进度。刷新后补发的高进度不会满足，
+  // 因此不能仅凭新会话号或 startedAt 解除墓碑。
+  if (removedPosition > 0 && positionTicks >= removedPosition) {
+    return false;
+  }
+  return positionTicks <= PLAYBACK_REPLAY_CONFIRM_TICKS;
+}
+
+async function clearPlaybackTombstone(env, key, itemId) {
+  const latest = await readTombstones(env, key, { fresh: true });
+  if (latest[itemId]) {
+    delete latest[itemId];
+    await writeTombstones(env, key, latest);
+  }
 }
 
 // 统一的闸门：返回 true 表示这次写入属于“移除之后补发的残留”，应当忽略。
@@ -3321,19 +3326,35 @@ async function playbackWriteSuppressed(env, token, itemId, opts = {}) {
   const marker = normalizeTombstone(store[itemId]);
   if (!marker) return false;
   // 客户端刷新时经常会换一个 PlaySessionId，但仍然是删除前那次播放的残留上报。
-  // 因此“新会话”本身绝不能解除墓碑；只有明确用户操作，或从 0 真正重新起播才放行。
+  // 因此“新会话”本身绝不能解除墓碑。第一次从 0 起播只记成待确认会话，
+  // 只有同一会话随后出现合理低进度，或用户明确标记已播，才真正放行。
   const explicitAction = opts.explicit === true;
-  const confirmedRestart =
-    opts.restarted === true && Number(opts.positionTicks || 0) === 0;
-  if (!explicitAction && !confirmedRestart) {
-    return true;
+  if (explicitAction) {
+    await clearPlaybackTombstone(env, key, itemId);
+    return false;
   }
-  const latest = await readTombstones(env, key, { fresh: true });
-  if (latest[itemId]) {
-    delete latest[itemId];
-    await writeTombstones(env, key, latest);
+
+  if (isPlausiblePlaybackRestart(marker, opts)) {
+    await clearPlaybackTombstone(env, key, itemId);
+    return false;
   }
-  return false;
+
+  if (opts.restarted === true && Math.max(0, Number(opts.positionTicks) || 0) === 0) {
+    const playSessionId = String(opts.playSessionId || "");
+    if (playSessionId) {
+      const latest = await readTombstones(env, key, { fresh: true });
+      const latestMarker = normalizeTombstone(latest[itemId]);
+      if (latestMarker) {
+        latest[itemId] = {
+          ...latestMarker,
+          pendingPlaySessionId: playSessionId,
+          pendingAt: Date.now(),
+        };
+        await writeTombstones(env, key, latest);
+      }
+    }
+  }
+  return true;
 }
 
 // 客户端写用户数据时，参数可能在 body，也可能拼在 query string 上
@@ -4179,6 +4200,13 @@ async function applyItemUserDataAction(itemId, action, request, env, token) {
     await writePlaybackState(env, state, token);
     return userDataForRecord(state[itemId]);
   }
+  if (action === "userdata" && (method === "POST" || method === "PUT")) {
+    // 部分客户端不用 DELETE，而是向 UserData 回写 PlaybackPositionTicks=0
+    // 来清掉续播；这也必须立墓碑，否则紧接着补发的旧进度会再次把它带回列表。
+    await removePlaybackRecord(env, token, state, itemId);
+    await writePlaybackState(env, state, token);
+    return userDataForRecord(state[itemId]);
+  }
   if (!existing && !isMarkAction) {
     // 本来就没有这条记录，就别凭空写一条（例如重复“结束播放”）。
     return userDataForRecord(existing);
@@ -4611,6 +4639,33 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
       const incomingPlayed = playedParam === undefined
         ? undefined
         : isTruthyUserDataFlag(playedParam);
+      const favoriteOnly = favoriteParam !== undefined &&
+        playedParam === undefined &&
+        positionParam === undefined &&
+        playCountParam === undefined;
+      const explicitProgressClear =
+        !favoriteOnly &&
+        ((positionParam !== undefined && incomingPosition === 0) ||
+          (playedParam !== undefined && incomingPlayed === false));
+      if (explicitProgressClear) {
+        // UserData 回写 0 进度（或未播状态）也是客户端的“移除续播”操作，
+        // 按删除处理并立墓碑；收藏字段若同请求带回，仍按原值保留。
+        await removePlaybackRecord(env, token, userDataState, userDataItemId);
+        if (favoriteParam !== undefined) {
+          const favoriteRecord = userDataState[userDataItemId] || {
+            itemId: userDataItemId,
+            positionTicks: 0,
+            played: false,
+            playCount: 0,
+            lastPlayedDate: "",
+          };
+          favoriteRecord.itemId = userDataItemId;
+          favoriteRecord.favorite = isTruthyUserDataFlag(favoriteParam);
+          userDataState[userDataItemId] = favoriteRecord;
+        }
+        await writePlaybackState(env, userDataState, token);
+        return noContentResponse();
+      }
       if (incomingPosition > 0 || incomingPlayed === true) {
         // 客户端退出后常会补发一次“最后的进度”，刚移除过的条目不能被它复活
         if (await playbackWriteSuppressed(env, token, userDataItemId, {
