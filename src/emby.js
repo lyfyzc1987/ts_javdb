@@ -60,11 +60,7 @@ const INLINE_HLS_CONTENT_TYPES = new Set([
   "application/vnd.apple.mpegurl",
   "application/x-mpegurl",
 ]);
-// 解析器有时会把整段 HLS 清单塞进 data URL。不同资源的清单大小差异很大，
-// 旧上限会把稍大的备用线路直接过滤掉，客户端就只剩一条播放源。
-const MAX_INLINE_HLS_LENGTH = 12_000_000;
-// 修改播放源结构后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v3";
+const MAX_INLINE_HLS_LENGTH = 2_000_000;
 const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
 const HOME_MAX_SOURCE_PAGES = 40;
@@ -329,51 +325,6 @@ function videoVariantLabel(source, index, total) {
   if (/reduc|mosaic|compress|small/i.test(variant)) return "压缩版";
   if (variant) return variant;
   return `线路 ${index + 1}`;
-}
-
-// 变体名里的站点前缀（如 fcjav_reducing_mosaic -> fcjav）。
-// 上游不同站点会给出同名变体（例如三条都叫“压缩版”），
-// 客户端按名字展示播放源时容易看成重复项，这里用站点名把重名区分开。
-function videoVariantSite(variant) {
-  const match = String(variant?.variant || "").match(/^([a-z0-9]+)[_-]/i);
-  if (!match) return "";
-  const first = match[1].toLowerCase();
-  if (GENERIC_VARIANT_PREFIXES.has(first)) return "";
-  return first;
-}
-
-// 这些前缀只是“画质/有无码”描述，不是站点名，拿来做区分反而会把
-// “压缩版”改成“压缩版 · reducing”这种奇怪的名字。
-const GENERIC_VARIANT_PREFIXES = new Set([
-  "reducing", "reduce", "mosaic", "compress", "compressed", "original",
-  "raw", "hd", "sd", "small", "censored", "uncensored", "chinese", "sub",
-]);
-
-// 让每条播放源的名字都不重复：重名的补上站点名或序号。
-// 客户端（Emby 系列）在“播放源/媒体源”列表里按名字区分条目，
-// 名字唯一的源不会被折叠掉。
-function uniqueVariantLabels(variants) {
-  const labels = variants.map((variant, index) =>
-    videoVariantLabel(variant, index, variants.length));
-  const counts = new Map();
-  for (const label of labels) {
-    counts.set(label, (counts.get(label) || 0) + 1);
-  }
-  const used = new Set();
-  return labels.map((label, index) => {
-    used.add(label);
-    if (counts.get(label) === 1) return label;
-    const variant = variants[index] || {};
-    const site = videoVariantSite(variant);
-    const type = /mpegurl|m3u8/i.test(String(variant.sourceType || "")) ? "HLS" : "MP4";
-    const candidates = [];
-    if (site) candidates.push(`${label} · ${site}`);
-    candidates.push(`${label} · ${type}`);
-    candidates.push(`${label} ${index + 1}`);
-    const chosen = candidates.find((item) => !used.has(item)) || `${label} ${index + 1}`;
-    used.add(chosen);
-    return chosen;
-  });
 }
 
 function safeMediaContentType(value) {
@@ -2080,7 +2031,7 @@ async function resolveVideoCached(movie, env, fetchImpl) {
   if (!code) {
     return resolveVideo(movie, env, fetchImpl);
   }
-  const key = `${resolverOrigin(env)}${resolverResolvePath(env)}|${RESOLVE_VIDEO_CACHE_VERSION}|${code}`;
+  const key = `${resolverOrigin(env)}${resolverResolvePath(env)}|${code}`;
   return RESOLVE_VIDEO_CACHE.fetch(key, async () => {
     const shared = await edgeCacheRead(EDGE_NAMESPACE_VIDEO, key);
     if (shared !== undefined) {
@@ -2119,7 +2070,7 @@ function forgetResolveVideoCache(movie, env) {
   if (!code) {
     return;
   }
-  const key = `${resolverOrigin(env)}${resolverResolvePath(env)}|${RESOLVE_VIDEO_CACHE_VERSION}|${code}`;
+  const key = `${resolverOrigin(env)}${resolverResolvePath(env)}|${code}`;
   RESOLVE_VIDEO_CACHE.forget(key);
   forgetEdgeCache(EDGE_NAMESPACE_VIDEO, key);
 }
@@ -2335,24 +2286,49 @@ function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = 
     DefaultAudioStreamIndex: 1,
     DefaultSubtitleStreamIndex: subtitleStreams.length > 0 ? 2 : undefined,
     MediaStreams: [
-      // Emby 客户端会依据 MediaStreams 判断一份媒体源是否完整。这里保留最小化的
-      // 视频轨和音频轨结构，但不下发编码/码率等详细媒体信息；容器仍显示 STRM。
-      {
-        Type: "Video",
-        IsDefault: true,
-        IsForced: false,
-        IsExternal: false,
-        Index: 0,
-        Width: width,
-        Height: height || undefined,
-      },
-      {
-        Type: "Audio",
-        IsDefault: true,
-        IsForced: false,
-        IsExternal: false,
-        Index: 1,
-      },
+      // ===== 媒体信息精简（第 2 步）：视频轨/音频轨整段停用，不再下发给客户端 =====
+      // 上一版虽然隐藏了“编码/分辨率/码率”，但客户端媒体信息里仍会显示
+      // “视频 编号 0”“音频 编号 1 默认 true 强制 false 外部 false”这类行。
+      // 现按需求把视频流、音频流整段注释掉，媒体信息不再出现这两条轨道，
+      // 只保留外部字幕流（供播放器选择“字幕 1 / 字幕 2…”）。
+      // 需要恢复时，把下面两段“// 原视频流 / // 原音频流”中的代码取消注释即可。
+      //
+      // 原视频流（含 Type/Index/IsDefault/IsForced/IsExternal 结构字段）：
+      // {
+      //   Type: "Video",
+      //   // Codec: isHls ? "hls" : "h264",
+      //   // CodecTag: isHls ? undefined : "avc1",
+      //   // DisplayTitle: height > 0 ? (height + "p H264 SDR") : "H264 SDR", // 原行（显示 分辨率+H264）
+      //   IsDefault: true,
+      //   IsForced: false,
+      //   IsExternal: false,
+      //   Index: 0,
+      //   // Width: width,
+      //   // Height: height || undefined,
+      //   // AspectRatio: "16:9",
+      //   // VideoRange: "SDR",
+      //   // VideoRangeType: "SDR",
+      //   // IsInterlaced: false,
+      //   // IsAVC: !isHls,
+      //   // IsAnamorphic: false,
+      //   // TimeBase: "1/10000000",
+      // },
+      // 原音频流（含 Type/Index/IsDefault/IsForced/IsExternal 结构字段）：
+      // {
+      //   Type: "Audio",
+      //   // Codec: "aac",
+      //   // CodecTag: "mp4a",
+      //   // Language: "und",
+      //   // DisplayLanguage: "Undetermined",
+      //   // DisplayTitle: "AAC stereo",
+      //   Index: 1,
+      //   // Channels: 2,
+      //   // ChannelLayout: "stereo",
+      //   // SampleRate: 48000,
+      //   IsDefault: true,
+      //   IsForced: false,
+      //   IsExternal: false,
+      // },
       ...subtitleStreams,
     ],
   };
@@ -2409,7 +2385,6 @@ function selectedPlaybackVideo(video, itemId, requestUrl) {
 
 function mediaSourcesForVideo(item, requestUrl, token, video, subtitles = []) {
   const variants = playbackVariants(video);
-  const labels = uniqueVariantLabels(variants);
   return variants.map((variant, index) =>
     mediaSource(
       item,
@@ -2417,9 +2392,8 @@ function mediaSourcesForVideo(item, requestUrl, token, video, subtitles = []) {
       token,
       {
         ...variant,
-        sourceName: variants.length > 1
-          ? labels[index]
-          : variant.sourceName || "",
+        sourceName: variant.sourceName ||
+          (variants.length > 1 ? videoVariantLabel(variant, index, variants.length) : ""),
       },
       subtitles,
       mediaSourceIdForIndex(item.Id, index),
@@ -2614,17 +2588,12 @@ function virtualFolder(library) {
   };
 }
 
-// 详情页“顺带解析播放源”的预算。
-// 上游解析器冷启动普遍要 1.5~4.5 秒（实测 ADN-710 约 1.6s、JUR-799 约 1.5s、
-// GVH-385 约 4.3s），旧的 3s 预算经常赶不上，于是回退成“1 条占位源”，
-// 客户端详情页就只能看到一个播放源。这里把预算放宽到能覆盖冷启动的时长，
-// 让第一次点开就能拿到全部播放源；超时兜底逻辑仍然保留，页面不会无限转圈。
-// 这份预算只约束播放源解析本身——字幕不再计入（见 itemResponse）。
-const ITEM_DETAIL_RESOLVE_BUDGET_MS = 9000;
+// 详情页“顺带解析播放源”的预算：超过就先返回元数据（真正播放时再完整解析）。
+// 这份预算只约束播放源解析本身——字幕不再计入（见 itemResponse），
+// 否则字幕稍慢就会把已经解析好的播放源一起丢掉，客户端详情页只能看到一条占位源。
+const ITEM_DETAIL_RESOLVE_BUDGET_MS = 3000;
 // 起播(/PlaybackInfo)时客户端马上就要播放,字幕流必须跟着这次响应一起下发,
-// 否则会出现“视频已经播了、字幕还在加载”。这里维持原来的 3.5s:详情页已经把
-// 播放源/字幕都预热进缓存,起播时基本是秒回;只有“没开详情页直接起播”的冷请求
-// 才可能退回占位源,此时保住“马上能播”比“显示全部播放源”更重要。
+// 否则会出现“视频已经播了、字幕还在加载”。这里比详情页多给一点时间。
 const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 3500;
 
 // 后台预热:不阻塞当前响应,把播放源与字幕列表解析完写进缓存,
@@ -2839,8 +2808,12 @@ const PLAYBACK_MAX_RESUME_ITEMS = 30;
 // 进度距片尾不足 2 分钟也视为“已看完”：部分客户端在结尾前几秒/一两分钟退出时
 // 不会上报 PlayedToCompletion，若仍按“没看完”处理会残留进度条并出现在“继续播放”里。
 const PLAYBACK_FINISH_TAIL_TICKS = 120 * 10_000_000;
-// 移除播放记录后，墓碑会按 PLAYBACK_TOMBSTONE_RETENTION_MS 长期保留。
-// 进度、停止、新会话的残留上报都挡在墓碑外；只有用户明确操作或从 0 重新起播才放行。
+// 移除播放记录后的“抑制期”：客户端常在移除后不久又补发一次旧的进度/停止
+// 上报，把刚删掉的条目又写回“继续观看”。这段时间内忽略该条目的残留上报。
+// 抑制信息放在独立的“墓碑”key 里（见下），所以迟到的整份覆盖也冲不掉它。
+// 抑制期要够长：客户端补发残留上报的时间点很不固定（重开 App、切后台回来…）。
+// 真的重播另有出口（开始播放事件 / 进度明显往前播），不会因为抑制期长就记不上。
+const PLAYBACK_DELETE_SUPPRESS_MS = 2 * 60 * 60 * 1000;
 // 墓碑保留 30 天：脏写回把老记录带回来时，读取阶段也能按时间戳剪掉。
 const PLAYBACK_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const PLAYBACK_MAX_TOMBSTONES = 300;
@@ -3287,11 +3260,12 @@ function filterStateByTombstones(state, store) {
       result.changed = true;
       continue;
     }
-    // 只有一次明确的“从 0 重新开始播放”(带 startedAt)才算用户又播了。
-    // 新会话号不能单独作准：客户端刷新、重建播放器时也会换会话号，并补发旧进度。
+    // 只有一次“重新开始播放”(带 startedAt)或全新的播放会话,才算用户又播了。
+    // 绝不用“位置前进 / 时间戳变新”判断:那也可能是残留上报。
     const startedAt = Date.parse(String(record.startedAt || ""));
     const restarted = Number.isFinite(startedAt) && startedAt > marker.at;
-    if (restarted) {
+    const newSession = Boolean(recordSession && markerSession && recordSession !== markerSession);
+    if (restarted || newSession) {
       delete store[itemId];
       result.cleared.push(itemId);
       continue;
@@ -3368,12 +3342,17 @@ async function playbackWriteSuppressed(env, token, itemId, opts = {}) {
   const store = await readTombstones(env, key);
   const marker = normalizeTombstone(store[itemId]);
   if (!marker) return false;
-  // 客户端刷新时经常会换一个 PlaySessionId，但仍然是删除前那次播放的残留上报。
-  // 因此“新会话”本身绝不能解除墓碑；只有明确用户操作，或从 0 真正重新起播才放行。
-  const explicitAction = opts.explicit === true;
-  const confirmedRestart =
-    opts.restarted === true && Number(opts.positionTicks || 0) === 0;
-  if (!explicitAction && !confirmedRestart) {
+  const fresh = Date.now() - marker.at < PLAYBACK_DELETE_SUPPRESS_MS;
+  const sessionId = String(opts.playSessionId || "");
+  const markerSession = String(marker.playSessionId || "");
+  const sameSession = Boolean(sessionId && markerSession && sessionId === markerSession);
+  const newSession = Boolean(sessionId && markerSession && sessionId !== markerSession);
+  // 关键修复:从“继续观看”移除记录时播放器往往还开着,之后每一次进度上报的位置与
+  // 时间戳都会超过删除那一刻。旧逻辑按“进度明显前进”就解除抑制,记录于是过一会又出现。
+  // 现在同一播放会话的后续上报一律忽略,只有“重新开始播放”或全新会话才算真的重播。
+  // opts.explicit 表示这是用户在客户端上的明确操作(例如手动点“标记已播”),
+  // 不是播放器补发的残留上报:这种要放行。进度上报 / 同步类请求一律拦截。
+  if (opts.restarted !== true && opts.explicit !== true && !newSession && (fresh || sameSession)) {
     return true;
   }
   const latest = await readTombstones(env, key, { fresh: true });
@@ -4233,7 +4212,6 @@ async function applyItemUserDataAction(itemId, action, request, env, token) {
   }
   if (action !== "favoriteitems" && await playbackWriteSuppressed(env, token, itemId, {
     playedToCompletion: action === "playeditems" && method !== "DELETE",
-    explicit: action === "playeditems" && method !== "DELETE",
   })) {
     return userDataForRecord(state[itemId]);
   }
