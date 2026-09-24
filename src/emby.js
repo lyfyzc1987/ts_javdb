@@ -2336,17 +2336,34 @@ function playbackVariants(video) {
 
 function mediaSourceIdForIndex(itemId, index) {
   const base = String(itemId || "");
-  return index <= 0 ? base : base + "-" + String(index + 1);
+  const digest = md5(`${base}|emby-media-source-v1|${Math.max(0, Number(index) || 0)}`);
+  const variant = ((Number.parseInt(digest[16], 16) & 0x3) | 0x8).toString(16);
+  return [
+    digest.slice(0, 8),
+    digest.slice(8, 12),
+    `4${digest.slice(13, 16)}`,
+    `${variant}${digest.slice(17, 20)}`,
+    digest.slice(20, 32),
+  ].join("-");
 }
 
-function mediaSourceVariantIndex(itemId, mediaSourceId) {
+function mediaSourceVariantIndex(itemId, mediaSourceId, variantCount = 0) {
   const base = String(itemId || "");
   const value = String(mediaSourceId || "").trim();
   if (!value || value === base) return 0;
   const prefix = base + "-";
-  if (!value.startsWith(prefix)) return -1;
-  const number = Number(value.slice(prefix.length));
-  return Number.isInteger(number) && number > 1 ? number - 1 : -1;
+  if (value.startsWith(prefix)) {
+    const number = Number(value.slice(prefix.length));
+    if (Number.isInteger(number) && number > 1) return number - 1;
+  }
+  const count = Math.max(0, Math.floor(Number(variantCount) || 0));
+  const normalized = value.toLowerCase();
+  for (let index = 0; index < count; index += 1) {
+    if (mediaSourceIdForIndex(base, index) === normalized) {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function selectedPlaybackVideo(video, itemId, requestUrl) {
@@ -2355,6 +2372,7 @@ function selectedPlaybackVideo(video, itemId, requestUrl) {
   const requestedIndex = mediaSourceVariantIndex(
     itemId,
     requestUrl.searchParams.get("mediaSourceId"),
+    variants.length,
   );
   if (requestedIndex <= 0 || requestedIndex >= variants.length) return video;
   const selected = variants[requestedIndex];
@@ -2822,18 +2840,35 @@ function playbackKv(env) {
 //   tombstone —— “已移除”墓碑（比状态更关键：它负责挡住迟到的脏写回）。
 const EDGE_NAMESPACE_PLAYBACK = "playback";
 const EDGE_NAMESPACE_TOMBSTONE = "tombstone";
+const EDGE_NAMESPACE_PLAYBACK_MIRROR = "playback-mirror-v1";
+const EDGE_NAMESPACE_TOMBSTONE_MIRROR = "tombstone-mirror-v1";
 const PLAYBACK_CACHE_TTL_S = 30 * 24 * 60 * 60;
+// KV 读取本身可能缓存约 60 秒。把刚写入的结果短时镜像到同一机房的 Cache API，
+// 可以保证“移除记录 -> 客户端立刻刷新”不会再次读到删除前的快照。
+const PLAYBACK_MIRROR_CACHE_TTL_S = 30;
+const PLAYBACK_LOCAL_WRITE_AUTHORITY_MS = 60 * 1000;
+
+function durableMirrorNamespace(namespace) {
+  return namespace === EDGE_NAMESPACE_TOMBSTONE
+    ? EDGE_NAMESPACE_TOMBSTONE_MIRROR
+    : EDGE_NAMESPACE_PLAYBACK_MIRROR;
+}
 
 // 统一入口：优先 KV（绑定了就跨机房长期保存），没绑定时退到边缘缓存。
 async function durableJsonRead(env, namespace, key) {
   const kv = playbackKv(env);
   if (kv) {
+    // 新写入的短时镜像只在当前机房有效，但能绕开 KV 的读取缓存，
+    // 避免删除或真正重播后，紧接着刷新又读到旧快照。
+    const mirrored = await edgeCacheRead(durableMirrorNamespace(namespace), key);
+    if (mirrored !== undefined) {
+      return mirrored;
+    }
     try {
-      const value = await kv.get(key, "json");
+      const value = await kv.get(key, "json", { cacheTtl: 30 });
       if (value !== null && value !== undefined) {
         return value;
       }
-      // KV 明确回答“没有”：不再往下看边缘缓存，免得拿到迁移前的过期副本。
       return null;
     } catch (error) {
       console.error(JSON.stringify({
@@ -2865,10 +2900,11 @@ async function durableJsonRead(env, namespace, key) {
 
 async function durableJsonWrite(env, namespace, key, value) {
   const kv = playbackKv(env);
+  let kvWriteSucceeded = false;
   if (kv) {
     try {
       await kv.put(key, JSON.stringify(value));
-      return;
+      kvWriteSucceeded = true;
     } catch (error) {
       console.error(JSON.stringify({
         message: "Playback store write failed",
@@ -2876,18 +2912,35 @@ async function durableJsonWrite(env, namespace, key, value) {
       }));
     }
   }
+  if (kvWriteSucceeded) {
+    await edgeCacheWrite(
+      durableMirrorNamespace(namespace),
+      key,
+      value,
+      PLAYBACK_MIRROR_CACHE_TTL_S,
+    );
+    return;
+  }
+  // 没有 KV 或 KV 写入失败时，仍然使用原有长期边缘缓存作为持久化兜底。
   await edgeCacheWrite(namespace, key, value, PLAYBACK_CACHE_TTL_S);
 }
 
 const MEMORY_PLAYBACK_STATES = new Map();
+const MEMORY_PLAYBACK_STATE_WRITES = new Map();
 
-function rememberPlaybackState(key, state) {
+function rememberPlaybackState(key, state, opts = {}) {
   try {
     MEMORY_PLAYBACK_STATES.set(key, state || {});
+    if (opts.localWrite === true) {
+      MEMORY_PLAYBACK_STATE_WRITES.set(key, Date.now());
+    } else {
+      MEMORY_PLAYBACK_STATE_WRITES.delete(key);
+    }
     if (MEMORY_PLAYBACK_STATES.size > MAX_MEMORY_PLAYBACK_STATES) {
       const oldestKey = MEMORY_PLAYBACK_STATES.keys().next().value;
       if (oldestKey !== undefined) {
         MEMORY_PLAYBACK_STATES.delete(oldestKey);
+        MEMORY_PLAYBACK_STATE_WRITES.delete(oldestKey);
       }
     }
   } catch {
@@ -3030,6 +3083,14 @@ async function playbackStateKey(env, token) {
 
 async function loadPlaybackStateByKey(env, key) {
   const memoryState = MEMORY_PLAYBACK_STATES.get(key);
+  const writeAt = Number(MEMORY_PLAYBACK_STATE_WRITES.get(key) || 0);
+  if (
+    memoryState && typeof memoryState === "object" &&
+    writeAt > 0 &&
+    Date.now() - writeAt <= PLAYBACK_LOCAL_WRITE_AUTHORITY_MS
+  ) {
+    return memoryState;
+  }
   const value = await durableJsonRead(env, EDGE_NAMESPACE_PLAYBACK, key);
   if (value && typeof value === "object") {
     rememberPlaybackState(key, value);
@@ -3051,7 +3112,7 @@ async function writePlaybackStateByKey(env, key, state) {
   // 并发时唯一能兜住的检查）。这里强制读最新的墓碑表，不做缓存复用。
   const store = await readTombstones(env, key, { fresh: true });
   filterStateByTombstones(next, store);
-  rememberPlaybackState(key, next);
+  rememberPlaybackState(key, next, { localWrite: true });
   await durableJsonWrite(env, EDGE_NAMESPACE_PLAYBACK, key, next);
 }
 
@@ -3149,9 +3210,14 @@ function pruneTombstoneStore(store) {
   return changed;
 }
 
-function rememberTombstones(key, store) {
+function rememberTombstones(key, store, opts = {}) {
   try {
-    MEMORY_PLAYBACK_TOMBSTONES.set(key, { store: store || {}, at: Date.now() });
+    const now = Date.now();
+    MEMORY_PLAYBACK_TOMBSTONES.set(key, {
+      store: store || {},
+      at: now,
+      writtenAt: opts.localWrite === true ? now : 0,
+    });
     if (MEMORY_PLAYBACK_TOMBSTONES.size > MAX_MEMORY_TOMBSTONE_STORES) {
       const oldestKey = MEMORY_PLAYBACK_TOMBSTONES.keys().next().value;
       if (oldestKey !== undefined) {
@@ -3169,6 +3235,15 @@ async function readTombstones(env, stateKey, opts = {}) {
   const fallback = cached && cached.store && typeof cached.store === "object"
     ? cached.store
     : {};
+  const writtenAt = Number(cached && cached.writtenAt || 0);
+  if (
+    opts.fresh &&
+    cached &&
+    writtenAt > 0 &&
+    Date.now() - writtenAt <= PLAYBACK_LOCAL_WRITE_AUTHORITY_MS
+  ) {
+    return fallback;
+  }
   // 短时缓存：进度上报很频繁，不能每次都多读一次持久化存储。
   // 即使因此晚几秒才拿到别的实例刚写的墓碑也没关系：脏记录的时间戳早于移除
   // 时间，缓存过期后下一次读取仍会被剪掉。
@@ -3190,7 +3265,7 @@ async function readTombstones(env, stateKey, opts = {}) {
 async function writeTombstones(env, stateKey, store) {
   const key = playbackTombstoneKey(stateKey);
   pruneTombstoneStore(store);
-  rememberTombstones(key, store || {});
+  rememberTombstones(key, store || {}, { localWrite: true });
   await durableJsonWrite(env, EDGE_NAMESPACE_TOMBSTONE, key, store || {});
 }
 
