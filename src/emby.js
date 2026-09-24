@@ -2829,6 +2829,41 @@ function playbackKv(env) {
   return kv && typeof kv.get === "function" && typeof kv.put === "function" ? kv : null;
 }
 
+function playbackDb(env) {
+  const db = env && env.PLAYBACK_DB;
+  return db && typeof db.prepare === "function" ? db : null;
+}
+
+async function durableDbRead(db, namespace, key) {
+  const row = await db
+    .prepare("SELECT value FROM playback_json WHERE namespace = ? AND key = ?")
+    .bind(namespace, key)
+    .first();
+  if (!row || row.value === null || row.value === undefined) {
+    return undefined;
+  }
+  if (typeof row.value !== "string") {
+    return row.value;
+  }
+  try {
+    return JSON.parse(row.value);
+  } catch (error) {
+    throw new Error(`Invalid JSON in playback store: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function durableDbWrite(db, namespace, key, value) {
+  await db
+    .prepare(
+      "INSERT INTO playback_json (namespace, key, value, updated_at) " +
+      "VALUES (?, ?, ?, ?) " +
+      "ON CONFLICT(namespace, key) DO UPDATE SET " +
+      "value = excluded.value, updated_at = excluded.updated_at",
+    )
+    .bind(namespace, key, JSON.stringify(value), Date.now())
+    .run();
+}
+
 // —— 零配置持久化兜底 ——
 // 不少部署是把这份代码直接粘进 Cloudflare，并没有在设置里绑定 PLAYBACK_KV。
 // 那种情况下播放记录只能留在某个 Worker 实例的内存里：实例一被回收，
@@ -2856,6 +2891,31 @@ function durableMirrorNamespace(namespace) {
 
 // 统一入口：优先 KV（绑定了就跨机房长期保存），没绑定时退到边缘缓存。
 async function durableJsonRead(env, namespace, key) {
+  const db = playbackDb(env);
+  if (db) {
+    try {
+      const value = await durableDbRead(db, namespace, key);
+      if (value !== undefined) {
+        return value;
+      }
+      // D1 是后来才启用的：旧部署里可能已经有 KV 数据，首次读取时迁移。
+      const kv = playbackKv(env);
+      if (kv) {
+        const legacy = await kv.get(key, "json");
+        if (legacy !== null && legacy !== undefined) {
+          await durableDbWrite(db, namespace, key, legacy);
+          return legacy;
+        }
+      }
+      return null;
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "Playback D1 read failed",
+        error: error instanceof Error ? error.message : String(error),
+      }));
+      // 读取失败时继续走 KV / Edge Cache，避免数据库故障让播放记录完全不可用。
+    }
+  }
   const kv = playbackKv(env);
   if (kv) {
     // 新写入的短时镜像只在当前机房有效，但能绕开 KV 的读取缓存，
@@ -2899,6 +2959,19 @@ async function durableJsonRead(env, namespace, key) {
 }
 
 async function durableJsonWrite(env, namespace, key, value) {
+  const db = playbackDb(env);
+  let dbWriteSucceeded = false;
+  if (db) {
+    try {
+      await durableDbWrite(db, namespace, key, value);
+      dbWriteSucceeded = true;
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "Playback D1 write failed",
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
   const kv = playbackKv(env);
   let kvWriteSucceeded = false;
   if (kv) {
@@ -2912,7 +2985,7 @@ async function durableJsonWrite(env, namespace, key, value) {
       }));
     }
   }
-  if (kvWriteSucceeded) {
+  if (dbWriteSucceeded || kvWriteSucceeded) {
     await edgeCacheWrite(
       durableMirrorNamespace(namespace),
       key,

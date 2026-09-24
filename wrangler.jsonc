@@ -8,5 +8,12 @@
     "UPSTREAM_ORIGIN": "https://catembylegacy.fastcdn.dpdns.org",
     "EMBY_GUEST_ACCESS": "true",
     "JAVSTRM_ORIGIN": "https://javstrm.emby-59f.workers.dev"
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "PLAYBACK_DB",
+      "database_name": "ts-javdb-playback",
+      "database_id": "e56f98c9-9460-47c8-ad81-cd24c56a3d9a"
+    }
+  ]
 }
