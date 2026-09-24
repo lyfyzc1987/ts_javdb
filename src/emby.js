@@ -2834,6 +2834,36 @@ function playbackDb(env) {
   return db && typeof db.prepare === "function" ? db : null;
 }
 
+function playbackDbBytes(value) {
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((entry) => Number.isInteger(entry) && entry >= 0 && entry <= 255)
+  ) {
+    return Uint8Array.from(value);
+  }
+  return null;
+}
+
+function parsePlaybackDbValue(value) {
+  const bytes = playbackDbBytes(value);
+  if (bytes) {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  }
+  if (typeof value === "string") {
+    const parsed = JSON.parse(value);
+    const legacyBytes = playbackDbBytes(parsed);
+    return legacyBytes ? JSON.parse(new TextDecoder().decode(legacyBytes)) : parsed;
+  }
+  return value;
+}
+
 async function durableDbRead(db, namespace, key) {
   const row = await db
     .prepare("SELECT value FROM playback_json WHERE namespace = ? AND key = ?")
@@ -2842,11 +2872,8 @@ async function durableDbRead(db, namespace, key) {
   if (!row || row.value === null || row.value === undefined) {
     return undefined;
   }
-  if (typeof row.value !== "string") {
-    return row.value;
-  }
   try {
-    return JSON.parse(row.value);
+    return parsePlaybackDbValue(row.value);
   } catch (error) {
     throw new Error(`Invalid JSON in playback store: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -2856,7 +2883,7 @@ async function durableDbWrite(db, namespace, key, value) {
   await db
     .prepare(
       "INSERT INTO playback_json (namespace, key, value, updated_at) " +
-      "VALUES (?, ?, ?, ?) " +
+      "VALUES (?, ?, CAST(? AS TEXT), ?) " +
       "ON CONFLICT(namespace, key) DO UPDATE SET " +
       "value = excluded.value, updated_at = excluded.updated_at",
     )
@@ -3157,7 +3184,11 @@ async function playbackStateKey(env, token) {
 async function loadPlaybackStateByKey(env, key) {
   const memoryState = MEMORY_PLAYBACK_STATES.get(key);
   const writeAt = Number(MEMORY_PLAYBACK_STATE_WRITES.get(key) || 0);
+  const dbBacked = playbackDb(env) !== null;
+  // D1 模式下不能信任某实例的短时本地写缓存：同一账号的删除/重播请求可能落到
+  // 不同实例，旧实例若在 60 秒内直接返回自己的快照，会让新写入在部分域名不可见。
   if (
+    !dbBacked &&
     memoryState && typeof memoryState === "object" &&
     writeAt > 0 &&
     Date.now() - writeAt <= PLAYBACK_LOCAL_WRITE_AUTHORITY_MS
@@ -3168,6 +3199,10 @@ async function loadPlaybackStateByKey(env, key) {
   if (value && typeof value === "object") {
     rememberPlaybackState(key, value);
     return value;
+  }
+  if (dbBacked && value !== undefined) {
+    // D1 明确没有这行时，空状态就是权威结果；不能退回可能已过期的实例内存快照。
+    return {};
   }
   return memoryState && typeof memoryState === "object" ? memoryState : {};
 }
@@ -3242,6 +3277,10 @@ function playbackTombstoneKey(stateKey) {
   return `${stateKey}${PLAYBACK_TOMBSTONE_SUFFIX}`;
 }
 
+function tombstoneStore(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
 function normalizeTombstone(raw) {
   if (!raw) return null;
   if (typeof raw === "number") {
@@ -3287,7 +3326,7 @@ function rememberTombstones(key, store, opts = {}) {
   try {
     const now = Date.now();
     MEMORY_PLAYBACK_TOMBSTONES.set(key, {
-      store: store || {},
+      store: tombstoneStore(store),
       at: now,
       writtenAt: opts.localWrite === true ? now : 0,
     });
@@ -3305,30 +3344,30 @@ function rememberTombstones(key, store, opts = {}) {
 async function readTombstones(env, stateKey, opts = {}) {
   const key = playbackTombstoneKey(stateKey);
   const cached = MEMORY_PLAYBACK_TOMBSTONES.get(key);
-  const fallback = cached && cached.store && typeof cached.store === "object"
-    ? cached.store
-    : {};
-  const writtenAt = Number(cached && cached.writtenAt || 0);
-  if (
-    opts.fresh &&
-    cached &&
-    writtenAt > 0 &&
-    Date.now() - writtenAt <= PLAYBACK_LOCAL_WRITE_AUTHORITY_MS
-  ) {
-    return fallback;
-  }
+  const fallback = tombstoneStore(cached && cached.store);
+  const dbBacked = playbackDb(env) !== null;
   // 短时缓存：进度上报很频繁，不能每次都多读一次持久化存储。
   // 即使因此晚几秒才拿到别的实例刚写的墓碑也没关系：脏记录的时间戳早于移除
   // 时间，缓存过期后下一次读取仍会被剪掉。
-  if (!opts.fresh && cached && Date.now() - cached.at < PLAYBACK_TOMBSTONE_CACHE_MS) {
-    return cached.store && typeof cached.store === "object" ? cached.store : {};
+  // D1 是强一致源。若仍复用实例内存缓存，真正重播已清墓碑后，其他实例可能继续
+  // 用旧墓碑过滤新进度，表现为同一用户在不同域名刷新时记录时有时无。因此 D1
+  // 模式下跳过墓碑短缓存，始终读取数据库最新值。
+  if (
+    !opts.fresh &&
+    !dbBacked &&
+    cached &&
+    Date.now() - cached.at < PLAYBACK_TOMBSTONE_CACHE_MS
+  ) {
+    return tombstoneStore(cached.store);
   }
   const value = await durableJsonRead(env, EDGE_NAMESPACE_TOMBSTONE, key);
   if (value === undefined) {
     // 读取失败：沿用上一次的表，绝不把它当成“墓碑全没了”。
     return fallback;
   }
-  const store = value && typeof value === "object" ? value : {};
+  // 旧版本曾把该行写成 JSON 数组。数组上的命名属性无法被 JSON.stringify
+  // 持久化，必须丢弃并重建为普通对象，否则新立的墓碑仍会静默丢失。
+  const store = tombstoneStore(value);
   pruneTombstoneStore(store);
   // 即使读到的是空表也要记进内存缓存（短时），保持原有的“同实例 5 秒”语义。
   rememberTombstones(key, store);
@@ -3337,9 +3376,10 @@ async function readTombstones(env, stateKey, opts = {}) {
 
 async function writeTombstones(env, stateKey, store) {
   const key = playbackTombstoneKey(stateKey);
-  pruneTombstoneStore(store);
-  rememberTombstones(key, store || {}, { localWrite: true });
-  await durableJsonWrite(env, EDGE_NAMESPACE_TOMBSTONE, key, store || {});
+  const next = tombstoneStore(store);
+  pruneTombstoneStore(next);
+  rememberTombstones(key, next, { localWrite: true });
+  await durableJsonWrite(env, EDGE_NAMESPACE_TOMBSTONE, key, next);
 }
 
 function recordTimestampMs(record) {
@@ -3470,7 +3510,9 @@ async function clearPlaybackTombstone(env, key, itemId) {
 async function playbackWriteSuppressed(env, token, itemId, opts = {}) {
   if (!itemId) return false;
   const key = await playbackStateKey(env, token);
-  const store = await readTombstones(env, key);
+  // 播放器会并发发出开始播放和进度上报，它们可能落到不同实例。
+  // 必须读取 D1 中最新墓碑，才能看到另一个实例刚写入的“待确认重播会话”。
+  const store = await readTombstones(env, key, { fresh: true });
   const marker = normalizeTombstone(store[itemId]);
   if (!marker) return false;
   // 客户端刷新时经常会换一个 PlaySessionId，但仍然是删除前那次播放的残留上报。
