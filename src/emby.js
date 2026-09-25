@@ -64,8 +64,8 @@ const INLINE_HLS_CONTENT_TYPES = new Set([
 // 解析器有时会把整段 HLS 清单塞进 data URL。不同资源的清单大小差异很大，
 // 旧上限会把稍大的备用线路直接过滤掉，客户端就只剩一条播放源。
 const MAX_INLINE_HLS_LENGTH = 12_000_000;
-// 修改播放源结构后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v4";
+// 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v7";
 const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
 const HOME_MAX_SOURCE_PAGES = 40;
@@ -320,6 +320,38 @@ function sourceVariants(payload) {
 
   // Some resolver versions return one source object instead of an array.
   return sourceUrlValue(data) ? [data] : [];
+}
+
+function resolverVariantKey(item) {
+  const variant = String(item?.variant || item?.name || item?.id || "")
+    .trim()
+    .toLowerCase();
+  if (variant) {
+    return `variant:${variant}`;
+  }
+  const source = String(sourceUrlValue(item)).trim().toLowerCase();
+  if (source) {
+    return `source:${source}`;
+  }
+  const label = String(item?.label || item?.displayName || "").trim().toLowerCase();
+  return label ? `label:${label}` : "";
+}
+
+function mergeResolverVariants(payloads) {
+  const variants = [];
+  const seen = new Set();
+  payloads.forEach((payload, payloadIndex) => {
+    sourceVariants(payload).forEach((item, itemIndex) => {
+      const key = resolverVariantKey(item) ||
+        `payload:${payloadIndex}:item:${itemIndex}`;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      variants.push(item);
+    });
+  });
+  return variants;
 }
 
 function videoVariantLabel(source, index, total) {
@@ -845,8 +877,8 @@ async function upstreamJson(path, env, fetchImpl) {
   return payload;
 }
 
-async function resolverJson(path, env, fetchImpl) {
-  const response = await fetchWithRetry(fetchImpl, `${resolverOrigin(env)}${path}`, {
+async function resolverJsonUrl(url, env, fetchImpl) {
+  const response = await fetchWithRetry(fetchImpl, String(url), {
     headers: { accept: "application/json" },
     redirect: "follow",
   }, RESOLVER_FETCH_TIMEOUT_MS);
@@ -862,6 +894,10 @@ async function resolverJson(path, env, fetchImpl) {
     throw new Error(`${payload.message || payload.error || `Resolver HTTP ${response.status}`}${detail}`);
   }
   return payload;
+}
+
+async function resolverJson(path, env, fetchImpl) {
+  return resolverJsonUrl(`${resolverOrigin(env)}${path}`, env, fetchImpl);
 }
 
 function movieFromPayload(payload) {
@@ -1267,7 +1303,7 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     LocationType: "Remote",
     MediaType: "Video",
     VideoType: "VideoFile",
-    Container: "strm",
+    Container: "mp4",
     Tagline: movieTagline(movie) || undefined,
     Taglines: movieTaglines(movie),
     Overview: String(movie?.summary || "").trim(),
@@ -1920,18 +1956,8 @@ async function scanLibraryMovies(library, options) {
   });
   return { movies, exhausted };
 }
-async function resolveVideo(movie, env, fetchImpl) {
-  const code = movieNumber(movie) || movie.id || movie.title;
-  if (!code) {
-    return null;
-  }
-
-  const payload = await resolverJson(
-    `${resolverResolvePath(env)}?code=${encodeURIComponent(code)}&lang=zh`,
-    env,
-    fetchImpl,
-  );
-  const variants = sourceVariants(payload)
+function videoFromResolverPayloads(payloads, movie, code, env) {
+  const variants = mergeResolverVariants(payloads)
     .flatMap((item) => {
       const rawSource = sourceUrlValue(item);
       const sourceUrl = safeMediaUrl(rawSource, env);
@@ -1968,6 +1994,73 @@ async function resolveVideo(movie, env, fetchImpl) {
     ...variant,
     alternates: orderedVariants.slice(1),
   };
+}
+
+function videoFromResolverPayload(payload, movie, code, env) {
+  return videoFromResolverPayloads([payload], movie, code, env);
+}
+
+function resolverVideoUrls(code, env) {
+  const urls = [];
+  const primary = new URL(`${resolverOrigin(env)}${resolverResolvePath(env)}`);
+  primary.searchParams.set("code", code);
+  primary.searchParams.set("lang", "zh");
+  urls.push(primary.toString());
+
+  // 线上主解析器可能临时停用账号；公开静态源仍提供完整多线路结果。
+  const fallback = new URL("/api/v/resolve", upstreamOrigin(env));
+  fallback.searchParams.set("code", code);
+  fallback.searchParams.set("lang", "zh");
+  if (!urls.includes(fallback.toString())) {
+    urls.push(fallback.toString());
+  }
+  return urls;
+}
+
+async function resolveVideo(movie, env, fetchImpl) {
+  const code = movieNumber(movie) || movie.id || movie.title;
+  if (!code) {
+    return null;
+  }
+
+  const loadResolverVideo = async (resolverUrl) => {
+    const payload = await resolverJsonUrl(resolverUrl, env, fetchImpl);
+    const video = videoFromResolverPayload(payload, movie, code, env);
+    return {
+      payload,
+      video,
+      variantCount: video ? 1 + video.alternates.length : 0,
+    };
+  };
+  const resolverUrls = resolverVideoUrls(code, env);
+  if (resolverUrls.length === 1) {
+    return (await loadResolverVideo(resolverUrls[0])).video;
+  }
+
+  // 两个解析端点并发启动。线上主站可能挂起很久，而公开回退源通常很快；
+  // 先等回退源，再给主站一个短暂合并窗口，避免为了多线路把客户端卡住。
+  const primaryPromise = loadResolverVideo(resolverUrls[0])
+    .then((value) => ({ value }), (error) => ({ error }));
+  const fallbackPromise = loadResolverVideo(resolverUrls[1])
+    .then((value) => ({ value }), (error) => ({ error }));
+  const fallback = await fallbackPromise;
+  const primary = fallback.value?.variantCount
+    ? await settledWithin(primaryPromise, 1500)
+    : await primaryPromise;
+  const payloads = [primary, fallback]
+    .map((item) => item.value?.payload)
+    .filter(Boolean);
+  const merged = payloads.length
+    ? videoFromResolverPayloads(payloads, movie, code, env)
+    : null;
+  if (merged) {
+    return merged;
+  }
+  const failure = primary.error || fallback.error;
+  if (failure) {
+    throw failure;
+  }
+  return null;
 }
 
 function subtitleCodec(subtitle) {
@@ -2208,13 +2301,9 @@ async function cachedSubtitleBody(subtitle, env, fetchImpl) {
 
 function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = item.Id) {
   const isHls = /mpegurl|m3u8/i.test(video.sourceType || video.sourceUrl);
-  // ===== 媒体信息 STRM 化（旧逻辑以注释保留，便于恢复）=====
-  // 旧版：容器提示是 HLS / M3U8，客户端媒体信息里会显示 “HLS / M3U8”：
-  //   旧代码：const container = isHls ? "hls" : "mp4";
-  // 新版：统一改成 STRM 提示，让客户端把每条资源当成一个 .strm 远程文件。
-  // 真实播放地址仍是下方 streamExtension 生成的 .m3u8 / .mp4（未改动），播放不受影响。
-  const container = "strm";
-  // 实际播放/下载地址的后缀仍用 .m3u8 / .mp4，保持真实文件类型。
+  // Emby 的 DirectPlay 与设备兼容判断会读取 Container 和 Path。
+  // 普通视频不能伪装成 .strm，否则部分客户端会判为不兼容或只保留第一个源。
+  const container = isHls ? "m3u8" : "mp4";
   const streamExtension = isHls ? "m3u8" : "mp4";
   const mediaSourceId = String(sourceId || item.Id);
   const height = Number(video.quality || 0);
@@ -2236,11 +2325,7 @@ function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = 
     }
     return url;
   };
-  // 真正播放用的地址：后缀仍是 .mp4 / .m3u8，播放器靠它判断文件类型。
   const streamUrl = buildStreamUrl(streamExtension);
-  // 展示用的地址：非 HLS 时后缀改成 .strm，客户端“媒体信息”读这个字段，
-  // 不会再出现 mp4 提示。HLS 保持 .m3u8（本来就没有 mp4 字样，避免影响播放引擎判断）。
-  const displayUrl = buildStreamUrl(isHls ? streamExtension : container);
   const subtitleStreams = subtitles.map((subtitle, index) => {
     const streamIndex = index + 2;
     const deliveryUrl = new URL(
@@ -2274,7 +2359,7 @@ function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = 
   return {
     Id: mediaSourceId,
     Name: String(video.sourceName || video.title || item.Name || "").trim() || item.Name || "",
-    Path: displayUrl.toString(),
+    Path: streamUrl.toString(),
     DirectStreamUrl: `${streamUrl.pathname}${streamUrl.search}`,
     Protocol: "Http",
     Type: "Default",
@@ -2292,23 +2377,39 @@ function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = 
     DefaultAudioStreamIndex: 1,
     DefaultSubtitleStreamIndex: subtitleStreams[0]?.Index,
     MediaStreams: [
-      // Emby 客户端会依据 MediaStreams 判断媒体源是否完整。这里保留最小化的
-      // 视频轨和音频轨结构，但不下发编码/码率等详细媒体信息；容器仍显示 STRM。
       {
         Type: "Video",
+        Codec: "h264",
+        CodecTag: isHls ? undefined : "avc1",
+        DisplayTitle: height > 0 ? `${height}p H264 SDR` : "H264 SDR",
         IsDefault: true,
         IsForced: false,
         IsExternal: false,
         Index: 0,
         Width: width,
         Height: height || undefined,
+        AspectRatio: "16:9",
+        VideoRange: "SDR",
+        VideoRangeType: "SDR",
+        IsInterlaced: false,
+        IsAVC: true,
+        IsAnamorphic: false,
+        TimeBase: "1/10000000",
       },
       {
         Type: "Audio",
+        Codec: "aac",
+        CodecTag: "mp4a",
+        Language: "und",
+        DisplayLanguage: "Undetermined",
+        DisplayTitle: "AAC stereo",
         IsDefault: true,
         IsForced: false,
         IsExternal: false,
         Index: 1,
+        Channels: 2,
+        ChannelLayout: "stereo",
+        SampleRate: 48000,
       },
       ...subtitleStreams,
     ],
@@ -2397,6 +2498,29 @@ function mediaSourcesForVideo(item, requestUrl, token, video, subtitles = []) {
       subtitles,
       mediaSourceIdForIndex(item.Id, index),
     ));
+}
+
+// 解析服务首次冷启动偶尔会超过一分钟。预算内拿不到真实线路时，至少返回
+// 两个稳定的入口编号，避免客户端把缓存里的“加载中”状态固定成单播放源。
+// 媒体源 ID 只由影片 ID 和序号生成，所以解析完成后前两条 ID 不会变化；
+// 真正的多线路结果返回后，后续线路会自然补到列表里。
+function pendingPlaybackVideo(item) {
+  const title = item?.Name || "";
+  const sourceType = "video/mp4";
+  return {
+    title,
+    sourceType,
+    variant: "pending-1",
+    sourceName: "线路 1",
+    alternates: [
+      {
+        title,
+        sourceType,
+        variant: "pending-2",
+        sourceName: "线路 2",
+      },
+    ],
+  };
 }
 
 function authenticationResponse(request, env, user, token) {
@@ -2650,6 +2774,14 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
+function settledWithin(promise, ms) {
+  let timer;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+}
+
 // 带“已完成状态”的包装:整体超时时可以取回已经解析完的那部分结果,
 // 而不是把已经拿到的播放源一起丢掉。
 function trackResolution(promise) {
@@ -2728,14 +2860,13 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
       item.HasSubtitles = false;
       return jsonResponse(item);
     }
-    // 解析超时/未在预算内完成：仍返回一条占位媒体源，保证客户端显示“播放”按钮。
-    // 该占位地址只是入口，真正播放时会由 /PlaybackInfo 与 /Videos/{id}/stream
-    // 重新完整解析出真实播放地址，因此不影响实际播放。
+    // 解析超时/未在预算内完成：返回两个稳定入口，保证客户端不会把这次
+    // “加载中”状态缓存成单播放源。真正播放时会重新解析并映射到真实线路。
     const placeholders = mediaSourcesForVideo(
       item,
       request.url,
       playbackToken,
-      { title: item.Name, sourceType: "video/mp4" },
+      pendingPlaybackVideo(item),
       subtitles,
     );
     const placeholder = placeholders[0];
@@ -4467,6 +4598,47 @@ function fallbackTargetId(path) {
   return candidates.length ? candidates[candidates.length - 1] : "";
 }
 
+function batchDeleteItemIds(url) {
+  const ids = [];
+  for (const [key, value] of url.searchParams.entries()) {
+    if (!/^(?:ids|itemids|itemid)$/i.test(key)) {
+      continue;
+    }
+    const decoded = safeDecodeComponent(value);
+    for (const part of decoded.split(/[,\s]+/)) {
+      const itemId = part.trim();
+      if (itemId) {
+        ids.push(itemId);
+      }
+    }
+  }
+  return [...new Set(ids)];
+}
+
+// Emby 部分客户端不是按单条路径删除，而是批量请求：
+// DELETE /Users/{uid}/Items/Resume?Ids=xxx 或 DELETE /Items?Ids=xxx。
+// 这些路径平时会被列表读取分支接住，所以必须在读取前处理。
+async function handleBatchPlaybackDelete(path, request, env, url) {
+  const method = request.method;
+  const isBatchPath = /^\/Items(?:\/(?:Resume|Delete|Remove))?$/i.test(path);
+  const canDelete = method === "DELETE" || method === "POST" || method === "PUT";
+  if (!isBatchPath || !canDelete) {
+    return null;
+  }
+  const itemIds = batchDeleteItemIds(url);
+  if (!itemIds.length) {
+    return null;
+  }
+
+  const token = getToken(request, url);
+  const state = await readPlaybackState(env, token);
+  for (const itemId of itemIds.slice(0, 200)) {
+    await removePlaybackRecord(env, token, state, itemId);
+  }
+  await writePlaybackState(env, state, token);
+  return noContentResponse();
+}
+
 // 兜底：只要是针对某一个条目的增删改，就当作成功处理，
 // 避免客户端在“移除播放记录 / 继续观看”时报 404。
 async function handleFallbackDelete(path, request, env, url) {
@@ -4630,6 +4802,10 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
   }
 
   const token = getToken(request, url);
+  const batchPlaybackDelete = await handleBatchPlaybackDelete(path, request, env, url);
+  if (batchPlaybackDelete) {
+    return batchPlaybackDelete;
+  }
   if (path === "/Items/Root") {
     return jsonResponse(rootItem(env));
   }
@@ -5200,7 +5376,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
             item,
             request.url,
             playbackToken,
-            { title: item.Name, sourceType: "video/mp4" },
+            pendingPlaybackVideo(item),
             subtitles,
           );
 
