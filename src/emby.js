@@ -65,7 +65,7 @@ const INLINE_HLS_CONTENT_TYPES = new Set([
 // 旧上限会把稍大的备用线路直接过滤掉，客户端就只剩一条播放源。
 const MAX_INLINE_HLS_LENGTH = 12_000_000;
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v8";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v9";
 const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
 const HOME_MAX_SOURCE_PAGES = 40;
@@ -403,6 +403,198 @@ function decodeInlineHls(value) {
   }
 }
 
+// 解析器常把整段 HLS 清单塞进 data URL，完整 JSON 可能超过 700KB。
+// 这里不等整个响应体：从流里一旦扫到完整 variant 对象就记下来，首条线路
+// 到达后再短暂收集同源其余线路，然后主动取消剩余无关响应体。
+function createResolverVariantParser() {
+  let json = "";
+  let keySearchIndex = 0;
+  let arrayStart = -1;
+  let scanIndex = -1;
+  let arrayComplete = false;
+  let inString = false;
+  let escaped = false;
+  let elementStart = -1;
+  let elementDepth = 0;
+  const variants = [];
+
+  const findArrayStart = () => {
+    if (arrayStart >= 0) return;
+    const pattern = /"(?:variants|sources|videos|streams)"\s*:/g;
+    pattern.lastIndex = keySearchIndex;
+    const match = pattern.exec(json);
+    if (!match) {
+      keySearchIndex = Math.max(0, json.length - 32);
+      return;
+    }
+    let index = pattern.lastIndex;
+    while (index < json.length && /\s/.test(json[index])) index += 1;
+    if (json[index] !== "[") {
+      keySearchIndex = pattern.lastIndex;
+      return;
+    }
+    arrayStart = index;
+    scanIndex = index + 1;
+  };
+
+  const scan = () => {
+    findArrayStart();
+    if (arrayStart < 0 || arrayComplete) return;
+    while (scanIndex < json.length) {
+      const char = json[scanIndex];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        scanIndex += 1;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        scanIndex += 1;
+        continue;
+      }
+      if (elementStart < 0) {
+        if (char === "]") {
+          arrayComplete = true;
+          const text = json.slice(arrayStart, scanIndex + 1);
+          try {
+            const complete = JSON.parse(text);
+            if (Array.isArray(complete)) {
+              variants.splice(0, variants.length, ...complete);
+            }
+          } catch {
+            // 已经收集到的对象仍可用。
+          }
+          break;
+        }
+        if (char === "{" || char === "[" || char === '"') {
+          if (char === "{") {
+            elementStart = scanIndex;
+            elementDepth = 1;
+          }
+        }
+      } else if (char === "{" || char === "[") {
+        elementDepth += 1;
+      } else if (char === "}" || char === "]") {
+        elementDepth -= 1;
+        if (elementDepth === 0) {
+          try {
+            variants.push(JSON.parse(json.slice(elementStart, scanIndex + 1)));
+          } catch {
+            // 半截或非对象元素直接跳过。
+          }
+          elementStart = -1;
+        }
+      }
+      scanIndex += 1;
+    }
+  };
+
+  return {
+    push(fragment) {
+      if (!fragment) return;
+      json += fragment;
+      scan();
+    },
+    variants() {
+      return variants.slice();
+    },
+    complete() {
+      return arrayComplete;
+    },
+    payload() {
+      if (variants.length) {
+        return { variants: variants.slice() };
+      }
+      try {
+        return JSON.parse(json);
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+async function readResolverJsonResponse(response, options = {}) {
+  const timeoutMs = Math.max(1, Number(options.timeoutMs) || RESOLVER_FETCH_TIMEOUT_MS);
+  const graceMs = Math.max(0, Number(options.graceMs) || RESOLVER_VARIANT_GRACE_MS);
+  const timeoutAt = Date.now() + timeoutMs;
+  const readWithDeadline = async (reader, deadline) => {
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now()));
+    });
+    try {
+      return await Promise.race([reader.read(), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const text = await withTimeout(response.text(), timeoutMs);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`Resolver returned non-JSON (${response.status})`);
+    }
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const parser = createResolverVariantParser();
+  let firstVariantAt = 0;
+  let graceDeadline = 0;
+
+  try {
+    while (Date.now() < timeoutAt) {
+      const deadline = graceDeadline || timeoutAt;
+      const chunk = await readWithDeadline(reader, deadline);
+      if (!chunk) {
+        if (parser.variants().length) {
+          return parser.payload();
+        }
+        throw new Error("Resolver response timed out");
+      }
+      if (chunk.done) {
+        parser.push(decoder.decode());
+        const payload = parser.payload();
+        if (payload) return payload;
+        throw new Error(`Resolver returned non-JSON (${response.status})`);
+      }
+      parser.push(decoder.decode(chunk.value, { stream: true }));
+      if (parser.variants().length) {
+        if (!firstVariantAt) {
+          firstVariantAt = Date.now();
+        }
+        // 每个新 chunk 都刷新空闲截止时间；持续传输不会因为总时长被误砍。
+        graceDeadline = Date.now() + graceMs;
+      }
+      if (parser.complete()) {
+        return parser.payload();
+      }
+      if (graceDeadline && Date.now() >= graceDeadline) {
+        return parser.payload();
+      }
+    }
+    if (parser.variants().length) {
+      return parser.payload();
+    }
+    throw new Error("Resolver response timed out");
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // 响应体可能已经被上游结束；取消失败不影响已解析的线路。
+    }
+  }
+}
+
 function getToken(request, url) {
   const queryToken =
     url.searchParams.get("api_key") ||
@@ -561,9 +753,17 @@ function virtualUser(env = {}, name = "JAVDB Guest", hasPassword = false) {
 // 是长连接，不走这里，避免中途被超时打断。
 const FETCH_TIMEOUT_MS = 10000;
 const FETCH_MAX_ATTEMPTS = 2;
-// 播放源解析接口是第三方现场抓取：新片子第一次通常要 10 秒左右，比普通接口慢很多。
-// 单独放宽它的超时，避免刚好在 10 秒被掐断、白白重新来一遍。
-const RESOLVER_FETCH_TIMEOUT_MS = 25000;
+// 播放源解析接口是第三方现场抓取：响应头有时很快，但 700KB 左右的 JSON
+// 会慢慢挤牙膏。整个请求（包括响应体读取）必须控制在客户端等待预算内，
+// 否则 PlaybackInfo 会因为一个解析源而超时。
+const RESOLVER_FETCH_TIMEOUT_MS = 12000;
+// variants 数组里第一条线路完整到达后，按“空闲时间”收集同源的其他线路：
+// 只要响应体还在持续到达就继续读，连续这么久没有新数据才结束。
+// 固定从首条起算会把 700KB 响应后半段的线路提前截掉。
+const RESOLVER_VARIANT_GRACE_MS = 1800;
+// 主源和回退源并发返回；第一条有效结果到达后，再给另一条最多这么久合并。
+// 回退源的完整 4 条线路常在 2.5-4.5 秒内到达，窗口过短会只剩单条线路。
+const RESOLVER_SECONDARY_MERGE_MS = 4500;
 
 async function fetchWithTimeout(fetchImpl, url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -880,22 +1080,26 @@ async function upstreamJson(path, env, fetchImpl) {
 }
 
 async function resolverJsonUrl(url, env, fetchImpl) {
-  const response = await fetchWithRetry(fetchImpl, String(url), {
-    headers: { accept: "application/json" },
-    redirect: "follow",
-  }, RESOLVER_FETCH_TIMEOUT_MS);
-  const text = await response.text();
-  let payload;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RESOLVER_FETCH_TIMEOUT_MS);
   try {
-    payload = JSON.parse(text);
-  } catch {
-    throw new Error(`Resolver returned non-JSON (${response.status})`);
+    const response = await fetchImpl(String(url), {
+      headers: { accept: "application/json" },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    const payload = await readResolverJsonResponse(response, {
+      timeoutMs: RESOLVER_FETCH_TIMEOUT_MS,
+      graceMs: RESOLVER_VARIANT_GRACE_MS,
+    });
+    if (!response.ok) {
+      const detail = payload.code ? ` [code=${payload.code}]` : "";
+      throw new Error(`${payload.message || payload.error || `Resolver HTTP ${response.status}`}${detail}`);
+    }
+    return payload;
+  } finally {
+    clearTimeout(timer);
   }
-  if (!response.ok) {
-    const detail = payload.code ? ` [code=${payload.code}]` : "";
-    throw new Error(`${payload.message || payload.error || `Resolver HTTP ${response.status}`}${detail}`);
-  }
-  return payload;
 }
 
 async function resolverJson(path, env, fetchImpl) {
@@ -920,6 +1124,37 @@ function hasChineseSubtitles(movie) {
 
 function isPlayableChinese(movie) {
   return Boolean(movie?.can_play) && hasChineseSubtitles(movie);
+}
+
+function exactSearchCode(searchTerm) {
+  return movieNumberFromText(String(searchTerm || "").trim());
+}
+
+function movieMatchesExactSearch(movie, code) {
+  if (!code || !movie?.can_play) return false;
+  return movieNumberFromText(movieNumber(movie)) === code;
+}
+
+function sourceFilterForSearch(library, code) {
+  // 上游的 subtitle 过滤会把 RCTD-740 错当成 RCTD-340；精确番号搜索
+  // 改用 can_play，再在本地按完整番号校正。
+  return code ? "can_play" : library.sourceFilter;
+}
+
+function prioritizeExactSearchResults(movies, code) {
+  if (!code || !Array.isArray(movies) || movies.length < 2) {
+    return movies;
+  }
+  const exact = [];
+  const rest = [];
+  for (const movie of movies) {
+    if (movieMatchesExactSearch(movie, code)) {
+      exact.push(movie);
+    } else {
+      rest.push(movie);
+    }
+  }
+  return exact.length ? exact.concat(rest) : movies;
 }
 
 function bytesStartWith(bytes, signature, offset = 0) {
@@ -1521,7 +1756,7 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
 
   // 同一页数据短时间内直接复用：客户端返回再进、翻页回退、重复请求都不再回源。
   const cacheKey = [
-    "movie-page-v1",
+    "movie-page-v2",
     apiOrigin(env),
     upstreamToken ? "u" : "g",
     library.id,
@@ -1574,11 +1809,15 @@ async function loadMovieCatalogPage(options) {
     upstreamToken,
   } = options;
 
+  const exactCode = exactSearchCode(searchTerm);
+  const sourceFilter = sourceFilterForSearch(library, exactCode);
   const matchingMovies = [];
   const seen = new Set();
   const collect = (movies) => {
     for (const movie of movies) {
-      if (!library.matches(movie)) continue;
+      if (!library.matches(movie) && !movieMatchesExactSearch(movie, exactCode)) {
+        continue;
+      }
       const key = String(movie.id ?? movie.number ?? "");
       if (key && !seen.has(key)) {
         seen.add(key);
@@ -1592,13 +1831,15 @@ async function loadMovieCatalogPage(options) {
       maxPages: SEARCH_MAX_SOURCE_PAGES,
       pageSize: SEARCH_SOURCE_PAGE_SIZE,
       needAll: needsFullCatalog,
-      enough: () => matchingMovies.length >= requiredCount,
+      enough: () => exactCode
+        ? matchingMovies.some((movie) => movieMatchesExactSearch(movie, exactCode))
+        : matchingMovies.length >= requiredCount,
       fetchPage: (page) => javdbRequest("/v2/search", env, fetchImpl, {
         query: {
           q: searchTerm,
           page,
           type: "movie",
-          movie_filter_by: library.sourceFilter,
+          movie_filter_by: sourceFilter,
           limit: SEARCH_SOURCE_PAGE_SIZE,
         },
         token: upstreamToken,
@@ -1622,9 +1863,10 @@ async function loadMovieCatalogPage(options) {
       collect,
     });
 
-  const orderedMovies = needsFullCatalog
+  const sortedMovies = needsFullCatalog
     ? sortMoviesForClient(matchingMovies, sortComparators, sortOrder)
     : matchingMovies;
+  const orderedMovies = prioritizeExactSearchResults(sortedMovies, exactCode);
   return {
     movies: orderedMovies.slice(startIndex, requiredCount),
     // 已翻到末尾时用真实数量；否则略多报，让客户端能继续往下翻页
@@ -1918,19 +2160,24 @@ async function scanLibraryMovies(library, options) {
   } = options;
   const movies = [];
   const seen = new Set();
-  const byKeyword = Boolean(String(searchTerm || "").trim());
+  const keyword = String(searchTerm || "").trim();
+  const byKeyword = Boolean(keyword);
+  const exactCode = exactSearchCode(keyword);
+  const sourceFilter = sourceFilterForSearch(library, exactCode);
   const exhausted = await fetchPagesInParallel({
     maxPages: byKeyword ? SEARCH_MAX_SOURCE_PAGES : HOME_MAX_SOURCE_PAGES,
     pageSize: byKeyword ? SEARCH_SOURCE_PAGE_SIZE : HOME_SOURCE_PAGE_SIZE,
     needAll,
-    enough: () => alreadyCount + movies.length >= requiredCount,
+    enough: () => exactCode
+      ? movies.some((movie) => movieMatchesExactSearch(movie, exactCode))
+      : alreadyCount + movies.length >= requiredCount,
     fetchPage: (page) => (byKeyword
       ? javdbRequest("/v2/search", env, fetchImpl, {
         query: {
-          q: searchTerm,
+          q: keyword,
           page,
           type: "movie",
-          movie_filter_by: library.sourceFilter,
+          movie_filter_by: sourceFilter,
           limit: SEARCH_SOURCE_PAGE_SIZE,
         },
         token: upstreamToken,
@@ -1947,7 +2194,9 @@ async function scanLibraryMovies(library, options) {
     ).then(moviesFromPayload),
     collect: (pageMovies) => {
       for (const movie of pageMovies) {
-        if (!library.matches(movie)) continue;
+        if (!library.matches(movie) && !movieMatchesExactSearch(movie, exactCode)) {
+          continue;
+        }
         const key = String(movie.id ?? movie.number ?? "");
         if (key && !seen.has(key)) {
           seen.add(key);
@@ -1956,7 +2205,10 @@ async function scanLibraryMovies(library, options) {
       }
     },
   });
-  return { movies, exhausted };
+  return {
+    movies: prioritizeExactSearchResults(movies, exactCode),
+    exhausted,
+  };
 }
 function videoFromResolverPayloads(payloads, movie, code, env) {
   const variants = mergeResolverVariants(payloads)
@@ -2039,18 +2291,47 @@ async function resolveVideo(movie, env, fetchImpl) {
     return (await loadResolverVideo(resolverUrls[0])).video;
   }
 
-  // 两个解析端点并发启动。线上主站可能挂起很久，而公开回退源通常很快；
-  // 先等回退源，再给主站一个短暂合并窗口，避免为了多线路把客户端卡住。
-  const primaryPromise = loadResolverVideo(resolverUrls[0])
+  // 两个解析端点并发启动，等第一条有效结果，而不是固定先等回退源。
+  // 主站挂起时回退源可以立即启动；主站有单条线路时，也保留一个短暂
+  // 合并窗口等待回退源补齐其余线路。
+  const primarySettled = loadResolverVideo(resolverUrls[0])
     .then((value) => ({ value }), (error) => ({ error }));
-  const fallbackPromise = loadResolverVideo(resolverUrls[1])
+  const fallbackSettled = loadResolverVideo(resolverUrls[1])
     .then((value) => ({ value }), (error) => ({ error }));
-  const fallback = await fallbackPromise;
-  const primary = fallback.value?.variantCount
-    ? await settledWithin(primaryPromise, 1500)
-    : await primaryPromise;
+  const settledEntries = [
+    { name: "primary", promise: primarySettled },
+    { name: "fallback", promise: fallbackSettled },
+  ];
+  const firstValid = await new Promise((resolve) => {
+    let remaining = settledEntries.length;
+    let resolved = false;
+    settledEntries.forEach((entry) => {
+      entry.promise.then((settled) => {
+        remaining -= 1;
+        if (!resolved && settled.value?.variantCount) {
+          resolved = true;
+          resolve({ name: entry.name, settled });
+          return;
+        }
+        if (!resolved && remaining === 0) {
+          resolved = true;
+          resolve(null);
+        }
+      });
+    });
+  });
+  const primary = firstValid?.name === "primary"
+    ? firstValid.settled
+    : firstValid
+      ? await settledWithin(primarySettled, RESOLVER_SECONDARY_MERGE_MS)
+      : await primarySettled;
+  const fallback = firstValid?.name === "fallback"
+    ? firstValid.settled
+    : firstValid
+      ? await settledWithin(fallbackSettled, RESOLVER_SECONDARY_MERGE_MS)
+      : await fallbackSettled;
   const payloads = [primary, fallback]
-    .map((item) => item.value?.payload)
+    .map((item) => item?.value?.payload)
     .filter(Boolean);
   const merged = payloads.length
     ? videoFromResolverPayloads(payloads, movie, code, env)
@@ -4479,6 +4760,13 @@ async function applyItemUserDataAction(itemId, action, request, env, token) {
   if (method === "DELETE" && (action === "playingitems" || action === "userdata")) {
     // 结束播放 / 移除续播记录：整条删掉，条目立刻从“继续观看”消失；
     // 同时立墓碑（单独存储），抑制客户端随后补发的残留上报。
+    await removePlaybackRecord(env, token, state, itemId);
+    await writePlaybackState(env, state, token);
+    return userDataForRecord(undefined);
+  }
+  if (action === "playeditems" && method === "DELETE") {
+    // “标记未播放 / 删除观看记录”也必须走墓碑，否则客户端刷新后迟到的
+    // 进度上报会立刻把记录重新创建出来。
     await removePlaybackRecord(env, token, state, itemId);
     await writePlaybackState(env, state, token);
     return userDataForRecord(undefined);
