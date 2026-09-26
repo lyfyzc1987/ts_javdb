@@ -65,11 +65,13 @@ const INLINE_HLS_CONTENT_TYPES = new Set([
 // 旧上限会把稍大的备用线路直接过滤掉，客户端就只剩一条播放源。
 const MAX_INLINE_HLS_LENGTH = 12_000_000;
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v7";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v8";
 const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
 const HOME_MAX_SOURCE_PAGES = 40;
-const SEARCH_SOURCE_PAGE_SIZE = 50;
+// 上游 /v2/search 无论 limit 传多少都固定返回 20 条；按 50 判断末页会把
+// 第一页误判成最后一页，导致后页资源搜不到。
+const SEARCH_SOURCE_PAGE_SIZE = 20;
 const SEARCH_MAX_SOURCE_PAGES = 40;
 const IMAGE_CONTENT_TYPES = new Map([
   [".avif", "image/avif"],
@@ -561,7 +563,7 @@ const FETCH_TIMEOUT_MS = 10000;
 const FETCH_MAX_ATTEMPTS = 2;
 // 播放源解析接口是第三方现场抓取：新片子第一次通常要 10 秒左右，比普通接口慢很多。
 // 单独放宽它的超时，避免刚好在 10 秒被掐断、白白重新来一遍。
-const RESOLVER_FETCH_TIMEOUT_MS = 15000;
+const RESOLVER_FETCH_TIMEOUT_MS = 25000;
 
 async function fetchWithTimeout(fetchImpl, url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -2500,29 +2502,6 @@ function mediaSourcesForVideo(item, requestUrl, token, video, subtitles = []) {
     ));
 }
 
-// 解析服务首次冷启动偶尔会超过一分钟。预算内拿不到真实线路时，至少返回
-// 两个稳定的入口编号，避免客户端把缓存里的“加载中”状态固定成单播放源。
-// 媒体源 ID 只由影片 ID 和序号生成，所以解析完成后前两条 ID 不会变化；
-// 真正的多线路结果返回后，后续线路会自然补到列表里。
-function pendingPlaybackVideo(item) {
-  const title = item?.Name || "";
-  const sourceType = "video/mp4";
-  return {
-    title,
-    sourceType,
-    variant: "pending-1",
-    sourceName: "线路 1",
-    alternates: [
-      {
-        title,
-        sourceType,
-        variant: "pending-2",
-        sourceName: "线路 2",
-      },
-    ],
-  };
-}
-
 function authenticationResponse(request, env, user, token) {
   const sessionId = crypto.randomUUID();
   return jsonResponse({
@@ -2711,13 +2690,10 @@ function virtualFolder(library) {
   };
 }
 
-// 详情页“顺带解析播放源”的预算：超过就先返回元数据（真正播放时再完整解析）。
-// 这份预算只约束播放源解析本身——字幕不再计入（见 itemResponse），
-// 否则字幕稍慢就会把已经解析好的播放源一起丢掉，客户端详情页只能看到一条占位源。
-const ITEM_DETAIL_RESOLVE_BUDGET_MS = 6000;
-// 起播(/PlaybackInfo)时客户端马上就要播放,字幕流必须跟着这次响应一起下发,
-// 否则会出现“视频已经播了、字幕还在加载”。这里比详情页多给一点时间。
-const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 8000;
+// 真实解析器首次抓取通常需要十几秒。预算过短会在解析完成前返回，
+// 客户端只能看到空列表或反复加载；这里给完整解析留出足够时间。
+const ITEM_DETAIL_RESOLVE_BUDGET_MS = 20000;
+const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 20000;
 
 // 后台预热:不阻塞当前响应,把播放源与字幕列表解析完写进缓存,
 // 下次(真正点播放时)直接命中,起播和字幕出现都更快。
@@ -2860,21 +2836,13 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
       item.HasSubtitles = false;
       return jsonResponse(item);
     }
-    // 解析超时/未在预算内完成：返回两个稳定入口，保证客户端不会把这次
-    // “加载中”状态缓存成单播放源。真正播放时会重新解析并映射到真实线路。
-    const placeholders = mediaSourcesForVideo(
-      item,
-      request.url,
-      playbackToken,
-      pendingPlaybackVideo(item),
-      subtitles,
-    );
-    const placeholder = placeholders[0];
-    item.Path = placeholder.Path;
-    item.MediaSources = placeholders;
-    item.MediaStreams = placeholder.MediaStreams;
-    item.MediaSourceCount = placeholders.length;
-    item.Container = placeholder.Container;
+    // 解析未在预算内完成：不要返回没有真实地址的占位线路，否则客户端会
+    // 选中假源并一直加载。后台解析完成后，下一次详情/起播请求会命中缓存。
+    item.PlayAccess = "None";
+    item.MediaSources = [];
+    item.MediaStreams = [];
+    item.MediaSourceCount = 0;
+    item.Container = undefined;
     item.HasSubtitles = subtitles.length > 0;
     return jsonResponse(item);
   }
@@ -5339,8 +5307,8 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
       const movie = await getMovieCached(decodeURIComponent(playbackMatch[1]), env, fetchImpl, token);
       const item = mapMovie(movie, request.url, env);
       const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
-      // 与详情页一致：给解析一小段预算时间，超时就先返回占位媒体源，让客户端马上能起播
-      // （真正播放时由 /Videos/{id}/stream 再做完整解析；后台解析完成后会写进缓存）。
+      // 与详情页一致：给真实解析留出足够预算，超时则返回空列表并继续后台解析，
+      // 不再返回无地址的假线路。
       const videoResolution = trackResolution(resolveVideoCached(movie, env, fetchImpl));
       const subtitleResolution = trackResolution(
         resolveSubtitlesCached(movie, env, fetchImpl).catch(() => []),
@@ -5370,15 +5338,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
 
       const mediaSources = video
         ? mediaSourcesForVideo(item, request.url, playbackToken, video, subtitles)
-        : resolutionFinished
-          ? []
-          : mediaSourcesForVideo(
-            item,
-            request.url,
-            playbackToken,
-            pendingPlaybackVideo(item),
-            subtitles,
-          );
+        : [];
 
       const playSessionId = crypto.randomUUID();
       // 记住这次播放用的会话号:之后“移除播放记录”才能认出哪些上报是残留。
