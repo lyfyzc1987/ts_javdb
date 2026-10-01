@@ -12,6 +12,7 @@ const env = {
   JAVDB_API_ORIGIN:
     process.env.JAVDB_API_ORIGIN || "https://jdforrepam.com/api",
   EMBY_SERVER_ID: process.env.EMBY_SERVER_ID || "bbjavdb-emby",
+  EMBY_SERVER_VERSION: process.env.EMBY_SERVER_VERSION || "4.8.0.0",
   EMBY_GUEST_ACCESS: process.env.EMBY_GUEST_ACCESS || "true",
   EMBY_GUEST_TOKEN: process.env.EMBY_GUEST_TOKEN || "bbjavdb-guest",
   EXTRA_MEDIA_HOSTS: process.env.EXTRA_MEDIA_HOSTS || "",

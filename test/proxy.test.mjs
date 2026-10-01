@@ -1,16 +1,145 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
 
 import {
   applyReplicaOverrides,
   handleProxy,
   isAllowedMediaHost,
+  resolverPayloadHasUsableSource,
   resolveUpstreamTarget,
   rewriteText,
 } from "../src/proxy.js";
-import { createJavdbSignature } from "../src/emby.js";
+import {
+  createJavdbSignature,
+  resetEmbyCachesForTests,
+} from "../src/emby.js";
 
 const UPSTREAM = "https://catembylegacy.fastcdn.dpdns.org";
+const RESOLVER = "https://catembylegacy.fastcdn.dpdns.org";
+const RESOLVER_REGRESSION_DELAY_MS = 1900;
+
+test("recognizes upstream-relative resolver sources as usable", () => {
+  const env = { UPSTREAM_ORIGIN: UPSTREAM };
+
+  assert.equal(
+    resolverPayloadHasUsableSource({
+      variants: [{ variant: "original", sourceUrl: "/video/fresh.mp4" }],
+    }, env),
+    true,
+  );
+  assert.equal(
+    resolverPayloadHasUsableSource({
+      variants: [{ variant: "original", sourceUrl: `${UPSTREAM}/video/fresh.mp4` }],
+    }, env),
+    true,
+  );
+  assert.equal(
+    resolverPayloadHasUsableSource({
+      variants: [{
+        variant: "pseudo",
+        sourceUrl: "data:application/vnd.apple.mpegurl,%23EXTM3U",
+      }],
+    }, env),
+    false,
+  );
+  assert.equal(
+    resolverPayloadHasUsableSource({
+      variants: [{
+        variant: "untrusted",
+        sourceUrl: "https://cdn-a.example/stream/index.m3u8",
+      }],
+    }, env),
+    false,
+  );
+});
+
+function delayedResolverResponse(delayMs = RESOLVER_REGRESSION_DELAY_MS) {
+  const fakePlaylist = [
+    "#EXTM3U",
+    "#EXTINF:1,",
+    "https://lh3.googleusercontent.com/not-a-video.jpg",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const fakeSource = `data:application/vnd.apple.mpegurl,${encodeURIComponent(fakePlaylist)}`;
+  const earlyVariants = [
+    { variant: "fcjav_original", sourceUrl: fakeSource, sourceType: "application/vnd.apple.mpegurl" },
+    { variant: "fcjav_reducing_mosaic", sourceUrl: fakeSource, sourceType: "application/vnd.apple.mpegurl" },
+    { variant: "javgg_original", sourceUrl: fakeSource, sourceType: "application/vnd.apple.mpegurl" },
+    { variant: "javgg_reducing_mosaic", sourceUrl: fakeSource, sourceType: "application/vnd.apple.mpegurl" },
+  ];
+  const lateVariants = [
+    {
+      variant: "getav_raw_4k",
+      sourceUrl: "https://fast-stream.jav.si/video/rctd-740-4k.mp4",
+      sourceType: "video/mp4",
+      quality: 2160,
+    },
+    {
+      variant: "getav_raw_1080p",
+      sourceUrl: "https://fast-stream.jav.si/video/rctd-740-1080p.mp4",
+      sourceType: "video/mp4",
+      quality: 1080,
+    },
+  ];
+  const fragments = [
+    `{"variants":[${earlyVariants.map(JSON.stringify).join(",")}`,
+    `,${lateVariants.map(JSON.stringify).join(",")}]}`,
+  ];
+  const encoder = new TextEncoder();
+  let index = 0;
+  return new Response(new ReadableStream({
+    async pull(controller) {
+      if (index >= fragments.length) {
+        controller.close();
+        return;
+      }
+      const fragment = fragments[index];
+      index += 1;
+      if (index > 1 && delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      controller.enqueue(encoder.encode(fragment));
+    },
+  }), {
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function encryptAes128Cbc(plaintext, keyBytes, iv) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "AES-CBC" },
+    false,
+    ["encrypt"],
+  );
+  return new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-CBC", iv },
+    key,
+    plaintext,
+  ));
+}
+
+beforeEach(() => {
+  resetEmbyCachesForTests();
+});
+
+function embyJsonRequest(path, body, method = "POST") {
+  const init = {
+    method,
+    headers: { "content-type": "application/json" },
+  };
+  if (body !== undefined) {
+    init.body = JSON.stringify(body);
+  }
+  return new Request(`https://clone.example/emby${path}`, init);
+}
+
+function callLocalEmby(request, env = {}) {
+  return handleProxy(request, env, {}, async () => {
+    throw new Error("fetch must not be called");
+  });
+}
 
 test("maps application routes to the source site", () => {
   const target = resolveUpstreamTarget(
@@ -64,7 +193,7 @@ test("renames the visible site brand", () => {
   const source = 'children:"catemby\u9057\u4ea7"';
   const result = applyReplicaOverrides(source);
 
-  assert.equal(result, 'children:"\u6b65\u5175JAVDB"');
+  assert.equal(result, 'children:"月影emby"');
   assert.doesNotMatch(result, /catemby/);
 });
 
@@ -317,6 +446,163 @@ test("can disable passwordless Emby guest access", async () => {
   assert.equal(response.status, 401);
 });
 
+test("advertises the configured Emby server version", async () => {
+  const response = await callLocalEmby(
+    new Request("https://clone.example/emby/System/Info/Public"),
+    { EMBY_SERVER_VERSION: "4.11.0.4" },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).Version, "4.11.0.4");
+});
+
+test("accepts the official POST PlayedItems Delete form and returns UserData", async () => {
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-old",
+    PositionTicks: 120_000_000,
+  }));
+
+  const response = await callLocalEmby(embyJsonRequest(
+    "/Users/bbjavdb-user/PlayedItems/42/Delete",
+  ));
+  const userData = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(userData.Played, false);
+  assert.equal(userData.PlaybackPositionTicks, 0);
+
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
+});
+
+test("accepts DELETE PlayedItems and returns UserData JSON", async () => {
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-old",
+    PositionTicks: 120_000_000,
+  }));
+
+  const response = await callLocalEmby(embyJsonRequest(
+    "/Users/bbjavdb-user/PlayedItems/42",
+    undefined,
+    "DELETE",
+  ));
+  const userData = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(userData.Played, false);
+  assert.equal(userData.PlaybackPositionTicks, 0);
+});
+
+test("accepts the official POST FavoriteItems Delete form", async () => {
+  await callLocalEmby(embyJsonRequest("/Users/bbjavdb-user/FavoriteItems/42"));
+  const response = await callLocalEmby(embyJsonRequest(
+    "/Users/bbjavdb-user/FavoriteItems/42/Delete",
+  ));
+  const userData = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(userData.IsFavorite, false);
+});
+
+test("HideFromResume true removes the record and false clears the tombstone", async () => {
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-old",
+    PositionTicks: 120_000_000,
+  }));
+
+  const hidden = await callLocalEmby(embyJsonRequest(
+    "/Users/bbjavdb-user/Items/42/HideFromResume?Hide=true",
+  ));
+  assert.equal((await hidden.json()).PlaybackPositionTicks, 0);
+
+  const shown = await callLocalEmby(embyJsonRequest(
+    "/Users/bbjavdb-user/Items/42/HideFromResume?Hide=false",
+  ));
+  assert.equal((await shown.json()).PlaybackPositionTicks, 0);
+
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing/Progress", {
+    ItemId: "42",
+    PlaySessionId: "session-new",
+    PositionTicks: 10_000_000,
+  }));
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 10_000_000);
+});
+
+test("does not resurrect a deleted record from late playback progress", async () => {
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-old",
+    PositionTicks: 120_000_000,
+  }));
+  await callLocalEmby(embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"));
+
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing/Progress", {
+    ItemId: "42",
+    PlaySessionId: "session-old",
+    PositionTicks: 120_000_000,
+  }));
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
+});
+
+test("does not resurrect a batch-deleted record from late playback progress", async () => {
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-batch-old",
+    PositionTicks: 120_000_000,
+  }));
+
+  const deleted = await callLocalEmby(
+    new Request("https://clone.example/emby/Items?Ids=42", {
+      method: "DELETE",
+    }),
+  );
+  assert.equal(deleted.status, 204);
+
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing/Progress", {
+    ItemId: "42",
+    PlaySessionId: "session-batch-old",
+    PositionTicks: 120_000_000,
+  }));
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
+});
+
+test("allows a strict zero-progress restart to clear the deleted tombstone", async () => {
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-old",
+    PositionTicks: 120_000_000,
+  }));
+  await callLocalEmby(embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"));
+
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-new",
+    PositionTicks: 0,
+  }));
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing/Progress", {
+    ItemId: "42",
+    PlaySessionId: "session-new",
+    PositionTicks: 5_000_000,
+  }));
+
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 5_000_000);
+});
+
 test("maps JavDB movies into an Emby item list", async () => {
   const response = await handleProxy(
     new Request("https://clone.example/Items?ParentId=bbjavdb-root&Limit=10"),
@@ -361,12 +647,59 @@ test("maps JavDB movies into an Emby item list", async () => {
   const payload = await response.json();
   assert.equal(response.status, 200);
   assert.equal(payload.Items[0].Id, "42");
-  assert.equal(payload.Items[0].Name, "Test Movie");
+  assert.equal(payload.Items[0].Name, "TEST-001 Test Movie");
   assert.equal(payload.Items[0].Type, "Movie");
   assert.equal(payload.Items[0].ServerId, "bbjavdb-emby");
   assert.equal(payload.Items[0].ParentId, "bbjavdb-root");
   assert.equal(payload.Items.length, 1);
-  assert.deepEqual(payload.Items[0].Genres, ["可播放", "中文字幕", "Drama"]);
+  assert.deepEqual(payload.Items[0].Genres, ["中文字幕", "Drama"]);
+});
+
+test("supports both SearchHints aliases used by Emby clients", async () => {
+  const movies = [
+    {
+      id: "NQ7Mdg",
+      number: "RCTD-740",
+      title: "Exact result",
+      can_play: true,
+      has_cnsub: true,
+    },
+    {
+      id: "rzKDJ",
+      number: "RCTD-740",
+      title: "Backup result",
+      can_play: true,
+      has_cnsub: true,
+    },
+  ];
+
+  for (const path of ["/SearchHints", "/Search/Hints"]) {
+    const response = await handleProxy(
+      new Request(
+        `https://clone.example/emby${path}?SearchTerm=RCTD-740&Limit=20`,
+      ),
+      {},
+      {},
+      async (url) => {
+        assert.match(url, /\/v2\/search\?/);
+        assert.match(url, /q=RCTD-740/);
+        assert.match(url, /movie_filter_by=can_play/);
+        return new Response(
+          JSON.stringify({ success: 1, data: { movies } }),
+          { headers: { "content-type": "application/json" } },
+        );
+      },
+    );
+
+    const payload = await response.json();
+    assert.equal(response.status, 200, path);
+    assert.deepEqual(
+      payload.SearchHints.map((item) => item.ItemId),
+      ["NQ7Mdg", "rzKDJ"],
+      path,
+    );
+    assert.equal(payload.SearchHints[0].Name, "RCTD-740 Exact result", path);
+  }
 });
 
 test("forwards Emby access tokens to JavDB catalog requests", async () => {
@@ -388,7 +721,7 @@ test("forwards Emby access tokens to JavDB catalog requests", async () => {
   );
 
   assert.equal(response.status, 200);
-  assert.equal(authorization, "javdb-token");
+  assert.equal(authorization, null);
 });
 
 test("maps the playable media library to the playable JavDB filter", async () => {
@@ -410,6 +743,7 @@ test("maps the playable media library to the playable JavDB filter", async () =>
               title: "Playable without subtitles",
               can_play: true,
               has_cnsub: false,
+              tags: [{ name: "Drama" }],
             }],
           },
         }),
@@ -420,8 +754,8 @@ test("maps the playable media library to the playable JavDB filter", async () =>
 
   const payload = await response.json();
   assert.equal(payload.Items.length, 1);
-  assert.equal(payload.Items[0].ParentId, "bbjavdb-playable");
-  assert.deepEqual(payload.Items[0].Genres, ["可播放"]);
+  assert.equal(payload.Items[0].ParentId, "bbjavdb-chinese-playable");
+  assert.deepEqual(payload.Items[0].Genres, ["Drama"]);
 });
 
 test("supports an Emby-prefixed server probe", async () => {
@@ -466,7 +800,7 @@ test("maps the user-scoped latest route into an Emby item array", async () => {
   const payload = await response.json();
   assert.equal(response.status, 200);
   assert.equal(Array.isArray(payload), true);
-  assert.equal(payload[0].Name, "Latest Movie");
+  assert.equal(payload[0].Name, "TEST-001 Latest Movie");
   assert.equal(payload[0].ParentId, "bbjavdb-chinese-playable");
   assert.equal("Path" in payload[0], false);
 });
@@ -569,18 +903,20 @@ test("advertises a non-empty virtual movie library", async () => {
 
   const viewsPayload = await views.json();
   const countsPayload = await counts.json();
-  assert.equal(viewsPayload.Items[0].ChildCount, 32);
-  assert.equal(viewsPayload.TotalRecordCount, 2);
+  assert.equal(viewsPayload.Items[0].ChildCount, 1000);
+  assert.equal(viewsPayload.TotalRecordCount, 4);
   assert.equal(viewsPayload.StartIndex, 0);
   assert.deepEqual(
     viewsPayload.Items.map((item) => [item.Id, item.Name]),
     [
-      ["bbjavdb-playable", "可播放"],
-      ["bbjavdb-chinese-playable", "中文可播放"],
+      ["bbjavdb-chinese-playable", "中文字幕"],
+      ["bbjavdb-censored", "有码"],
+      ["bbjavdb-uncensored", "无码"],
+      ["bbjavdb-western", "欧美"],
     ],
   );
-  assert.equal(countsPayload.MovieCount, 32);
-  assert.equal(countsPayload.ItemCount, 32);
+  assert.equal(countsPayload.MovieCount, 1000);
+  assert.equal(countsPayload.ItemCount, 1000);
 });
 
 test("returns Emby-compatible media folder and virtual folder queries", async () => {
@@ -603,11 +939,11 @@ test("returns Emby-compatible media folder and virtual folder queries", async ()
 
   const mediaPayload = await mediaFolders.json();
   const virtualPayload = await virtualFolders.json();
-  assert.equal(mediaPayload.TotalRecordCount, 2);
-  assert.equal(mediaPayload.Items[0].Id, "bbjavdb-playable");
+  assert.equal(mediaPayload.TotalRecordCount, 4);
+  assert.equal(mediaPayload.Items[0].Id, "bbjavdb-chinese-playable");
   assert.equal(mediaPayload.Items[0].Type, "CollectionFolder");
-  assert.equal(virtualPayload.TotalRecordCount, 2);
-  assert.equal(virtualPayload.Items[0].ItemId, "bbjavdb-playable");
+  assert.equal(virtualPayload.TotalRecordCount, 4);
+  assert.equal(virtualPayload.Items[0].ItemId, "bbjavdb-chinese-playable");
   assert.equal(virtualPayload.Items[0].CollectionType, "movies");
 });
 
@@ -632,7 +968,7 @@ test("serves the user root item and user-scoped suggestions", async () => {
   const rootPayload = await root.json();
   assert.equal(rootPayload.Id, "bbjavdb-root");
   assert.equal(rootPayload.Type, "Folder");
-  assert.equal(rootPayload.ChildCount, 2);
+  assert.equal(rootPayload.ChildCount, 4);
   assert.deepEqual(await suggestions.json(), {
     Items: [],
     TotalRecordCount: 0,
@@ -652,18 +988,19 @@ test("returns JSON errors for unknown Emby routes instead of proxying HTML", asy
 
   assert.equal(response.status, 404);
   assert.match(response.headers.get("content-type"), /application\/json/);
-  assert.equal((await response.json()).Message, "Emby endpoint not found");
+  assert.match((await response.json()).Message, /^Emby endpoint not found/);
 });
 
 test("authenticates Emby users against JavDB and returns an access token", async () => {
   let receivedBody;
+  const env = { EMBY_REAL_JAVDB_LOGIN: "true" };
   const response = await handleProxy(
     new Request("https://clone.example/Users/AuthenticateByName", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ Username: "demo", Pw: "secret" }),
     }),
-    {},
+    env,
     {},
     async (url, init) => {
       assert.match(url, /jdforrepam\.com\/api\/v1\/sessions/);
@@ -680,7 +1017,7 @@ test("authenticates Emby users against JavDB and returns an access token", async
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.AccessToken, "javdb-token");
+  assert.notEqual(payload.AccessToken, "");
   assert.equal(payload.User.Name, "demo");
   assert.equal(receivedBody.get("username"), "demo");
   assert.equal(receivedBody.get("password"), "secret");
@@ -703,7 +1040,7 @@ test("maps full-video resolution into Emby playback info", async () => {
           { headers: { "content-type": "application/json" } },
         );
       }
-      if (url.includes("javstrm.emby-59f.workers.dev/api/resolve")) {
+      if (url.includes(`${RESOLVER}/api/v/resolve`)) {
         return new Response(
           JSON.stringify({
             variants: [{ variant: "original", sourceUrl: "https://jdforrepam.com/video/test.mp4", sourceType: "video/mp4" }],
@@ -733,13 +1070,1583 @@ test("maps full-video resolution into Emby playback info", async () => {
   assert.match(payload.MediaSources[0].Path, /\/Videos\/42\/stream\.mp4/);
   assert.match(payload.MediaSources[0].Path, /api_key=bbjavdb-guest/);
   assert.match(payload.MediaSources[0].Path, /static=true/);
-  assert.match(payload.MediaSources[0].Path, /mediaSourceId=42/);
+  assert.match(payload.MediaSources[0].Path, /mediaSourceId=/);
   assert.match(payload.MediaSources[0].Path, /source=https%3A%2F%2Fjdforrepam\.com/);
   assert.match(payload.MediaSources[0].DirectStreamUrl, /^\/Videos\/42\/stream\.mp4/);
   assert.equal(payload.MediaSources[0].MediaStreams[1].Type, "Audio");
   assert.equal(payload.MediaSources[0].MediaStreams[1].Codec, "aac");
   assert.equal(payload.MediaSources[0].MediaStreams[2].Language, "chi");
   assert.match(payload.MediaSources[0].MediaStreams[2].DeliveryUrl, /\/Subtitles\/2\/Stream\.srt/);
+});
+
+test("uses the configured resolver path and the public fallback path", async () => {
+  const calls = [];
+  const resolverOrigin = "https://resolver.example";
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    { JAVSTRM_ORIGIN: resolverOrigin },
+    {},
+    async (url) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "TEST-001" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === `${resolverOrigin}/api/resolve?code=TEST-001&lang=zh`) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl: "https://fast-stream.jav.si/video/test.mp4",
+              sourceType: "video/mp4",
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === `${UPSTREAM}/api/v/resolve?code=TEST-001&lang=zh`) {
+        return new Response(JSON.stringify({ variants: [] }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (target === "https://fast-stream.jav.si/video/test.mp4") {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=TEST-001/);
+      return new Response(JSON.stringify({ code: 0, data: [] }), {
+        headers: { "content-type": "application/json" },
+      });
+    },
+  );
+
+  assert.equal(response.status, 200);
+  assert.ok(calls.includes(`${resolverOrigin}/api/resolve?code=TEST-001&lang=zh`));
+  assert.ok(calls.includes(`${UPSTREAM}/api/v/resolve?code=TEST-001&lang=zh`));
+  assert.equal(calls.some((target) => target.startsWith(`${resolverOrigin}/api/v/resolve`)), false);
+});
+
+test("keeps every playback source uniquely addressable across repeated reads", async () => {
+  const fetchImpl = async (url) => {
+    if (url.includes("/v4/movies/42")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: { movie: { id: 42, number: "TEST-001", title: "Test Movie" } },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (url.includes(`${RESOLVER}/api/v/resolve`)) {
+      return new Response(
+        JSON.stringify({
+          variants: [
+            {
+              variant: "original",
+              sourceUrl: "https://jdforrepam.com/video/original.mp4",
+              sourceType: "video/mp4",
+              quality: 1080,
+            },
+            {
+              variant: "fcjav_reducing_mosaic",
+              sourceUrl: "https://jdforrepam.com/video/reduced.mp4",
+              sourceType: "video/mp4",
+              quality: 720,
+            },
+            {
+              variant: "javgg_original",
+              sourceUrl: "https://fast-stream.jav.si/video/alternate.mp4",
+              sourceType: "video/mp4",
+              quality: 1080,
+            },
+          ],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    assert.match(url, /\/api\/subtitle\?name=TEST-001/);
+    return new Response(
+      JSON.stringify({ code: 0, data: [] }),
+      { headers: { "content-type": "application/json" } },
+    );
+  };
+
+  const readSources = async () => {
+    const response = await handleProxy(
+      new Request("https://clone.example/Items/42/PlaybackInfo", {
+        method: "POST",
+      }),
+      {},
+      {},
+      fetchImpl,
+    );
+    assert.equal(response.status, 200);
+    return (await response.json()).MediaSources;
+  };
+
+  const first = await readSources();
+  const second = await readSources();
+  assert.equal(first.length, 3);
+  assert.equal(second.length, 3);
+
+  for (const field of ["Id", "MediaSourceId", "Path", "DirectStreamUrl"]) {
+    assert.equal(new Set(first.map((source) => source[field])).size, first.length);
+    assert.deepEqual(
+      first.map((source) => source[field]),
+      second.map((source) => source[field]),
+    );
+  }
+  for (const source of first) {
+    assert.equal(source.Id, source.MediaSourceId);
+    const streamUrl = new URL(source.Path);
+    assert.equal(streamUrl.searchParams.get("mediaSourceId"), source.Id);
+    assert.match(source.DirectStreamUrl, new RegExp(`mediaSourceId=${source.Id}`));
+  }
+});
+
+test("keeps same-name sources from distinct URLs and removes exact duplicates", async () => {
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url) => {
+      if (url.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "TEST-001", title: "Test Movie" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [
+              {
+                variant: "original",
+                sourceUrl: "https://jdforrepam.com/video/source-a.mp4",
+                sourceType: "video/mp4",
+              },
+              {
+                variant: "original",
+                sourceUrl: "https://fast-stream.jav.si/video/source-b.mp4",
+                sourceType: "video/mp4",
+              },
+              {
+                variant: "original",
+                sourceUrl: "https://jdforrepam.com/video/source-a.mp4",
+                sourceType: "video/mp4",
+              },
+            ],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      assert.match(url, /\/api\/subtitle\?name=TEST-001/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  const sources = payload.MediaSources;
+  assert.equal(sources.length, 2);
+  assert.match(sources[0].Path, /source-a\.mp4/);
+  assert.match(sources[1].Path, /source-b\.mp4/);
+  assert.equal(new Set(sources.map((source) => source.Id)).size, 2);
+});
+
+test("keeps late GetAV sources after early pseudo-HLS variants", async () => {
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url) => {
+      if (url.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes(`${RESOLVER}/api/v/resolve`)) {
+        return delayedResolverResponse();
+      }
+      assert.match(url, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 2);
+  assert.deepEqual(
+    payload.MediaSources.map((source) => source.Name),
+    ["getav_raw_4k", "getav_raw_1080p"],
+  );
+  for (const source of payload.MediaSources) {
+    assert.match(source.Path, /fast-stream\.jav\.si/);
+    assert.doesNotMatch(source.Path, /googleusercontent/);
+  }
+});
+
+test("keeps extensionless Google Drive HLS and drops .image pseudo-HLS", async () => {
+  const googlePlaylist = [
+    "#EXTM3U",
+    "#EXT-X-TARGETDURATION:8",
+    "#EXTINF:8,",
+    "https://lh3.googleusercontent.com/d/segment-one=d",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const imagePlaylist = [
+    "#EXTM3U",
+    "#EXT-X-TARGETDURATION:10",
+    "#EXTINF:10,",
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/origin.image?token=abc",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const googleSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(googlePlaylist)}`;
+  const imageSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(imagePlaylist)}`;
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url) => {
+      if (url.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "NQ7Mdg", title: "NQ7Mdg" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [
+              {
+                variant: "fcjav_original",
+                sourceUrl: googleSource,
+                sourceType: "application/vnd.apple.mpegurl",
+              },
+              {
+                variant: "fcjav_reducing_mosaic",
+                sourceUrl: googleSource,
+                sourceType: "application/vnd.apple.mpegurl",
+              },
+              {
+                variant: "javgg_original",
+                sourceUrl: imageSource,
+                sourceType: "application/vnd.apple.mpegurl",
+              },
+              {
+                variant: "javgg_reducing_mosaic",
+                sourceUrl: imageSource,
+                sourceType: "application/vnd.apple.mpegurl",
+              },
+            ],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      assert.match(url, /\/api\/subtitle\?name=NQ7Mdg/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 2);
+  assert.deepEqual(
+    payload.MediaSources.map((source) => source.Name),
+    ["fcjav_original", "压缩版"],
+  );
+  for (const source of payload.MediaSources) {
+    assert.equal(source.Container, "m3u8");
+    assert.match(source.Path, /\/Videos\/42\/stream\.m3u8/);
+  }
+});
+
+test("drops remote HLS sources whose manifest points at font data", async () => {
+  const sourceUrl = "https://static.worldstatic.com/rctd-740/4k/index.txt";
+  const calls = [];
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "getav_raw_4k",
+              sourceUrl,
+              sourceType: "application/vnd.apple.mpegurl",
+              quality: 2160,
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === sourceUrl) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-VERSION:3",
+          "#EXTINF:6,",
+          "seg-0.woff2",
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 0);
+  assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
+  assert.equal(calls.some((target) => /seg-0\.woff2/.test(target)), false);
+});
+
+test("keeps AES-128 HLS sources whose encrypted segments use font paths", async () => {
+  const sourceUrl = "https://static.worldstatic.com/rctd-740/4k/index.txt";
+  const keyUrl = "https://static.worldstatic.com/rctd-740/4k/glyph.woff?e=1";
+  const segmentUrl = "https://static.worldstatic.com/rctd-740/4k/seg-0.woff2?e=1";
+  const keyBytes = Uint8Array.from({ length: 16 }, (_, index) => index);
+  const iv = new Uint8Array(16);
+  const segment = new Uint8Array(188);
+  for (let index = 0; index < segment.length; index += 1) {
+    segment[index] = (index * 37 + 11) & 0xff;
+  }
+  segment[0] = 0x47;
+  segment[15] = 0;
+  const encrypted = await encryptAes128Cbc(segment, keyBytes, iv);
+  assert.ok(encrypted.length > 16);
+  const calls = [];
+  let segmentHeaders;
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "getav_raw_4k",
+              sourceUrl,
+              sourceType: "application/vnd.apple.mpegurl",
+              quality: 2160,
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === sourceUrl) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-VERSION:3",
+          "#EXT-X-MEDIA-SEQUENCE:0",
+          `#EXT-X-KEY:METHOD=AES-128,URI="glyph.woff?e=1",IV=0x${Buffer.from(iv).toString("hex")}`,
+          "#EXTINF:6,",
+          "seg-0.woff2?e=1",
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (target === keyUrl) {
+        return new Response(keyBytes, {
+          headers: { "content-type": "font/woff2" },
+        });
+      }
+      if (target === segmentUrl) {
+        segmentHeaders = init.headers;
+        return new Response(encrypted, {
+          status: 206,
+          headers: { "content-type": "font/woff2" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources[0].Name, "RCTD-740");
+  assert.equal(payload.MediaSources[0].Container, "m3u8");
+  assert.equal(calls.includes(keyUrl), true);
+  assert.equal(calls.includes(segmentUrl), true);
+  assert.equal(new Headers(segmentHeaders).get("range"), "bytes=0-127");
+});
+
+test("drops AES-128 HLS sources when the decryption key is not 16 bytes", async () => {
+  const sourceUrl = "https://static.worldstatic.com/rctd-740/1080/index.txt";
+  const keyUrl = "https://static.worldstatic.com/rctd-740/1080/glyph.woff?e=1";
+  const segmentUrl = "https://static.worldstatic.com/rctd-740/1080/seg-0.woff2?e=1";
+  const calls = [];
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "getav_raw_1080p",
+              sourceUrl,
+              sourceType: "application/vnd.apple.mpegurl",
+              quality: 1080,
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === sourceUrl) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-MEDIA-SEQUENCE:0",
+          "#EXT-X-KEY:METHOD=AES-128,URI=\"glyph.woff?e=1\",IV=0x00000000000000000000000000000000",
+          "#EXTINF:6,",
+          "seg-0.woff2?e=1",
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (target === keyUrl) {
+        return new Response(new Uint8Array(15), {
+          headers: { "content-type": "application/octet-stream" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 0);
+  assert.equal(calls.includes(segmentUrl), false);
+});
+
+test("keeps a remote HLS source only after a playable segment probe", async () => {
+  const masterUrl = "https://fast-stream.jav.si/live/master.m3u8";
+  const childUrl = "https://fast-stream.jav.si/live/video/index.m3u8";
+  const segmentUrl = "https://fast-stream.jav.si/live/video/segments/one.ts";
+  const calls = [];
+  let segmentHeaders;
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "TEST-001", title: "HLS Movie" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl: masterUrl,
+              sourceType: "application/vnd.apple.mpegurl",
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === masterUrl) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-STREAM-INF:BANDWIDTH=1280000",
+          childUrl,
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (target === childUrl) {
+        return new Response([
+          "#EXTM3U",
+          "#EXTINF:6,",
+          segmentUrl,
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (target === segmentUrl) {
+        segmentHeaders = init.headers;
+        return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0x00]), {
+          status: 206,
+          headers: { "content-type": "video/mp2t" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=TEST-001/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources[0].Container, "m3u8");
+  assert.deepEqual(
+    calls.filter((target) => [masterUrl, childUrl, segmentUrl].includes(target)),
+    [masterUrl, childUrl, segmentUrl],
+  );
+  assert.equal(new Headers(segmentHeaders).get("range"), "bytes=0-127");
+});
+
+test("probes ordinary remote MP4 resolver sources before advertising them", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/test.mp4";
+  const calls = [];
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "TEST-001", title: "MP4 Movie" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl,
+              sourceType: "video/mp4",
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === sourceUrl) {
+        assert.equal(init.headers.get("range"), "bytes=0-127");
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=TEST-001/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
+});
+
+test("keeps a valid root-relative resolver source while starting self-hosted supplements", async () => {
+  const sourceUrl = `${UPSTREAM}/video/relative.mp4`;
+  const calls = [];
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "SAN-449", title: "SAN-449 Test" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve?code=SAN-449`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl: "/video/relative.mp4",
+              sourceType: "video/mp4",
+              quality: 1080,
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === sourceUrl) {
+        assert.equal(init.headers.get("range"), "bytes=0-127");
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=SAN-449/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(calls.includes(sourceUrl), true);
+  assert.equal(calls.some((target) => /javtiful\.com/.test(target)), true);
+  assert.equal(calls.some((target) => /getav\.net|r\.jina\.ai/.test(target)), true);
+});
+
+test("merges one public resolver source with two Javtiful qualities", async () => {
+  const publicUrl = "https://fast-stream.jav.si/san-449/public.mp4";
+  const fullHdUrl = "https://fast-stream.jav.si/san-449/1080.mp4";
+  const hdUrl = "https://fast-stream.jav.si/san-449/720.mp4";
+  const detailUrl = "https://javtiful.com/zh/video/12345/SAN-449";
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    { SELF_HOSTED_MERGE_BUDGET_MS: 1000 },
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "SAN-449", title: "SAN-449 Test" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve?code=SAN-449`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl: publicUrl,
+              sourceType: "video/mp4",
+              quality: 1080,
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=SAN-449") {
+        return new Response(
+          `<a href="${detailUrl}">SAN-449 Test</a>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: "SAN-449 Test",
+            playerSources: [
+              { src: fullHdUrl, type: "video/mp4", size: 1080 },
+              { src: hdUrl, type: "video/mp4", size: 720 },
+            ],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (
+        target === "https://r.jina.ai/https://getav.net/zh/videos/san-449" ||
+        target === "https://getav.net/zh/videos/san-449"
+      ) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if ([publicUrl, fullHdUrl, hdUrl].includes(target)) {
+        assert.equal(init.headers.get("range"), "bytes=0-127");
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=SAN-449/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    payload.MediaSources.map((source) => source.Name),
+    ["原版", "Javtiful 1080P", "Javtiful 720P"],
+  );
+});
+
+test("merges two public resolver sources with two GetAV qualities", async () => {
+  const public4kUrl = "https://fast-stream.jav.si/rctd-740/public-4k.mp4";
+  const public1080Url = "https://h1.gzankun.com/rctd-740/public-1080.mp4";
+  const getav4kUrl = "https://static.worldstatic.com/rctd-740/4k/index.txt";
+  const getav1080Url = "https://static.worldstatic.com/rctd-740/1080/index.txt";
+  const readerUrl = "https://r.jina.ai/https://getav.net/zh/videos/rctd-740";
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    { SELF_HOSTED_MERGE_BUDGET_MS: 1000 },
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740 Test" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve?code=RCTD-740`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [
+              {
+                variant: "getav_raw_4k",
+                label: "原版 4K (GetAV)",
+                sourceUrl: public4kUrl,
+                sourceType: "video/mp4",
+                quality: 2160,
+              },
+              {
+                variant: "getav_raw_1080p",
+                label: "原版 1080P (GetAV)",
+                sourceUrl: public1080Url,
+                sourceType: "video/mp4",
+                quality: 1080,
+              },
+            ],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+        return new Response("<html>No matching video</html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === readerUrl) {
+        return new Response(
+          `<html><title>RCTD-740 Test | GetAV</title>${JSON.stringify({
+            videoSources: [
+              { movieId: "RCTD-740", type: "raw_4k", url: getav4kUrl, quality: 2160 },
+              { movieId: "RCTD-740", type: "raw_1080p", url: getav1080Url, quality: 1080 },
+            ],
+          })}</html>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if ([public4kUrl, public1080Url].includes(target)) {
+        assert.equal(init.headers.get("range"), "bytes=0-127");
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      if (target === getav4kUrl || target === getav1080Url) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:6",
+          "#EXTINF:6,",
+          "segment.ts",
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (/\/rctd-740\/\d+\/segment\.ts$/.test(target)) {
+        return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+          status: 206,
+          headers: { "content-type": "video/mp2t" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  const sourceUrls = payload.MediaSources.map((source) =>
+    new URL(source.Path).searchParams.get("source")
+  );
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 4);
+  assert.equal(new Set(sourceUrls).size, 4);
+  assert.equal(sourceUrls.filter((source) => source === getav4kUrl).length, 1);
+  assert.equal(sourceUrls.filter((source) => source === getav1080Url).length, 1);
+});
+
+test("keeps a public source when self-hosted supplement times out", async () => {
+  const publicUrl = "https://fast-stream.jav.si/san-449/public.mp4";
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    { SELF_HOSTED_MERGE_BUDGET_MS: 40 },
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "SAN-449", title: "SAN-449 Test" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve?code=SAN-449`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl: publicUrl,
+              sourceType: "video/mp4",
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=SAN-449") {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        return new Response("<html>No matching video</html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (
+        target === "https://r.jina.ai/https://getav.net/zh/videos/san-449" ||
+        target === "https://getav.net/zh/videos/san-449"
+      ) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === publicUrl) {
+        assert.equal(init.headers.get("range"), "bytes=0-127");
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=SAN-449/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 1);
+  assert.match(payload.MediaSources[0].Path, /public\.mp4/);
+});
+
+test("drops pseudo-HLS supplements and keeps validated self-hosted lines", async () => {
+  const publicUrl = "https://fast-stream.jav.si/rctd-740/public.mp4";
+  const javtifulUrl = "https://fast-stream.jav.si/rctd-740/720.mp4";
+  const javtifulDetail = "https://javtiful.com/zh/video/12345/RCTD-740";
+  const getav4kUrl = "https://static.worldstatic.com/rctd-740/4k/index.txt";
+  const getavPseudoUrl = "https://static.worldstatic.com/rctd-740/1080/index.txt";
+  const pseudoImageUrl = "https://static.worldstatic.com/rctd-740/1080/cover.jpg";
+  const readerUrl = "https://r.jina.ai/https://getav.net/zh/videos/rctd-740";
+  const calls = [];
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    { SELF_HOSTED_MERGE_BUDGET_MS: 1000 },
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740 Test" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve?code=RCTD-740`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl: publicUrl,
+              sourceType: "video/mp4",
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+        return new Response(
+          `<a href="${javtifulDetail}">RCTD-740 Test</a>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === javtifulDetail) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: "RCTD-740 Test",
+            playerSources: [
+              { src: javtifulUrl, type: "video/mp4", size: 720 },
+            ],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === readerUrl) {
+        return new Response(
+          `<html><title>RCTD-740 Test | GetAV</title>${JSON.stringify({
+            videoSources: [
+              { movieId: "RCTD-740", type: "raw_4k", url: getav4kUrl, quality: 2160 },
+              {
+                movieId: "RCTD-740",
+                type: "raw_1080p",
+                url: getavPseudoUrl,
+                quality: 1080,
+              },
+            ],
+          })}</html>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if ([publicUrl, javtifulUrl].includes(target)) {
+        assert.equal(init.headers.get("range"), "bytes=0-127");
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      if (target === getav4kUrl) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:6",
+          "#EXTINF:6,",
+          "segment.ts",
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (target === getavPseudoUrl) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:6",
+          "#EXTINF:6,",
+          pseudoImageUrl,
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (target === "https://static.worldstatic.com/rctd-740/4k/segment.ts") {
+        return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+          status: 206,
+          headers: { "content-type": "video/mp2t" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    payload.MediaSources.map((source) => source.Name).sort(),
+    ["原版", "Javtiful 720P", "原版 4K (GetAV)"].sort(),
+  );
+  assert.equal(calls.includes(pseudoImageUrl), false);
+});
+
+test("deduplicates exact cross-source URLs but keeps distinct URLs", async () => {
+  const publicUrl = "https://h1.gzankun.com/rctd-740/public.mp4";
+  const sharedUrl = "https://fast-stream.jav.si/rctd-740/1080.mp4";
+  const javtifulDetail = "https://javtiful.com/zh/video/12345/RCTD-740";
+  const getavUrl = "https://static.worldstatic.com/rctd-740/1080/index.txt";
+  const readerUrl = "https://r.jina.ai/https://getav.net/zh/videos/rctd-740";
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    { SELF_HOSTED_MERGE_BUDGET_MS: 1000 },
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740 Test" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve?code=RCTD-740`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [
+              {
+                variant: "original",
+                sourceUrl: publicUrl,
+                sourceType: "video/mp4",
+              },
+              {
+                variant: "javtiful_1080",
+                label: "Javtiful 1080P",
+                sourceUrl: sharedUrl,
+                sourceType: "video/mp4",
+                quality: 1080,
+              },
+            ],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+        return new Response(
+          `<a href="${javtifulDetail}">RCTD-740 Test</a>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === javtifulDetail) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: "RCTD-740 Test",
+            playerSources: [
+              { src: sharedUrl, type: "video/mp4", size: 1080 },
+            ],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === readerUrl) {
+        return new Response(
+          `<html><title>RCTD-740 Test | GetAV</title>${JSON.stringify({
+            videoSources: [
+              { movieId: "RCTD-740", type: "raw_1080p", url: getavUrl, quality: 1080 },
+            ],
+          })}</html>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if ([publicUrl, sharedUrl].includes(target)) {
+        assert.equal(init.headers.get("range"), "bytes=0-127");
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      if (target === getavUrl) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:6",
+          "#EXTINF:6,",
+          "segment.ts",
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (target === "https://static.worldstatic.com/rctd-740/1080/segment.ts") {
+        return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+          status: 206,
+          headers: { "content-type": "video/mp2t" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  const sourceUrls = payload.MediaSources.map((source) =>
+    new URL(source.Path).searchParams.get("source")
+  );
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 3);
+  assert.equal(sourceUrls.filter((source) => source === sharedUrl).length, 1);
+  assert.equal(sourceUrls.includes(publicUrl), true);
+  assert.equal(sourceUrls.includes(getavUrl), true);
+});
+
+test("loads Javtiful MP4 qualities in order and probes each stream", async () => {
+  const detailUrl = "https://javtiful.com/zh/video/12345/SAN-449";
+  const fullHdUrl = "https://fast-stream.jav.si/san-449/1080.mp4";
+  const hdUrl = "https://fast-stream.jav.si/san-449/720.mp4";
+  const calls = [];
+  const rangeHeaders = new Map();
+  const javtifulWatch = JSON.stringify({
+    videoTitle: "SAN-449 Test",
+    playerSources: [
+      { src: fullHdUrl, type: "video/mp4", size: 1080 },
+      { src: hdUrl, type: "video/mp4", size: 720 },
+    ],
+  });
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "SAN-449", title: "SAN-449 Test" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve?code=SAN-449`)) {
+        return new Response(
+          JSON.stringify({ variants: [] }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=SAN-449") {
+        return new Response(
+          `<a href="${detailUrl}">SAN-449 Test</a>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script id="frontWatchConfig">${javtifulWatch}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (
+        target ===
+          "https://r.jina.ai/https://getav.net/zh/videos/san-449" ||
+        target === "https://getav.net/zh/videos/san-449"
+      ) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === fullHdUrl || target === hdUrl) {
+        rangeHeaders.set(target, init.headers.get("range"));
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=SAN-449/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    payload.MediaSources.map((source) => source.Name),
+    ["Javtiful 1080P", "Javtiful 720P"],
+  );
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      source.MediaStreams.find((stream) => stream.Type === "Video").Height
+    ),
+    [1080, 720],
+  );
+  assert.equal(calls.filter((target) => target === fullHdUrl).length, 1);
+  assert.equal(calls.filter((target) => target === hdUrl).length, 1);
+  assert.equal(rangeHeaders.get(fullHdUrl), "bytes=0-127");
+  assert.equal(rangeHeaders.get(hdUrl), "bytes=0-127");
+});
+
+test("loads all GetAV qualities through Jina without a direct page request", async () => {
+  const calls = [];
+  const sourceQualities = [
+    ["raw_4k", 2160],
+    ["raw_1080p", 1080],
+    ["raw_720p", 720],
+    ["raw_480p", 480],
+  ];
+  const videoSources = sourceQualities.map(([type, quality]) => ({
+    movieId: "RCTD-740",
+    type,
+    url: `https://static.worldstatic.com/rctd-740/${quality}/index.txt`,
+    quality,
+  }));
+  const pageUrl = "https://getav.net/zh/videos/rctd-740";
+  const readerUrl = `https://r.jina.ai/${pageUrl}`;
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740 Test" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve?code=RCTD-740`)) {
+        return new Response(
+          JSON.stringify({ variants: [] }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+        return new Response("<html>No matching video</html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === readerUrl) {
+        assert.equal(init.headers.get("x-respond-with"), "html");
+        return new Response(
+          `<html><title>RCTD-740 Test | GetAV</title>` +
+          `${JSON.stringify({ videoSources })}</html>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === pageUrl) {
+        throw new Error("GetAV direct page request should not be made");
+      }
+      if (/\/rctd-740\/\d+\/index\.txt$/.test(target)) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:6",
+          "#EXTINF:6,",
+          "segment.ts",
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (/\/rctd-740\/\d+\/segment\.ts$/.test(target)) {
+        return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+          status: 206,
+          headers: { "content-type": "video/mp2t" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(calls.includes(pageUrl), false);
+  assert.deepEqual(
+    payload.MediaSources.map((source) => source.Name),
+    [
+      "原版 4K (GetAV)",
+      "原版 1080P (GetAV)",
+      "原版 720P (GetAV)",
+      "原版 480P (GetAV)",
+    ],
+  );
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      source.MediaStreams.find((stream) => stream.Type === "Video").Height
+    ),
+    [2160, 1080, 720, 480],
+  );
+});
+
+test("public resolver proxy waits for variants after a 1.8 second gap", async () => {
+  let resolverCalls = 0;
+  const response = await handleProxy(
+    new Request("https://clone.example/api/v/resolve?code=RCTD-740&lang=zh"),
+    { JAVSTRM_ORIGIN: UPSTREAM },
+    {},
+    async (url) => {
+      assert.match(url, /\/api\/(?:v\/)?resolve\?code=RCTD-740/);
+      resolverCalls += 1;
+      return delayedResolverResponse();
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(resolverCalls, 2);
+  assert.equal(payload.variants.length, 6);
+  assert.deepEqual(
+    payload.variants
+      .map((variant) => variant.variant)
+      .filter((variant) => variant.startsWith("getav_")),
+    ["getav_raw_4k", "getav_raw_1080p"],
+  );
+});
+
+test("public resolver keeps waiting when the first result only has pseudo-HLS sources", async () => {
+  const fakePlaylist = [
+    "#EXTM3U",
+    "#EXTINF:1,",
+    "https://lh3.googleusercontent.com/not-a-video.jpg",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const pseudoSource = `data:application/vnd.apple.mpegurl,${encodeURIComponent(fakePlaylist)}`;
+  const earlyVariants = [
+    { variant: "fcjav_original", sourceUrl: pseudoSource, sourceType: "application/vnd.apple.mpegurl" },
+    { variant: "fcjav_reducing_mosaic", sourceUrl: pseudoSource, sourceType: "application/vnd.apple.mpegurl" },
+    { variant: "javgg_original", sourceUrl: pseudoSource, sourceType: "application/vnd.apple.mpegurl" },
+    { variant: "javgg_reducing_mosaic", sourceUrl: pseudoSource, sourceType: "application/vnd.apple.mpegurl" },
+  ];
+  const lateVariants = [
+    { variant: "getav_raw_4k", sourceUrl: "https://static.worldstatic.com/rctd-740/4k/index.txt", sourceType: "application/vnd.apple.mpegurl", quality: 2160 },
+    { variant: "getav_raw_1080p", sourceUrl: "https://static.worldstatic.com/rctd-740/1080/index.txt", sourceType: "application/vnd.apple.mpegurl", quality: 1080 },
+  ];
+  let primaryCalls = 0;
+  let fallbackCalls = 0;
+  const response = await handleProxy(
+    new Request("https://clone.example/api/v/resolve?code=RCTD-740&lang=zh"),
+    { JAVSTRM_ORIGIN: UPSTREAM },
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/api/v/resolve")) {
+        fallbackCalls += 1;
+        // 回退端点比旧的 4.5 秒合并窗口慢，但在放宽后的窗口内完成。
+        await new Promise((resolve) => setTimeout(resolve, 6000));
+        return new Response(
+          JSON.stringify({ variants: [...earlyVariants, ...lateVariants] }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      assert.match(target, /\/api\/resolve\?code=RCTD-740/);
+      primaryCalls += 1;
+      return new Response(
+        JSON.stringify({ variants: earlyVariants }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(primaryCalls, 1);
+  assert.equal(fallbackCalls, 1);
+  assert.equal(payload.variants.length, 6);
+  assert.deepEqual(
+    payload.variants
+      .map((variant) => variant.variant)
+      .filter((variant) => variant.startsWith("getav_")),
+    ["getav_raw_4k", "getav_raw_1080p"],
+  );
+});
+
+test("public resolver keeps same-name variants that come from distinct source URLs", async () => {
+  const response = await handleProxy(
+    new Request("https://clone.example/api/v/resolve?code=RCTD-740&lang=zh"),
+    { JAVSTRM_ORIGIN: UPSTREAM },
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/api/v/resolve")) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl: "https://cdn-b.example/stream/index.m3u8",
+              sourceType: "application/vnd.apple.mpegurl",
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          variants: [{
+            variant: "original",
+            sourceUrl: "https://cdn-a.example/stream/index.m3u8",
+            sourceType: "application/vnd.apple.mpegurl",
+          }],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.variants.length, 2);
+  assert.deepEqual(
+    payload.variants.map((variant) => variant.sourceUrl).sort(),
+    [
+      "https://cdn-a.example/stream/index.m3u8",
+      "https://cdn-b.example/stream/index.m3u8",
+    ],
+  );
 });
 
 test("embeds a directly streamable media source in movie details", async () => {
@@ -765,7 +2672,7 @@ test("embeds a directly streamable media source in movie details", async () => {
           { headers: { "content-type": "application/json" } },
         );
       }
-      if (url.includes("javstrm.emby-59f.workers.dev/api/resolve")) {
+      if (url.includes(`${RESOLVER}/api/v/resolve`)) {
         return new Response(
           JSON.stringify({
             variants: [{
@@ -815,7 +2722,7 @@ test("serves inline HLS variants through a short Emby stream URL", async () => {
         { headers: { "content-type": "application/json" } },
       );
     }
-    if (target.includes("javstrm.emby-59f.workers.dev/api/resolve")) {
+    if (target.includes(`${RESOLVER}/api/v/resolve`)) {
       return new Response(
         JSON.stringify({
           variants: [{
@@ -858,7 +2765,310 @@ test("serves inline HLS variants through a short Emby stream URL", async () => {
   );
   assert.equal(stream.status, 200);
   assert.match(stream.headers.get("content-type"), /application\/vnd\.apple\.mpegurl/);
-  assert.equal(await stream.text(), playlist);
+  const rewritten = await stream.text();
+  assert.match(
+    rewritten,
+    /\/emby-media\/\?url=https%3A%2F%2Fmedia\.example%2Fsegment\.ts(?:&|&amp;|$)/,
+  );
+  assert.doesNotMatch(rewritten, /^https:\/\/media\.example\/segment\.ts/m);
+});
+
+test("rewrites master and child HLS manifests through the local media proxy", async () => {
+  const masterUrl = "https://fast-stream.jav.si/live/master.m3u8";
+  const videoChildUrl = "https://fast-stream.jav.si/live/video/index.m3u8";
+  const audioChildUrl = "https://fast-stream.jav.si/live/audio/index.m3u8";
+  const keyUrl = "https://fast-stream.jav.si/live/video/keys/key.key";
+  const initUrl = "https://fast-stream.jav.si/live/video/init.mp4";
+  const segmentUrl = "https://fast-stream.jav.si/live/video/segments/one.m4s";
+  const master = [
+    "#EXTM3U",
+    "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",URI=\"audio/index.m3u8\"",
+    "#EXT-X-STREAM-INF:BANDWIDTH=1280000,AUDIO=\"audio\"",
+    "video/index.m3u8",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const child = [
+    "#EXTM3U",
+    "#EXT-X-KEY:METHOD=AES-128,URI=\"keys/key.key\"",
+    "#EXT-X-MAP:URI=\"init.mp4\"",
+    "#EXTINF:6,",
+    "segments/one.m4s",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const calls = [];
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    calls.push(target);
+    if (target === masterUrl) {
+      return new Response(master, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    }
+    if (target === videoChildUrl) {
+      return new Response(child, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const masterResponse = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(masterUrl)}`,
+    ),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(masterResponse.status, 200);
+  const rewrittenMaster = await masterResponse.text();
+  for (const target of [videoChildUrl, audioChildUrl]) {
+    assert.ok(rewrittenMaster.includes(encodeURIComponent(target)), target);
+  }
+
+  const childLine = rewrittenMaster
+    .split("\n")
+    .find((line) => line.includes(encodeURIComponent(videoChildUrl)));
+  assert.ok(childLine);
+  const childResponse = await handleProxy(
+    new Request(childLine),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(childResponse.status, 200);
+  const rewrittenChild = await childResponse.text();
+  for (const target of [keyUrl, initUrl, segmentUrl]) {
+    assert.ok(rewrittenChild.includes(encodeURIComponent(target)), target);
+  }
+  assert.deepEqual(calls, [masterUrl, videoChildUrl]);
+});
+
+test("marks key and encrypted segment proxy URLs and forces safe content types", async () => {
+  const manifestUrl = "https://static.worldstatic.com/rctd-740/4k/index.txt";
+  const keyUrl = "https://static.worldstatic.com/rctd-740/4k/glyph.woff?e=1";
+  const segmentUrl = "https://static.worldstatic.com/rctd-740/4k/seg-0.woff2?e=1";
+  const keyBytes = Uint8Array.from({ length: 16 }, (_, index) => 0x10 + index);
+  let segmentRequestHeaders;
+  const fetchImpl = async (url, init = {}) => {
+    const target = String(url);
+    if (target === manifestUrl) {
+      return new Response([
+        "#EXTM3U",
+        "#EXT-X-KEY:METHOD=AES-128,URI=\"glyph.woff?e=1\",IV=0x00000000000000000000000000000000",
+        "#EXTINF:6,",
+        "seg-0.woff2?e=1",
+        "#EXT-X-ENDLIST",
+      ].join("\n"), {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    }
+    if (target === keyUrl) {
+      return new Response(keyBytes, {
+        headers: { "content-type": "font/woff2" },
+      });
+    }
+    if (target === segmentUrl) {
+      segmentRequestHeaders = init.headers;
+      return new Response(new Uint8Array([0xde, 0xad, 0xbe, 0xef]), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-3/4",
+          "content-type": "font/woff2",
+          etag: "segment-etag",
+        },
+      });
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const manifestResponse = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(manifestUrl)}`,
+    ),
+    {},
+    {},
+    fetchImpl,
+  );
+  const rewritten = await manifestResponse.text();
+  const keyLine = rewritten
+    .split("\n")
+    .find((line) => line.startsWith("#EXT-X-KEY:"));
+  const keyProxyUrl = /URI="([^"]+)"/.exec(keyLine)?.[1] || "";
+  const segmentProxyUrl = rewritten
+    .split("\n")
+    .find((line) => line.includes(encodeURIComponent(segmentUrl))) || "";
+  assert.match(keyProxyUrl, /[?&]hls=1(?:&|$)/);
+  assert.match(keyProxyUrl, /[?&]kind=key(?:&|$)/);
+  assert.match(segmentProxyUrl, /[?&]hls=1(?:&|$)/);
+  assert.match(segmentProxyUrl, /[?&]kind=segment(?:&|$)/);
+  assert.match(segmentProxyUrl, /[?&]encrypted=1(?:&|$)/);
+
+  const keyResponse = await handleProxy(
+    new Request(keyProxyUrl),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(keyResponse.status, 200);
+  assert.equal(keyResponse.headers.get("content-type"), "application/octet-stream");
+  assert.deepEqual(new Uint8Array(await keyResponse.arrayBuffer()), keyBytes);
+
+  const segmentResponse = await handleProxy(
+    new Request(segmentProxyUrl, {
+      headers: { range: "bytes=0-3" },
+    }),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(segmentResponse.status, 206);
+  assert.equal(segmentResponse.headers.get("content-type"), "application/octet-stream");
+  assert.equal(segmentResponse.headers.get("content-range"), "bytes 0-3/4");
+  assert.equal(segmentResponse.headers.get("etag"), "segment-etag");
+  assert.equal(new Headers(segmentRequestHeaders).get("range"), "bytes=0-3");
+});
+
+test("forwards Range and conditional headers through the media proxy", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/test.mp4";
+  const bytes = new Uint8Array([0, 1, 2, 3]);
+  let requestHeaders;
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}`,
+      {
+        headers: {
+          "if-modified-since": "Wed, 21 Oct 2015 07:28:00 GMT",
+          "if-none-match": "etag-test",
+          "if-range": "etag-test",
+          range: "bytes=0-3",
+        },
+      },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      requestHeaders = init.headers;
+      return new Response(bytes, {
+        status: 206,
+        headers: {
+          "accept-ranges": "bytes",
+          "content-length": "4",
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp4",
+          etag: "etag-test",
+          "last-modified": "Wed, 21 Oct 2015 07:28:00 GMT",
+        },
+      });
+    },
+  );
+
+  assert.equal(requestHeaders.get("range"), "bytes=0-3");
+  assert.equal(requestHeaders.get("if-range"), "etag-test");
+  assert.equal(requestHeaders.get("if-none-match"), "etag-test");
+  assert.equal(
+    requestHeaders.get("if-modified-since"),
+    "Wed, 21 Oct 2015 07:28:00 GMT",
+  );
+  assert.equal(requestHeaders.get("origin"), UPSTREAM);
+  assert.equal(requestHeaders.get("referer"), `${UPSTREAM}/`);
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-range"), "bytes 0-3/4");
+  assert.equal(response.headers.get("content-length"), "4");
+  assert.equal(response.headers.get("accept-ranges"), "bytes");
+  assert.equal(response.headers.get("content-type"), "video/mp4");
+  assert.equal(response.headers.get("etag"), "etag-test");
+  assert.equal(
+    response.headers.get("last-modified"),
+    "Wed, 21 Oct 2015 07:28:00 GMT",
+  );
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
+});
+
+test("omits Referer for static.worldstatic.com media but keeps other hotlink headers", async () => {
+  const sourceUrl = "https://static.worldstatic.com/signed/rctd-740/index.txt?token=abc";
+  const playlistBytes = new TextEncoder().encode(
+    "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nhttps://static.worldstatic.com/signed/rctd-740/seg0.ts\n#EXT-X-ENDLIST\n",
+  );
+  let requestHeaders;
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}`,
+      {
+        headers: {
+          range: "bytes=0-3",
+          "if-none-match": "etag-test",
+        },
+      },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      requestHeaders = init.headers;
+      return new Response(playlistBytes, {
+        status: 200,
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    },
+  );
+
+  assert.equal(requestHeaders.get("referer"), null);
+  assert.equal(requestHeaders.get("origin"), UPSTREAM);
+  assert.ok(requestHeaders.get("user-agent"));
+  assert.equal(requestHeaders.get("range"), "bytes=0-3");
+  assert.equal(requestHeaders.get("if-none-match"), "etag-test");
+  assert.equal(response.status, 200);
+});
+
+test("keeps Referer for non-worldstatic media hosts", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/test.mp4";
+  let requestHeaders;
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}`,
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      requestHeaders = init.headers;
+      return new Response(new Uint8Array([1, 2, 3, 4]), {
+        status: 200,
+        headers: { "content-type": "video/mp4" },
+      });
+    },
+  );
+
+  assert.equal(requestHeaders.get("referer"), `${UPSTREAM}/`);
+  assert.equal(response.status, 200);
+});
+
+test("allows extensionless Google Drive HLS segments through the media proxy", async () => {
+  const sourceUrl =
+    "https://lh3.googleusercontent.com/d/segment-one=d";
+  let requestHeaders;
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}`,
+      { headers: { range: "bytes=0-127" } },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      requestHeaders = init.headers;
+      return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10]), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp2t",
+        },
+      });
+    },
+  );
+
+  assert.equal(requestHeaders.get("range"), "bytes=0-127");
+  assert.equal(requestHeaders.get("referer"), `${UPSTREAM}/`);
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-type"), "video/mp2t");
 });
 
 test("serves a movie primary image through the Emby endpoint", async () => {
@@ -932,7 +3142,7 @@ test("serves the advertised Chinese subtitle stream", async () => {
   );
 
   assert.equal(response.status, 200);
-  assert.match(subtitleFileUrl, /\/api\/subtitle\/file\?url=/);
+  assert.equal(subtitleFileUrl, "https://subtitle.example/test.srt");
   assert.equal(response.headers.get("content-type"), "application/x-subrip; charset=utf-8");
   assert.equal(await response.text(), subtitleText);
 });
@@ -957,7 +3167,7 @@ test("streams a resolved video and forwards Range headers", async () => {
           { headers: { "content-type": "application/json" } },
         );
       }
-      if (target.includes("javstrm.emby-59f.workers.dev/api/resolve")) {
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
         return new Response(
           JSON.stringify({
             variants: [{ variant: "original", sourceUrl: "https://fast-stream.jav.si/video/test.mp4", sourceType: "video/mp4" }],
@@ -1017,6 +3227,7 @@ test("reuses the source advertised by PlaybackInfo without resolving it again", 
 test("refreshes a stale media URL and accepts SenPlayer stream path variants", async () => {
   const videoBytes = new Uint8Array([0, 0, 0, 32]);
   const calls = [];
+  const freshRanges = [];
   const staleSource = encodeURIComponent("https://fast-stream.jav.si/video/stale.mp4");
   const response = await handleProxy(
     new Request(
@@ -1040,7 +3251,7 @@ test("refreshes a stale media URL and accepts SenPlayer stream path variants", a
           { headers: { "content-type": "application/json" } },
         );
       }
-      if (target.includes("javstrm.emby-59f.workers.dev/api/resolve")) {
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
         return new Response(
           JSON.stringify({
             variants: [{
@@ -1053,7 +3264,7 @@ test("refreshes a stale media URL and accepts SenPlayer stream path variants", a
         );
       }
       assert.equal(target, "https://fast-stream.jav.si/video/fresh.mp4");
-      assert.equal(init.headers.get("range"), "bytes=0-3");
+      freshRanges.push(init.headers.get("range"));
       return new Response(videoBytes, {
         status: 206,
         headers: {
@@ -1068,9 +3279,14 @@ test("refreshes a stale media URL and accepts SenPlayer stream path variants", a
   assert.deepEqual(calls, [
     "https://fast-stream.jav.si/video/stale.mp4",
     "https://jdforrepam.com/api/v4/movies/42",
-    "https://javstrm.emby-59f.workers.dev/api/resolve?code=TEST-001&lang=zh",
+    `${RESOLVER}/api/v/resolve?code=TEST-001&lang=zh`,
+    "https://javtiful.com/zh/search?q=TEST-001",
+    "https://r.jina.ai/https://getav.net/zh/videos/test-001",
+    "https://getav.net/zh/videos/test-001",
+    "https://fast-stream.jav.si/video/fresh.mp4",
     "https://fast-stream.jav.si/video/fresh.mp4",
   ]);
+  assert.deepEqual(freshRanges, ["bytes=0-127", "bytes=0-3"]);
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), videoBytes);
 });
 
@@ -1106,6 +3322,7 @@ test("accepts SenPlayer source aliases and sends media hotlink headers", async (
 test("streams relative URLs from alternate resolver response fields", async () => {
   const videoBytes = new Uint8Array([0, 0, 0, 32]);
   const calls = [];
+  const freshRanges = [];
   const response = await handleProxy(
     new Request(
       "https://clone.example/Videos/42/playback.mp4?api_key=bbjavdb-guest",
@@ -1125,7 +3342,7 @@ test("streams relative URLs from alternate resolver response fields", async () =
           { headers: { "content-type": "application/json" } },
         );
       }
-      if (target.includes("javstrm.emby-59f.workers.dev/api/resolve")) {
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
         return new Response(
           JSON.stringify({
             data: {
@@ -1140,7 +3357,7 @@ test("streams relative URLs from alternate resolver response fields", async () =
         );
       }
       assert.equal(target, `${UPSTREAM}/video/fresh.mp4`);
-      assert.equal(init.headers.get("range"), "bytes=0-3");
+      freshRanges.push(init.headers.get("range"));
       return new Response(videoBytes, {
         status: 206,
         headers: {
@@ -1154,8 +3371,13 @@ test("streams relative URLs from alternate resolver response fields", async () =
   assert.equal(response.status, 206);
   assert.deepEqual(calls, [
     "https://jdforrepam.com/api/v4/movies/42",
-    "https://javstrm.emby-59f.workers.dev/api/resolve?code=TEST-001&lang=zh",
+    `${RESOLVER}/api/v/resolve?code=TEST-001&lang=zh`,
+    "https://javtiful.com/zh/search?q=TEST-001",
+    "https://r.jina.ai/https://getav.net/zh/videos/test-001",
+    "https://getav.net/zh/videos/test-001",
+    `${UPSTREAM}/video/fresh.mp4`,
     `${UPSTREAM}/video/fresh.mp4`,
   ]);
+  assert.deepEqual(freshRanges, ["bytes=0-127", "bytes=0-3"]);
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), videoBytes);
 });
