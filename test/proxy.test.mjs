@@ -788,6 +788,41 @@ test("supports both SearchHints aliases used by Emby clients", async () => {
   }
 });
 
+test("reports the exact search count after filtering fuzzy results", async () => {
+  const movies = [
+    {
+      id: "NQ7Mdg",
+      number: "RCTD-740",
+      title: "Exact result",
+      can_play: true,
+      has_cnsub: true,
+    },
+    {
+      id: "wrong-code",
+      number: "RCTD-340",
+      title: "Wrong fuzzy result",
+      can_play: true,
+      has_cnsub: true,
+    },
+  ];
+  const response = await handleProxy(
+    new Request(
+      "https://clone.example/emby/Items?SearchTerm=RCTD-740&Recursive=true&IncludeItemTypes=Movie&Limit=20",
+    ),
+    {},
+    {},
+    async () => new Response(
+      JSON.stringify({ success: 1, data: { movies } }),
+      { headers: { "content-type": "application/json" } },
+    ),
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.TotalRecordCount, 1);
+  assert.deepEqual(payload.Items.map((item) => item.Id), ["NQ7Mdg"]);
+});
+
 test("forwards Emby access tokens to JavDB catalog requests", async () => {
   let authorization;
   const response = await handleProxy(

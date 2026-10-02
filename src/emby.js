@@ -2898,10 +2898,13 @@ async function loadMovieCatalogPage(options) {
   const orderedMovies = prioritizeExactSearchResults(sortedMovies, exactCode);
   return {
     movies: orderedMovies.slice(startIndex, requiredCount),
-    // 已翻到末尾时用真实数量；否则略多报，让客户端能继续往下翻页
-    totalRecordCount: sourceExhausted
-      ? matchingMovies.length
-      : matchingMovies.length + 1,
+    // 精确番号搜索会在本地过滤相近番号，数量必须以过滤后的结果为准。
+    // 普通浏览和模糊搜索在未翻到底时略多报，让客户端能继续往下翻页。
+    totalRecordCount: exactCode
+      ? orderedMovies.length
+      : sourceExhausted
+        ? matchingMovies.length
+        : matchingMovies.length + 1,
   };
 }
 // ================= 演员（Person）相关 =================
