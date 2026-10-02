@@ -141,6 +141,44 @@ function callLocalEmby(request, env = {}) {
   });
 }
 
+function createPlaybackD1(options = {}) {
+  const rows = new Map();
+  const failWrites = options.failWrites === true;
+  const rowKey = (namespace, key) => `${namespace}\u0000${key}`;
+  return {
+    rows,
+    prepare(sql) {
+      return {
+        bind(...values) {
+          return {
+            async first() {
+              if (!/SELECT value FROM playback_json/i.test(sql)) {
+                throw new Error(`Unexpected D1 first() query: ${sql}`);
+              }
+              const value = rows.get(rowKey(values[0], values[1]));
+              return value === undefined ? null : { value };
+            },
+            async run() {
+              if (failWrites) {
+                throw new Error("simulated D1 write failure");
+              }
+              if (/INSERT INTO playback_json/i.test(sql)) {
+                rows.set(rowKey(values[0], values[1]), values[2]);
+                return { success: true };
+              }
+              if (/DELETE FROM playback_json/i.test(sql)) {
+                rows.delete(rowKey(values[0], values[1]));
+                return { success: true };
+              }
+              throw new Error(`Unexpected D1 run() query: ${sql}`);
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
 test("maps application routes to the source site", () => {
   const target = resolveUpstreamTarget(
     "https://clone.example/movie/z4VJpy?page=2",
@@ -553,6 +591,47 @@ test("does not resurrect a deleted record from late playback progress", async ()
   assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
 });
 
+test("keeps a D1-backed deletion across a fresh instance cache", async () => {
+  const env = { PLAYBACK_DB: createPlaybackD1() };
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-d1-old",
+    PositionTicks: 120_000_000,
+  }), env);
+  await callLocalEmby(embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"), env);
+
+  // 模拟请求落到一个全新的 Worker 实例：内存缓存全空，只能相信 D1。
+  resetEmbyCachesForTests();
+
+  const lateProgress = await callLocalEmby(embyJsonRequest("/Sessions/Playing/Progress", {
+    ItemId: "42",
+    PlaySessionId: "session-d1-old",
+    PositionTicks: 120_000_000,
+  }), env);
+  assert.equal(lateProgress.status, 204);
+
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ), env);
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
+});
+
+test("reports a D1 write failure instead of silently accepting playback state", async () => {
+  const env = { PLAYBACK_DB: createPlaybackD1({ failWrites: true }) };
+  const progress = await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-d1-broken",
+    PositionTicks: 120_000_000,
+  }), env);
+  assert.equal(progress.status, 503);
+
+  const deleted = await callLocalEmby(
+    embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"),
+    env,
+  );
+  assert.equal(deleted.status, 503);
+});
+
 test("does not resurrect a batch-deleted record from late playback progress", async () => {
   await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
     ItemId: "42",
@@ -668,6 +747,13 @@ test("supports both SearchHints aliases used by Emby clients", async () => {
       id: "rzKDJ",
       number: "RCTD-740",
       title: "Backup result",
+      can_play: true,
+      has_cnsub: true,
+    },
+    {
+      id: "wrong-code",
+      number: "RCTD-340",
+      title: "Wrong fuzzy result",
       can_play: true,
       has_cnsub: true,
     },
@@ -1905,11 +1991,15 @@ test("merges one public resolver source with two Javtiful qualities", async () =
   );
 });
 
-test("merges two public resolver sources with two GetAV qualities", async () => {
+test("merges public resolver sources with GetAV qualities when the CDN requires its Referer", async () => {
   const public4kUrl = "https://fast-stream.jav.si/rctd-740/public-4k.mp4";
   const public1080Url = "https://h1.gzankun.com/rctd-740/public-1080.mp4";
   const getav4kUrl = "https://static.worldstatic.com/rctd-740/4k/index.txt";
   const getav1080Url = "https://static.worldstatic.com/rctd-740/1080/index.txt";
+  const pseudoPlaylist =
+    "#EXTM3U\n#EXTINF:1,\nhttps://lh3.googleusercontent.com/not-a-video.jpg\n#EXT-X-ENDLIST\n";
+  const pseudoSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(pseudoPlaylist)}`;
   const readerUrl = "https://r.jina.ai/https://getav.net/zh/videos/rctd-740";
   const response = await handleProxy(
     new Request("https://clone.example/Items/42/PlaybackInfo", {
@@ -1946,6 +2036,16 @@ test("merges two public resolver sources with two GetAV qualities", async () => 
                 sourceType: "video/mp4",
                 quality: 1080,
               },
+              {
+                variant: "javgg_original",
+                sourceUrl: pseudoSource,
+                sourceType: "application/vnd.apple.mpegurl",
+              },
+              {
+                variant: "javgg_reducing_mosaic",
+                sourceUrl: pseudoSource,
+                sourceType: "application/vnd.apple.mpegurl",
+              },
             ],
           }),
           { headers: { "content-type": "application/json" } },
@@ -1978,6 +2078,9 @@ test("merges two public resolver sources with two GetAV qualities", async () => 
         });
       }
       if (target === getav4kUrl || target === getav1080Url) {
+        if (init.headers.get("referer") !== "https://getav.net/") {
+          return new Response(null, { status: 403 });
+        }
         return new Response([
           "#EXTM3U",
           "#EXT-X-TARGETDURATION:6",
@@ -1989,6 +2092,9 @@ test("merges two public resolver sources with two GetAV qualities", async () => 
         });
       }
       if (/\/rctd-740\/\d+\/segment\.ts$/.test(target)) {
+        if (init.headers.get("referer") !== "https://getav.net/") {
+          return new Response(null, { status: 403 });
+        }
         return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
           status: 206,
           headers: { "content-type": "video/mp2t" },
@@ -2796,7 +2902,8 @@ test("rewrites master and child HLS manifests through the local media proxy", as
     "#EXT-X-ENDLIST",
   ].join("\n");
   const calls = [];
-  const fetchImpl = async (url) => {
+  let childRequestHeaders;
+  const fetchImpl = async (url, init = {}) => {
     const target = String(url);
     calls.push(target);
     if (target === masterUrl) {
@@ -2805,6 +2912,7 @@ test("rewrites master and child HLS manifests through the local media proxy", as
       });
     }
     if (target === videoChildUrl) {
+      childRequestHeaders = init.headers;
       return new Response(child, {
         headers: { "content-type": "application/vnd.apple.mpegurl" },
       });
@@ -2830,18 +2938,91 @@ test("rewrites master and child HLS manifests through the local media proxy", as
     .split("\n")
     .find((line) => line.includes(encodeURIComponent(videoChildUrl)));
   assert.ok(childLine);
+  assert.match(childLine, /[?&]kind=manifest(?:&|$)/);
   const childResponse = await handleProxy(
-    new Request(childLine),
+    new Request(childLine, { headers: { range: "bytes=0-1023" } }),
     {},
     {},
     fetchImpl,
   );
   assert.equal(childResponse.status, 200);
+  assert.equal(new Headers(childRequestHeaders).get("range"), null);
   const rewrittenChild = await childResponse.text();
   for (const target of [keyUrl, initUrl, segmentUrl]) {
     assert.ok(rewrittenChild.includes(encodeURIComponent(target)), target);
   }
   assert.deepEqual(calls, [masterUrl, videoChildUrl]);
+});
+
+test("rewrites a 206 HLS manifest for an explicit manifest request", async () => {
+  const manifestUrl = "https://static.worldstatic.com/rctd-740/4k/index.txt";
+  const keyUrl = "https://static.worldstatic.com/rctd-740/4k/glyph.woff?e=1";
+  const segmentUrl = "https://static.worldstatic.com/rctd-740/4k/seg-0.woff2?e=1";
+  const manifest = [
+    "#EXTM3U",
+    "#EXT-X-KEY:METHOD=AES-128,URI=\"glyph.woff?e=1\"",
+    "#EXTINF:6,",
+    "seg-0.woff2?e=1",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  let requestHeaders;
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(manifestUrl)}&hls=1&kind=manifest`,
+      { headers: { range: "bytes=0-1023" } },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      requestHeaders = init.headers;
+      return new Response(manifest, {
+        status: 206,
+        headers: {
+          "content-range": `bytes 0-${manifest.length - 1}/${manifest.length}`,
+          "content-type": "application/vnd.apple.mpegurl",
+        },
+      });
+    },
+  );
+
+  assert.equal(requestHeaders.get("range"), null);
+  assert.equal(requestHeaders.get("if-range"), null);
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-range"), null);
+  const rewritten = await response.text();
+  assert.ok(rewritten.includes(encodeURIComponent(keyUrl)));
+  assert.ok(rewritten.includes(encodeURIComponent(segmentUrl)));
+});
+
+test("does not forward Range when a direct HLS stream is a manifest", async () => {
+  const sourceUrl = "https://static.worldstatic.com/rctd-740/4k/index.txt";
+  const segmentUrl = "https://static.worldstatic.com/rctd-740/4k/seg-0.woff2?e=1";
+  const manifest = [
+    "#EXTM3U",
+    "#EXTINF:6,",
+    "seg-0.woff2?e=1",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  let requestHeaders;
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby/Videos/42/stream.m3u8?api_key=bbjavdb-guest&source=${encodeURIComponent(sourceUrl)}&sourceType=application%2Fvnd.apple.mpegurl`,
+      { headers: { range: "bytes=0-1023" } },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      requestHeaders = init.headers;
+      return new Response(manifest, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    },
+  );
+
+  assert.equal(requestHeaders.get("range"), null);
+  assert.equal(response.status, 200);
+  const rewritten = await response.text();
+  assert.ok(rewritten.includes(encodeURIComponent(segmentUrl)));
 });
 
 test("marks key and encrypted segment proxy URLs and forces safe content types", async () => {
@@ -2985,7 +3166,7 @@ test("forwards Range and conditional headers through the media proxy", async () 
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
 });
 
-test("omits Referer for static.worldstatic.com media but keeps other hotlink headers", async () => {
+test("uses the GetAV Referer for static.worldstatic.com media and keeps hotlink headers", async () => {
   const sourceUrl = "https://static.worldstatic.com/signed/rctd-740/index.txt?token=abc";
   const playlistBytes = new TextEncoder().encode(
     "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nhttps://static.worldstatic.com/signed/rctd-740/seg0.ts\n#EXT-X-ENDLIST\n",
@@ -3012,7 +3193,7 @@ test("omits Referer for static.worldstatic.com media but keeps other hotlink hea
     },
   );
 
-  assert.equal(requestHeaders.get("referer"), null);
+  assert.equal(requestHeaders.get("referer"), "https://getav.net/");
   assert.equal(requestHeaders.get("origin"), UPSTREAM);
   assert.ok(requestHeaders.get("user-agent"));
   assert.equal(requestHeaders.get("range"), "bytes=0-3");

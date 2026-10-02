@@ -124,6 +124,8 @@ git push -u origin main
 
 这种方式不依赖 GitHub 自动构建，适合从本机手动发布。
 
+Pages 使用仓库根目录的 `wrangler.jsonc`。该文件包含 `pages_build_output_dir`、环境变量和 D1 绑定；不要把它当作独立 Worker 的配置。
+
 首次使用先登录 Cloudflare：
 
 ```bash
@@ -136,7 +138,7 @@ npx wrangler login
 npm run deploy:pages
 ```
 
-当前脚本使用项目名 `bbjavdb`。需要更换名称时，可以修改 `package.json` 中的 `deploy:pages`，或直接执行：
+当前脚本使用项目名 `ts-javdb`。需要更换名称时，可以修改 `package.json` 中的 `deploy:pages`，或直接执行：
 
 ```bash
 npx wrangler pages deploy public --project-name=<YOUR_PAGES_PROJECT>
@@ -146,11 +148,11 @@ npx wrangler pages deploy public --project-name=<YOUR_PAGES_PROJECT>
 
 ## 部署方式三：独立 Worker
 
-独立 Worker 不使用 Pages 项目，所有请求直接进入 `src/worker.js`。
+独立 Worker 不使用 Pages 项目，所有请求直接进入 `src/worker.js`。它使用单独的 `wrangler.worker.jsonc`，因此不会和 Pages 的 `pages_build_output_dir` 配置冲突。
 
 ### 1. 修改 Worker 名称
 
-编辑 `wrangler.jsonc`：
+编辑 `wrangler.worker.jsonc`：
 
 ```jsonc
 {
@@ -176,7 +178,7 @@ npm run deploy
 发布前只构建、不上传：
 
 ```bash
-npx wrangler deploy --dry-run
+npx wrangler deploy --config=wrangler.worker.jsonc --dry-run
 ```
 
 ## Pages 与 Worker 如何选择
@@ -276,7 +278,8 @@ npm test
 |   `-- proxy.test.mjs    # Node 单元测试
 |-- .dev.vars.example     # 本地变量示例
 |-- package.json
-`-- wrangler.jsonc
+|-- wrangler.jsonc        # Cloudflare Pages 配置
+`-- wrangler.worker.jsonc # 独立 Worker 配置
 ```
 
 ## 测试与发布检查
@@ -302,7 +305,7 @@ npm test
 ```bash
 npm ci
 npm test
-npx wrangler deploy --dry-run
+npx wrangler deploy --config=wrangler.worker.jsonc --dry-run
 ```
 
 对于 Pages Functions，也可以单独检查构建：

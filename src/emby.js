@@ -76,6 +76,7 @@ const MEDIA_HOSTS = new Set([
   "www.fcjav.com",
 ]);
 const MEDIA_SUFFIXES = [".spfcas.com", ".gzankun.com"];
+const GETAV_MEDIA_REFERER = "https://getav.net/";
 const INLINE_HLS_CONTENT_TYPES = new Set([
   "application/mpegurl",
   "application/vnd.apple.mpegurl",
@@ -101,7 +102,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v17";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v19";
 const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
 const HOME_MAX_SOURCE_PAGES = 40;
@@ -373,6 +374,15 @@ function resolverPayloadHasUsableSource(payload, env) {
     Boolean(safeMediaUrl(sourceUrlValue(item), env)));
 }
 
+function resolverPayloadUsableSourceCount(payload, env) {
+  const seen = new Set();
+  for (const item of sourceVariants(payload)) {
+    const sourceUrl = safeMediaUrl(sourceUrlValue(item), env);
+    if (sourceUrl) seen.add(sourceUrl.toString());
+  }
+  return seen.size;
+}
+
 function canonicalResolverSource(item) {
   const raw = String(sourceUrlValue(item) || "").trim();
   if (!raw) return "";
@@ -622,9 +632,10 @@ async function fetchRemoteHlsResponse(url, fetchImpl, options = {}) {
       "application/vnd.apple.mpegurl,application/x-mpegurl,video/*,*/*;q=0.8",
     "user-agent": "Mozilla/5.0",
   });
-  if (mediaProxyHostAllowsReferer(url)) {
-    headers.set("referer", "https://www.javdb.com/");
-  }
+  headers.set(
+    "referer",
+    mediaProxyRefererForSource(url, "https://www.javdb.com/"),
+  );
   if (options.range) {
     headers.set("range", "bytes=0-127");
   }
@@ -1026,18 +1037,18 @@ function decodeInlineHls(value) {
   }
 }
 
-function mediaProxyHostAllowsReferer(sourceUrl) {
+function mediaProxyRefererForSource(sourceUrl, fallbackReferer) {
   try {
     const host = new URL(sourceUrl).hostname.toLowerCase();
-    // static.worldstatic.com answers Cloudflare 403 when a Referer is present,
-    // so playback requests to it must go out without that header.
-    return host !== "static.worldstatic.com";
-  } catch {
-    return true;
-  }
+    // GetAV 的媒体 CDN 会对缺少站内 Referer 的请求返回 403。
+    if (host === "worldstatic.com" || host.endsWith(".worldstatic.com")) {
+      return GETAV_MEDIA_REFERER;
+    }
+  } catch {}
+  return fallbackReferer;
 }
 
-function mediaProxyRequestHeaders(request, env, sourceUrl = "") {
+function mediaProxyRequestHeaders(request, env, sourceUrl = "", options = {}) {
   const upstream = upstreamOrigin(env);
   const headers = new Headers({
     accept: request.headers.get("accept") ||
@@ -1045,13 +1056,18 @@ function mediaProxyRequestHeaders(request, env, sourceUrl = "") {
     origin: upstream,
     "user-agent": request.headers.get("user-agent") || "Mozilla/5.0",
   });
-  if (mediaProxyHostAllowsReferer(sourceUrl)) {
-    headers.set("referer", `${upstream}/`);
-  }
-  for (const name of ["range", "if-range", "if-none-match", "if-modified-since"]) {
-    const value = request.headers.get(name);
-    if (value) {
-      headers.set(name, value);
+  headers.set(
+    "referer",
+    mediaProxyRefererForSource(sourceUrl, `${upstream}/`),
+  );
+  // HLS 清单必须拿到完整文本，Range/条件请求可能只返回前缀或 304，
+  // 后续就无法重写清单中的密钥和分片地址。
+  if (!options.hlsManifest) {
+    for (const name of ["range", "if-range", "if-none-match", "if-modified-since"]) {
+      const value = request.headers.get(name);
+      if (value) {
+        headers.set(name, value);
+      }
     }
   }
   return headers;
@@ -1092,6 +1108,34 @@ function hlsRewriteDepth(value) {
   const depth = Math.floor(Number(value));
   if (!Number.isFinite(depth) || depth < 0) return 0;
   return Math.min(MAX_HLS_REWRITE_DEPTH, depth);
+}
+
+function isHlsManifestSource(sourceUrl, sourceType = "") {
+  if (/mpegurl|m3u8/i.test(String(sourceType || ""))) {
+    return true;
+  }
+  let pathname = "";
+  try {
+    pathname = new URL(sourceUrl).pathname.toLowerCase();
+  } catch {
+    pathname = "";
+  }
+  return /\.m3u8?$/i.test(pathname);
+}
+
+function requestTargetsHlsManifest(request, sourceUrl = "") {
+  const requestUrl = new URL(request.url);
+  const kind = String(requestUrl.searchParams.get("kind") || "").toLowerCase();
+  if (kind === "manifest") {
+    return true;
+  }
+  if (kind === "segment" || kind === "key" || kind === "map") {
+    return false;
+  }
+  return isHlsManifestSource(
+    sourceUrl,
+    requestUrl.searchParams.get("sourceType") || "",
+  ) || /\.m3u8?$/i.test(requestUrl.pathname);
 }
 
 function hlsProxyUrl(value, baseUrl, requestUrl, depth, options = {}) {
@@ -1156,6 +1200,7 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth) {
   const baseUrl = String(manifestUrl || upstreamOrigin({}));
   const output = [];
   let encrypted = false;
+  let nextUriKind = "";
   for (const rawLine of source.replace(/\r\n?/g, "\n").split("\n")) {
     const line = rawLine.trim();
     if (!line) {
@@ -1171,11 +1216,16 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth) {
         encrypted = String(attributes.METHOD || "").trim().toUpperCase() ===
           "AES-128";
       }
+      if (/^#EXT-X-STREAM-INF:/i.test(line)) {
+        nextUriKind = "manifest";
+      }
       continue;
     }
+    const kind = nextUriKind || "segment";
+    nextUriKind = "";
     output.push(hlsProxyUrl(line, baseUrl, requestUrl, depth, {
       hls: true,
-      kind: "segment",
+      kind,
       encrypted,
     }));
   }
@@ -1216,7 +1266,11 @@ async function proxyMediaResponse(upstream, sourceUrl, request, env, depth = 0) 
     });
   }
 
-  if (!isHlsResponse(upstream, sourceUrl) || upstream.status === 206) {
+  const hlsManifestRequest = requestTargetsHlsManifest(request, sourceUrl);
+  if (
+    !isHlsResponse(upstream, sourceUrl) ||
+    (upstream.status === 206 && !hlsManifestRequest)
+  ) {
     return new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
@@ -2055,15 +2109,14 @@ function prioritizeExactSearchResults(movies, code) {
     return movies;
   }
   const exact = [];
-  const rest = [];
   for (const movie of movies) {
     if (movieMatchesExactSearch(movie, code)) {
       exact.push(movie);
-    } else {
-      rest.push(movie);
     }
   }
-  return exact.length ? exact.concat(rest) : movies;
+  // 精确番号命中时，上游模糊搜索常把 RCTD-340 之类的相近番号混进来。
+  // 只保留完全匹配，避免客户端搜索结果里出现无法播放或错误的目标。
+  return exact.length ? exact : movies;
 }
 
 // 搜索页的一轮抓取。精确番号首轮仍按上游的 can_play 过滤；若没有找到
@@ -3700,9 +3753,11 @@ async function resolveVideo(movie, env, fetchImpl) {
       });
     });
   });
-  const firstVideo = firstValid?.settled?.value?.video || null;
-  const firstVariantCount = playbackVariants(firstVideo).length;
+  const firstUsableSourceCount = firstValid?.settled?.value?.payload
+    ? resolverPayloadUsableSourceCount(firstValid.settled.value.payload, env)
+    : 0;
   const firstHasUsableSource = Boolean(
+    firstUsableSourceCount > 0 &&
     firstValid?.settled?.value?.payload &&
     resolverPayloadHasUsableSource(firstValid.settled.value.payload, env),
   );
@@ -3711,7 +3766,7 @@ async function resolveVideo(movie, env, fetchImpl) {
     (
       !firstValid ||
       !firstHasUsableSource ||
-      firstVariantCount < RESOLVER_SOURCE_TARGET_COUNT
+      firstUsableSourceCount < RESOLVER_SOURCE_TARGET_COUNT
     )
   ) {
     startSelfHostedVideo();
@@ -5215,17 +5270,26 @@ async function durableJsonRead(env, namespace, key) {
 
 async function durableJsonWrite(env, namespace, key, value) {
   const db = playbackDb(env);
-  let dbWriteSucceeded = false;
   if (db) {
     try {
       await durableDbWrite(db, namespace, key, value);
-      dbWriteSucceeded = true;
     } catch (error) {
       console.error(JSON.stringify({
         message: "Playback D1 write failed",
+        namespace,
         error: error instanceof Error ? error.message : String(error),
       }));
+      // D1 一旦绑定就是权威存储。这里绝不能悄悄退回 KV/Cache 后仍告诉客户端
+      // 写入成功，否则删除墓碑可能落在一台边缘实例而其他实例继续读到旧进度。
+      throw new Error("Playback state persistence failed");
     }
+    await edgeCacheWrite(
+      durableMirrorNamespace(namespace),
+      key,
+      value,
+      PLAYBACK_MIRROR_CACHE_TTL_S,
+    );
+    return;
   }
   const kv = playbackKv(env);
   let kvWriteSucceeded = false;
@@ -5240,7 +5304,7 @@ async function durableJsonWrite(env, namespace, key, value) {
       }));
     }
   }
-  if (dbWriteSucceeded || kvWriteSucceeded) {
+  if (kvWriteSucceeded) {
     await edgeCacheWrite(
       durableMirrorNamespace(namespace),
       key,
@@ -6313,9 +6377,15 @@ async function streamResponse(id, request, env, fetchImpl, token) {
           continue;
         }
         triedSources.add(sourceUrl.toString());
+        const hlsManifest = isHlsManifestSource(
+          sourceUrl.toString(),
+          candidate.sourceType || "",
+        );
         const upstream = await fetchImpl(sourceUrl.toString(), {
           method: request.method,
-          headers: mediaProxyRequestHeaders(request, env, sourceUrl.toString()),
+          headers: mediaProxyRequestHeaders(request, env, sourceUrl.toString(), {
+            hlsManifest,
+          }),
           redirect: "follow",
         });
         if (
@@ -6762,7 +6832,7 @@ async function handleFallbackDelete(path, request, env, url) {
   return noContentResponse();
 }
 
-export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = null) {
+async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = null) {
   // 有的入口会把 ExecutionContext 当第三个参数传进来(这样才有 waitUntil 可用),
   // 这里做个兼容:识别到就把它当成 ctx。
   if (ctx === null && fetchImpl && typeof fetchImpl.waitUntil === "function") {
@@ -6886,6 +6956,10 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
         path,
         error: error instanceof Error ? error.message : String(error),
       }));
+      return errorResponse(
+        503,
+        "Playback state is temporarily unavailable; retry the request",
+      );
     }
     return noContentResponse();
   }
@@ -7575,7 +7649,10 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
     if (!mediaUrl) {
       return errorResponse(403, "Media URL is not allowed");
     }
-    const headers = mediaProxyRequestHeaders(request, env, mediaUrl.toString());
+    const hlsManifest = requestTargetsHlsManifest(request, mediaUrl.toString());
+    const headers = mediaProxyRequestHeaders(request, env, mediaUrl.toString(), {
+      hlsManifest,
+    });
     const upstream = await fetchImpl(mediaUrl.toString(), {
       method: request.method,
       headers,
@@ -7596,6 +7673,23 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
   }
 
   return errorResponse(404, `Emby endpoint not found: ${request.method} ${path}`);
+}
+
+export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = null) {
+  try {
+    return await handleEmbyInternal(request, env, fetchImpl, ctx);
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Emby request failed",
+      method: request.method,
+      path: new URL(request.url).pathname,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    return errorResponse(
+      503,
+      "Emby state service is temporarily unavailable; retry the request",
+    );
+  }
 }
 
 // 集成测试会复用同一个模块实例；清空所有进程内状态，避免不同上游响应
