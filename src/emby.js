@@ -80,6 +80,7 @@ const MEDIA_SUFFIXES = [
   ".gzankun.com",
   ".cloudvexario.xyz",
   ".startupmarketingaid.cfd",
+  ".tiktokcdn.com",
 ];
 const GETAV_MEDIA_REFERER = "https://getav.net/";
 const INLINE_HLS_CONTENT_TYPES = new Set([
@@ -91,6 +92,8 @@ const INLINE_HLS_CONTENT_TYPES = new Set([
 // 旧上限会把稍大的备用线路直接过滤掉，客户端就只剩一条播放源。
 const MAX_INLINE_HLS_LENGTH = 12_000_000;
 const MAX_HLS_REWRITE_DEPTH = 8;
+// DTO 结构变化时提升版本，客户端会把它当成新的实体版本并刷新旧详情页缓存。
+const ITEM_DTO_ETAG_VERSION = "item-dto-v4";
 const REMOTE_HLS_PROBE_TIMEOUT_MS = 3500;
 // A resolver response can contain several HLS variants. Validate them in
 // parallel, but keep each variant's probe chain short so PlaybackInfo cannot
@@ -98,7 +101,7 @@ const REMOTE_HLS_PROBE_TIMEOUT_MS = 3500;
 const REMOTE_HLS_VARIANT_CONCURRENCY = 3;
 const REMOTE_HLS_PROBE_BUDGET = 4;
 const REMOTE_HLS_PROBE_DEPTH = 2;
-const REMOTE_MEDIA_PROBE_BYTES = 128;
+const REMOTE_MEDIA_PROBE_BYTES = 512;
 const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   401,
   403,
@@ -107,7 +110,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v20";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v25";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
@@ -452,8 +455,9 @@ function mergeResolverVariants(payloads) {
 // 也可能承载无扩展名的真实媒体分片。
 const INLINE_HLS_SEGMENT_PATTERN = /\.(?:ts|m4s|mp4|aac|m4a)(?:[?#]|$)/i;
 const GOOGLE_DRIVE_MEDIA_PATH_PATTERN = /^\/d\/[^/?#]+=d(?:[?#]|$)/i;
+const HLS_EMBEDDED_TS_IMAGE_PATTERN = /\.image(?:[?#]|$)/i;
 const INLINE_HLS_RESOURCE_PATTERN =
-  /[/_.-](?:image|thumb|cover|css|js)(?:[?#]|$)|[?&](?:contentType|response-content-type)=image\//i;
+  /[/_.-](?:thumb|cover|css|js)(?:[?#]|$)|[?&](?:contentType|response-content-type)=image\//i;
 const HLS_FONT_RESOURCE_PATTERN = /\.(?:woff2?|ttf|otf)(?:[?#]|$)/i;
 const HLS_IMAGE_RESOURCE_PATTERN = /\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/i;
 const HLS_AES_KEY_LENGTH = 16;
@@ -462,7 +466,8 @@ const HLS_AES_BLOCK_LENGTH = 16;
 function hlsPathLooksLikeMediaSegment(pathname) {
   return INLINE_HLS_SEGMENT_PATTERN.test(pathname) ||
     GOOGLE_DRIVE_MEDIA_PATH_PATTERN.test(pathname) ||
-    HLS_FONT_RESOURCE_PATTERN.test(pathname);
+    HLS_FONT_RESOURCE_PATTERN.test(pathname) ||
+    HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
 }
 
 function hlsPathLooksLikeNonVideo(pathname, search = "") {
@@ -510,6 +515,44 @@ function bytesLookLikeFont(bytes) {
     [0x00, 0x01, 0x00, 0x00],
   ];
   return signatures.some((signature) => bytesStartWith(bytes, signature));
+}
+
+function embeddedMpegTsOffset(bytes) {
+  if (!bytes?.length) return -1;
+  const scanEnd = Math.min(bytes.length - 1, REMOTE_MEDIA_PROBE_BYTES - 1);
+  for (let offset = 0; offset <= scanEnd; offset += 1) {
+    if (bytes[offset] !== 0x47) continue;
+    if (offset > 0) {
+      // A PNG/JPEG prefix can contain arbitrary bytes. Require a full TS
+      // packet train before accepting a non-zero offset.
+      if (
+        offset + 376 >= bytes.length ||
+        bytes[offset + 188] !== 0x47 ||
+        bytes[offset + 376] !== 0x47
+      ) {
+        continue;
+      }
+    } else {
+      if (
+        offset + 188 < bytes.length &&
+        bytes[offset + 188] !== 0x47
+      ) {
+        continue;
+      }
+      if (
+        offset + 376 < bytes.length &&
+        bytes[offset + 376] !== 0x47
+      ) {
+        continue;
+      }
+    }
+    return offset;
+  }
+  return -1;
+}
+
+function bytesLookLikeMpegTs(bytes) {
+  return embeddedMpegTsOffset(bytes) >= 0;
 }
 
 function responseLooksLikeTextDocument(bytes) {
@@ -636,7 +679,7 @@ async function fetchRemoteHlsResponse(url, fetchImpl, options = {}) {
     mediaProxyRefererForSource(url, "https://www.javdb.com/"),
   );
   if (options.range) {
-    headers.set("range", "bytes=0-127");
+    headers.set("range", `bytes=0-${REMOTE_MEDIA_PROBE_BYTES - 1}`);
   }
   return fetchWithTimeout(
     fetchImpl,
@@ -756,7 +799,8 @@ async function probeRemoteHlsSegment(
   try {
     const response = await fetchRemoteHlsResponse(url, fetchImpl, { range: true });
     if (!response?.ok) return false;
-    const bytes = new Uint8Array(await response.arrayBuffer()).subarray(0, 128);
+    const bytes = new Uint8Array(await response.arrayBuffer())
+      .subarray(0, REMOTE_MEDIA_PROBE_BYTES);
     if (!bytes.length) return false;
     if (keyContext?.method === "AES-128") {
       const encryptedBlock = bytes.subarray(0, HLS_AES_BLOCK_LENGTH);
@@ -772,6 +816,7 @@ async function probeRemoteHlsSegment(
         return false;
       }
     }
+    if (bytesLookLikeMpegTs(bytes)) return true;
     if (bytesLookLikeFont(bytes) || sniffImageContentType(bytes)) return false;
     if (responseLooksLikeTextDocument(bytes)) return false;
     return true;
@@ -913,7 +958,6 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl) {
     .trim()
     .toLowerCase();
   if (
-    contentType.startsWith("image/") ||
     contentType === "text/html" ||
     contentType === "application/xhtml+xml" ||
     contentType === "application/json" ||
@@ -930,6 +974,10 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl) {
     return true;
   }
   if (!bytes.length) return false;
+  // GG 的媒体 CDN 会把 MPEG-TS 藏在 PNG 文件头后面，并且返回 image/png。
+  // 必须先检查 TS 包，再按普通图片/字体内容做拒绝。
+  if (bytesLookLikeMpegTs(bytes)) return true;
+  if (contentType.startsWith("image/")) return false;
   if (sniffImageContentType(bytes) || bytesLookLikeFont(bytes)) return false;
   if (responseLooksLikeTextDocument(bytes)) return false;
   return true;
@@ -1066,6 +1114,364 @@ function mediaProxyRequestHeaders(request, env, sourceUrl = "", options = {}) {
     }
   }
   return headers;
+}
+
+function requestUsesMediaSegmentCache(request, sourceUrl, options = {}) {
+  if (request.method !== "GET") return false;
+  const requestUrl = new URL(request.url);
+  const kind = String(requestUrl.searchParams.get("kind") || "").toLowerCase();
+  if (kind === "key" || kind === "manifest" || kind === "map") {
+    return false;
+  }
+  if (options.hlsManifest) return false;
+  if (kind === "segment") return true;
+
+  let pathname = "";
+  try {
+    pathname = new URL(sourceUrl).pathname;
+  } catch {
+    return false;
+  }
+  return /\.(?:ts|m4s|aac|m4a)(?:[?#]|$)/i.test(pathname) ||
+    GOOGLE_DRIVE_MEDIA_PATH_PATTERN.test(pathname) ||
+    HLS_FONT_RESOURCE_PATTERN.test(pathname) ||
+    HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
+}
+
+function mediaSegmentCacheKey(sourceUrl) {
+  return `media-segment-v1|${md5(String(sourceUrl || ""))}`;
+}
+
+function mediaSegmentNeedsEmbeddedTsNormalization(sourceUrl) {
+  let pathname = "";
+  try {
+    pathname = new URL(sourceUrl).pathname;
+  } catch {
+    return false;
+  }
+  return HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
+}
+
+function parseSingleByteRange(value, total) {
+  if (!value) return null;
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(String(value).trim());
+  if (!match || (!match[1] && !match[2])) {
+    return { invalid: true };
+  }
+  const size = Math.max(0, Math.floor(Number(total) || 0));
+  if (size <= 0) return { unsatisfiable: true };
+
+  let start;
+  let end;
+  if (!match[1]) {
+    const suffixLength = Math.floor(Number(match[2]) || 0);
+    if (suffixLength <= 0) return { invalid: true };
+    start = Math.max(0, size - suffixLength);
+    end = size - 1;
+  } else {
+    start = Math.floor(Number(match[1]) || 0);
+    end = match[2] ? Math.floor(Number(match[2]) || 0) : size - 1;
+  }
+  if (start >= size) return { unsatisfiable: true };
+  end = Math.min(end, size - 1);
+  if (end < start) return { invalid: true };
+  return { start, end };
+}
+
+function normalizedMediaSegmentBytes(bytes, contentType = "") {
+  const embeddedOffset = embeddedMpegTsOffset(bytes);
+  if (embeddedOffset < 0) {
+    return {
+      bytes,
+      contentType,
+      embedded: false,
+    };
+  }
+  return {
+    bytes: embeddedOffset > 0 ? bytes.slice(embeddedOffset) : bytes,
+    contentType: "video/mp2t",
+    embedded: true,
+  };
+}
+
+function mediaRecordResponse(record, request) {
+  if (!record?.bytes) return null;
+  const headers = new Headers();
+  for (const [name, value] of record.headers || []) {
+    headers.set(name, value);
+  }
+  headers.set("content-length", String(record.bytes.byteLength));
+  if (record.contentRange) {
+    headers.set("content-range", record.contentRange);
+  } else {
+    headers.delete("content-range");
+  }
+  return new Response(record.bytes, {
+    status: record.status || 200,
+    statusText: record.statusText || "OK",
+    headers,
+  });
+}
+
+async function bufferMediaSegmentResponse(upstream, sourceUrl) {
+  const originalContentType = String(
+    upstream.headers.get("content-type") || "",
+  ).split(";")[0].trim().toLowerCase();
+
+  const bytes = new Uint8Array(await upstream.arrayBuffer());
+  const normalized = normalizedMediaSegmentBytes(bytes, originalContentType);
+  let pathname = "";
+  try {
+    pathname = new URL(sourceUrl).pathname;
+  } catch {}
+  const imageCandidate = originalContentType.startsWith("image/") ||
+    HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
+
+  const headers = new Headers();
+  for (const name of [
+    "accept-ranges",
+    "content-type",
+    "etag",
+    "last-modified",
+  ]) {
+    const value = upstream.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  headers.set("content-length", String(bytes.byteLength));
+  headers.set(
+    "content-type",
+    normalized.contentType || originalContentType || "application/octet-stream",
+  );
+  const upstreamContentRange = upstream.headers.get("content-range") || "";
+  const contentRange = normalized.embedded && upstreamContentRange
+    ? adjustedContentRangeAfterPrefix(
+      upstreamContentRange,
+      embeddedMpegTsOffset(bytes),
+      normalized.bytes.byteLength,
+    )
+    : upstreamContentRange;
+  if (!normalized.embedded) {
+    for (const name of ["etag", "last-modified"]) {
+      const value = upstream.headers.get(name);
+      if (value) headers.set(name, value);
+    }
+  }
+  headers.set("accept-ranges", "bytes");
+
+  // 只有完整的 200 响应才能作为本地断点续传缓存；真实图片、错误响应和
+  // 上游自行返回的 206 仍原样返回，避免把 PNG 前缀当成完整视频分片。
+  const rangeable = upstream.ok &&
+    upstream.status === 200 &&
+    !(imageCandidate && !normalized.embedded);
+  const cacheable = rangeable &&
+    bytes.byteLength > 0 &&
+    bytes.byteLength <= MAX_CACHED_MEDIA_SEGMENT_BYTES;
+
+  return {
+    record: {
+      bytes: normalized.bytes,
+      headers: [...headers.entries()],
+      status: upstream.status,
+      statusText: upstream.statusText,
+      contentRange,
+      rangeable,
+    },
+    cacheable,
+  };
+}
+
+function mediaSegmentRecordHeaders(upstream, byteLength) {
+  const headers = new Headers();
+  for (const name of [
+    "accept-ranges",
+    "content-type",
+    "etag",
+    "last-modified",
+  ]) {
+    const value = upstream.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  headers.set("content-length", String(byteLength));
+  headers.set("accept-ranges", "bytes");
+  return headers;
+}
+
+function mediaSegmentRecordForBytes(upstream, bytes) {
+  const headers = mediaSegmentRecordHeaders(upstream, bytes.byteLength);
+  return {
+    bytes,
+    headers: [...headers.entries()],
+    status: upstream.status,
+    statusText: upstream.statusText,
+    rangeable: true,
+  };
+}
+
+function streamCompleteMediaSegmentResponse(upstream, cacheKey) {
+  if (
+    upstream.status !== 200 ||
+    !upstream.body ||
+    upstream.headers.has("content-encoding")
+  ) {
+    return null;
+  }
+  const contentLength = Number(upstream.headers.get("content-length"));
+  if (!Number.isSafeInteger(contentLength) || contentLength <= 0) {
+    return null;
+  }
+  if (contentLength > MAX_CACHED_MEDIA_SEGMENT_BYTES) {
+    return upstream;
+  }
+
+  const cacheBytes = new Uint8Array(contentLength);
+  let cacheOffset = 0;
+  let cacheComplete = true;
+  const reader = upstream.body.getReader();
+  const body = new ReadableStream({
+    async pull(controller) {
+      let result;
+      try {
+        result = await reader.read();
+      } catch (error) {
+        controller.error(error);
+        return;
+      }
+      if (result.done) {
+        if (cacheComplete && cacheOffset === cacheBytes.byteLength) {
+          MEDIA_SEGMENT_BODY_CACHE.write(
+            cacheKey,
+            mediaSegmentRecordForBytes(upstream, cacheBytes),
+          );
+        }
+        controller.close();
+        return;
+      }
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value);
+      if (cacheComplete) {
+        if (cacheOffset + chunk.byteLength <= cacheBytes.byteLength) {
+          cacheBytes.set(chunk, cacheOffset);
+          cacheOffset += chunk.byteLength;
+        } else {
+          cacheComplete = false;
+        }
+      }
+      controller.enqueue(chunk);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: mediaProxyResponseHeaders(upstream),
+  });
+}
+
+function cachedMediaSegmentResponse(record, request) {
+  if (!record?.bytes) return null;
+  const headers = new Headers(record.headers || []);
+  headers.set("accept-ranges", "bytes");
+  const rangeHeader = request.headers.get("range");
+  if (!rangeHeader || record.rangeable === false || record.status !== 200) {
+    return mediaRecordResponse(record, request);
+  }
+
+  const range = parseSingleByteRange(rangeHeader, record.bytes.byteLength);
+  // Malformed or unsupported ranges are allowed to fall back to the complete
+  // representation. An empty response here would make the player abandon an
+  // otherwise valid segment.
+  if (!range || range.invalid) return mediaRecordResponse(record, request);
+  if (range.unsatisfiable) {
+    headers.set("content-range", `bytes */${record.bytes.byteLength}`);
+    headers.set("content-length", "0");
+    return new Response(null, {
+      status: 416,
+      statusText: "Range Not Satisfiable",
+      headers,
+    });
+  }
+  const body = record.bytes.slice(range.start, range.end + 1);
+  headers.set(
+    "content-range",
+    `bytes ${range.start}-${range.end}/${record.bytes.byteLength}`,
+  );
+  headers.set("content-length", String(body.byteLength));
+  headers.set("cache-control", "no-store");
+  return new Response(body, {
+    status: 206,
+    statusText: "Partial Content",
+    headers,
+  });
+}
+
+async function fetchMediaUpstreamResponse(
+  request,
+  sourceUrl,
+  env,
+  fetchImpl,
+  options = {},
+) {
+  const headers = mediaProxyRequestHeaders(request, env, sourceUrl, options);
+  const usesMediaSegmentCache = requestUsesMediaSegmentCache(
+    request,
+    sourceUrl,
+    options,
+  );
+  const needsEmbeddedTsNormalization =
+    mediaSegmentNeedsEmbeddedTsNormalization(sourceUrl);
+  // HLS 客户端经常先发 Range/206。GG 的伪 PNG 分片只会返回前缀，Worker 必须
+  // 先完整读取再剥离 TS；其余常规分片由 CDN 完整响应流式切片，避免先等整段
+  // 下载完成才返回首个字节。
+  if (usesMediaSegmentCache && needsEmbeddedTsNormalization) {
+    headers.delete("range");
+  }
+  const fetchUpstream = () => fetchImpl(sourceUrl, {
+    method: request.method,
+    headers,
+    redirect: "follow",
+  });
+  if (!usesMediaSegmentCache) {
+    return fetchUpstream();
+  }
+
+  const cacheKey = mediaSegmentCacheKey(sourceUrl);
+  const cached = MEDIA_SEGMENT_BODY_CACHE.read(cacheKey);
+  if (cached) {
+    const response = cachedMediaSegmentResponse(cached, request);
+    if (response) return response;
+  }
+
+  if (usesMediaSegmentCache && !needsEmbeddedTsNormalization) {
+    if (request.headers.has("range")) {
+      return fetchUpstream();
+    }
+    const upstream = await fetchUpstream();
+    const response = streamCompleteMediaSegmentResponse(upstream, cacheKey);
+    if (response) return response;
+    const result = await bufferMediaSegmentResponse(upstream, sourceUrl);
+    if (result?.record) {
+      if (result.cacheable) {
+        MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, result.record);
+      }
+      return cachedMediaSegmentResponse(result.record, request);
+    }
+  }
+
+  const result = await MEDIA_SEGMENT_BODY_CACHE.coalesce(cacheKey, async () => {
+    const upstream = await fetchUpstream();
+    return bufferMediaSegmentResponse(upstream, sourceUrl);
+  });
+
+  if (result?.record) {
+    if (result.cacheable) {
+      MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, result.record);
+    }
+    return cachedMediaSegmentResponse(result.record, request);
+  }
+  return fetchUpstream();
 }
 
 function mediaProxyResponseHeaders(upstream, options = {}) {
@@ -1247,6 +1653,21 @@ function isHlsResponse(upstream, sourceUrl) {
   return /\.m3u8?$/i.test(pathname);
 }
 
+function adjustedContentRangeAfterPrefix(contentRange, prefixLength, bodyLength) {
+  const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(
+    String(contentRange || "").trim(),
+  );
+  if (!match) return "";
+  const upstreamStart = Number(match[1]);
+  const upstreamTotal = match[3] === "*" ? null : Number(match[3]);
+  const virtualStart = Math.max(0, upstreamStart - prefixLength);
+  const virtualEnd = virtualStart + Math.max(0, bodyLength - 1);
+  const virtualTotal = upstreamTotal === null
+    ? "*"
+    : String(Math.max(0, upstreamTotal - prefixLength));
+  return `bytes ${virtualStart}-${virtualEnd}/${virtualTotal}`;
+}
+
 async function proxyMediaResponse(upstream, sourceUrl, request, env, depth = 0) {
   const requestUrl = new URL(request.url);
   const kind = String(requestUrl.searchParams.get("kind") || "").toLowerCase();
@@ -1273,6 +1694,52 @@ async function proxyMediaResponse(upstream, sourceUrl, request, env, depth = 0) 
   }
   if (request.method === "HEAD" || !upstream.body) {
     return new Response(null, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers,
+    });
+  }
+
+  let pathname = "";
+  try {
+    pathname = new URL(sourceUrl).pathname;
+  } catch {}
+  const embeddedTsCandidate = upstreamType.startsWith("image/") ||
+    HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
+  if (embeddedTsCandidate) {
+    const bytes = new Uint8Array(await upstream.arrayBuffer());
+    const prefixLength = embeddedMpegTsOffset(bytes);
+    if (prefixLength >= 0) {
+      const mediaBytes = prefixLength > 0 ? bytes.slice(prefixLength) : bytes;
+      const contentRange = headers.get("content-range");
+      if (upstream.status === 206 && contentRange) {
+        const adjusted = adjustedContentRangeAfterPrefix(
+          contentRange,
+          prefixLength,
+          mediaBytes.byteLength,
+        );
+        if (adjusted) {
+          headers.set("content-range", adjusted);
+        } else {
+          headers.delete("content-range");
+        }
+      } else {
+        headers.delete("content-range");
+      }
+      headers.set("accept-ranges", "bytes");
+      headers.set("content-length", String(mediaBytes.byteLength));
+      headers.set("content-type", "video/mp2t");
+      headers.delete("etag");
+      headers.delete("last-modified");
+      return new Response(mediaBytes, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers,
+      });
+    }
+    // 真实图片仍然按原样返回，只有带 TS 包头的伪图片才被转换成视频。
+    headers.set("content-length", String(bytes.byteLength));
+    return new Response(bytes, {
       status: upstream.status,
       statusText: upstream.statusText,
       headers,
@@ -1699,11 +2166,13 @@ const RESOLVER_THIN_MERGE_MS = 15000;
 // 很快，但不能让一个慢站点拖住 PlaybackInfo；到达首个自建结果后只再等一小段
 // 合并另一条链路的清晰度。
 const SELF_HOSTED_FIRST_SOURCE_TIMEOUT_MS = 12000;
-const SELF_HOSTED_SECONDARY_MERGE_MS = 4000;
+// Jina 代理取 GetAV 页面在冷启动时约需 4-5 秒。若 Javtiful 先返回并只等
+// 4 秒，Pages 会经常只保留 GG 的 2 条伪 HLS，直到缓存过期都不再补 GetAV。
+const SELF_HOSTED_SECONDARY_MERGE_MS = 8000;
 const SELF_HOSTED_THIN_MERGE_MS = 10000;
 // 公开解析器已经返回少量线路时，只给它一个较短的补源窗口；超时或失败仍保留
 // 已经验证通过的公开线路，不能为了追求更多清晰度拖满 PlaybackInfo 预算。
-const SELF_HOSTED_SUPPLEMENT_WAIT_MS = 6000;
+const SELF_HOSTED_SUPPLEMENT_WAIT_MS = 10000;
 const RESOLVER_SOURCE_TARGET_COUNT = 4;
 const SELF_HOSTED_PAGE_TIMEOUT_MS = 9000;
 const SELF_HOSTED_PAGE_USER_AGENT = "Mozilla/5.0";
@@ -1764,6 +2233,14 @@ const LIST_CACHE_TTL_MS = 60 * 1000;
 const MAX_MOVIE_CACHE_ENTRIES = 4000;
 const MAX_RESOLVE_CACHE_ENTRIES = 1000;
 const MAX_LIST_CACHE_ENTRIES = 400;
+// Keep a small number of complete segments per Worker instance. HLS players
+// often re-request the same segment with several byte ranges while seeking or
+// resuming; caching the complete body keeps those ranges local instead of
+// repeatedly downloading the CDN object.
+// GetAV 的 4K 分片约 13.4 MB，原先 8 MB 的上限会让它每次 Range 请求都回源。
+// 保留 4 条、单条最多 16 MB，既覆盖该分片，又把单实例内存占用控制在 64 MB。
+const MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES = 4;
+const MAX_CACHED_MEDIA_SEGMENT_BYTES = 16 * 1024 * 1024;
 
 function createTtlCache(ttlMs, maxEntries) {
   const entries = new Map();
@@ -1790,6 +2267,32 @@ function createTtlCache(ttlMs, maxEntries) {
     }
   };
 
+  const run = async (key, compute, cacheResult) => {
+    const cached = read(key);
+    if (cached !== undefined) return cached;
+    const running = pending.get(key);
+    if (running) return running;
+    const startedAtGeneration = generation;
+    const task = (async () => {
+      const value = await compute();
+      if (
+        cacheResult &&
+        value !== undefined &&
+        value !== null &&
+        generation === startedAtGeneration
+      ) {
+        write(key, value);
+      }
+      return value;
+    })();
+    pending.set(key, task);
+    try {
+      return await task;
+    } finally {
+      pending.delete(key);
+    }
+  };
+
   return {
     read,
     write,
@@ -1799,30 +2302,9 @@ function createTtlCache(ttlMs, maxEntries) {
       pending.delete(key);
     },
     // 同一个 key 的并发请求只回源一次；失败不缓存，等下次再试。
-    fetch: async (key, compute) => {
-      const cached = read(key);
-      if (cached !== undefined) return cached;
-      const running = pending.get(key);
-      if (running) return running;
-      const startedAtGeneration = generation;
-      const task = (async () => {
-        const value = await compute();
-        if (
-          value !== undefined &&
-          value !== null &&
-          generation === startedAtGeneration
-        ) {
-          write(key, value);
-        }
-        return value;
-      })();
-      pending.set(key, task);
-      try {
-        return await task;
-      } finally {
-        pending.delete(key);
-      }
-    },
+    fetch: (key, compute) => run(key, compute, true),
+    // 只复用同一 key 正在进行中的请求，不把结果写进缓存。
+    coalesce: (key, compute) => run(key, compute, false),
     clear: () => {
       generation += 1;
       entries.clear();
@@ -1836,6 +2318,10 @@ const RESOLVE_VIDEO_CACHE = createTtlCache(RESOLVE_CACHE_TTL_MS, MAX_RESOLVE_CAC
 const RESOLVE_SUBTITLE_CACHE = createTtlCache(RESOLVE_CACHE_TTL_MS, MAX_RESOLVE_CACHE_ENTRIES);
 const LIST_CACHE = createTtlCache(LIST_CACHE_TTL_MS, MAX_LIST_CACHE_ENTRIES);
 const API_TOKEN_CACHE = createTtlCache(60 * 1000, 500);
+const MEDIA_SEGMENT_BODY_CACHE = createTtlCache(
+  MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
+  MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES,
+);
 
 // ---------- 边缘缓存（跨实例复用） ----------
 // 上面的缓存只活在“当前 Worker 实例”的内存里：实例重启、扩容、换节点后就全部失效，
@@ -2519,6 +3005,73 @@ function movieTaglines(movie) {
   return tagline ? [tagline] : undefined;
 }
 
+function itemEtag(item) {
+  const userData = item?.UserData || {};
+  const sources = Array.isArray(item?.MediaSources)
+    ? item.MediaSources.map((source) => ({
+      Id: source?.Id || "",
+      MediaSourceId: source?.MediaSourceId || "",
+      Name: source?.Name || "",
+      Container: source?.Container || "",
+      Type: source?.Type || "",
+      RunTimeTicks: Number(source?.RunTimeTicks) || 0,
+    }))
+    : [];
+  const stableDto = {
+    version: ITEM_DTO_ETAG_VERSION,
+    Id: item?.Id || "",
+    Name: item?.Name || "",
+    OriginalTitle: item?.OriginalTitle || "",
+    Overview: item?.Overview || "",
+    PremiereDate: item?.PremiereDate || "",
+    ProductionYear: item?.ProductionYear || 0,
+    RunTimeTicks: Number(item?.RunTimeTicks) || 0,
+    Genres: item?.Genres || [],
+    Tags: item?.Tags || [],
+    People: item?.People || [],
+    Studios: item?.Studios || [],
+    ImageTags: item?.ImageTags || {},
+    MediaSourceCount: Number(item?.MediaSourceCount) || sources.length,
+    MediaSources: sources,
+    Played: Boolean(userData.Played),
+    PlayCount: Number(userData.PlayCount) || 0,
+    IsFavorite: Boolean(userData.IsFavorite),
+    PlaybackPositionTicks: Number(userData.PlaybackPositionTicks) || 0,
+    PlayedPercentage: Number(userData.PlayedPercentage) || 0,
+  };
+  return `"${md5(JSON.stringify(stableDto))}"`;
+}
+
+function requestHasMatchingEtag(request, etag) {
+  const header = String(request?.headers?.get("if-none-match") || "").trim();
+  if (!header) return false;
+  const normalizedEtag = String(etag || "").replace(/^W\//i, "");
+  return header.split(",").map((value) => value.trim()).some((value) =>
+    value === "*" || value.replace(/^W\//i, "") === normalizedEtag
+  );
+}
+
+function itemJsonResponse(item, request) {
+  const etag = itemEtag(item);
+  item.Etag = etag;
+  const headers = {
+    etag,
+    "cache-control": "no-store",
+    expires: "0",
+    pragma: "no-cache",
+  };
+  if (requestHasMatchingEtag(request, etag)) {
+    return new Response(null, {
+      status: 304,
+      headers: {
+        ...headers,
+        "access-control-allow-origin": "*",
+      },
+    });
+  }
+  return jsonResponse(item, 200, headers);
+}
+
 function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRARY_ID) {
   const id = String(movie.id ?? movie.number ?? "");
   const image = movie.cover_url || movie.thumb_url || "";
@@ -2629,6 +3182,7 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     item.TagItems.push({ Name: seriesName, Id: tagIdForName(seriesName) });
   }
 
+  item.Etag = itemEtag(item);
   return item;
 }
 
@@ -3631,17 +4185,25 @@ async function loadGetavVariants(code, fetchImpl) {
   const slug = String(code || "").trim().toLowerCase();
   const pageUrl = new URL(`/zh/videos/${encodeURIComponent(slug)}`, GETAV_ORIGIN);
   const readerUrl = `${JINA_READER_ORIGIN}/${pageUrl.toString()}`;
-  try {
-    const html = await fetchSelfHostedPageText(fetchImpl, readerUrl, {
-      "x-respond-with": "html",
-    });
-    const variants = getavVariantsFromPage(html, code);
-    if (variants.length) return variants;
-  } catch {
-    // Fall through to a direct request when Jina is unavailable or rate-limited.
-  }
-  const html = await fetchSelfHostedPageText(fetchImpl, pageUrl);
-  return getavVariantsFromPage(html, code);
+  // Jina 偶尔会排队，直连也可能被上游拦截；两条链路同时启动并采用先返回的
+  // 有效页面，避免串行等待把一个链路的首包延迟叠加成 10 秒以上的补源超时。
+  const first = await firstNonEmptyVariantTask([
+    {
+      name: "jina",
+      promise: fetchSelfHostedPageText(fetchImpl, readerUrl, {
+        "x-respond-with": "html",
+      })
+        .then((html) => getavVariantsFromPage(html, code))
+        .catch(() => []),
+    },
+    {
+      name: "direct",
+      promise: fetchSelfHostedPageText(fetchImpl, pageUrl)
+        .then((html) => getavVariantsFromPage(html, code))
+        .catch(() => []),
+    },
+  ]);
+  return first?.value || [];
 }
 
 function firstNonEmptyVariantTask(tasks) {
@@ -3730,14 +4292,25 @@ async function resolveVideo(movie, env, fetchImpl) {
     };
   };
   let selfHostedVideoTask = null;
+  let selfHostedResolutionFinished = true;
   const startSelfHostedVideo = () => {
     if (!selfHostedVideoTask) {
+      selfHostedResolutionFinished = false;
       selfHostedVideoTask = loadSelfHostedResolvedVideo(
         movie,
         code,
         env,
         fetchImpl,
-      ).catch(() => null);
+      ).then(
+        (video) => {
+          selfHostedResolutionFinished = true;
+          return video;
+        },
+        () => {
+          selfHostedResolutionFinished = true;
+          return null;
+        },
+      );
     }
     return selfHostedVideoTask;
   };
@@ -3813,6 +4386,13 @@ async function resolveVideo(movie, env, fetchImpl) {
   const merged = mergeResolvedVideoVariants(env, publicVideo, selfHosted);
   const validated = await finalizeVideo(merged);
   if (validated) {
+    // 一旦启动了自建补源，最终结果必须达到目标线路数才允许长期缓存。
+    // “补源任务已经结束”本身不等于成功，否则只补到 2 条也会污染 D1。
+    markResolvedVideoResolutionComplete(
+      validated,
+      !selfHostedVideoTask ||
+        resolvedVideoSourceCount(validated) >= RESOLVER_SOURCE_TARGET_COUNT,
+    );
     return validated;
   }
   const failure = otherResolvers
@@ -3901,6 +4481,21 @@ function isUsableResolvedVideo(video) {
   );
 }
 
+const RESOLVED_VIDEO_COMPLETENESS = new WeakMap();
+
+function resolvedVideoSourceCount(video) {
+  return playbackVariants(video).length;
+}
+
+function markResolvedVideoResolutionComplete(video, complete) {
+  if (!video || typeof video !== "object") return;
+  RESOLVED_VIDEO_COMPLETENESS.set(video, complete === true);
+}
+
+function resolvedVideoResolutionComplete(video) {
+  return RESOLVED_VIDEO_COMPLETENESS.get(video) !== false;
+}
+
 // 解析接口的账号可能临时被停用。仅靠短时边缘缓存会在缓存过期后突然把
 // 详情页变成“没有播放按钮”。这里把最后一次成功结果写到持久层，解析失败时
 // 继续下发旧源，同时后台尝试更新。
@@ -3952,7 +4547,12 @@ async function readPersistedResolvedVideo(env, key) {
 }
 
 async function writePersistedResolvedVideo(env, key, video) {
-  if (!isUsableResolvedVideo(video)) return;
+  if (
+    !isUsableResolvedVideo(video) ||
+    !resolvedVideoResolutionComplete(video)
+  ) {
+    return;
+  }
   const record = { video, savedAt: Date.now() };
   let serialized;
   try {
@@ -4130,7 +4730,9 @@ async function resolveVideoCached(movie, env, fetchImpl) {
   if (!key) {
     return resolveVideo(movie, env, fetchImpl);
   }
-  return RESOLVE_VIDEO_CACHE.fetch(key, async () => {
+  // 不用 fetch() 的自动写缓存：如果 GetAV 补源仍在后台且当前只有公开薄
+  // 线路，结果只能服务本次请求，不能进入 30 分钟内存缓存或长期 D1。
+  return RESOLVE_VIDEO_CACHE.coalesce(key, async () => {
     const shared = await edgeCacheRead(EDGE_NAMESPACE_VIDEO, key);
     if (isUsableResolvedVideo(shared)) {
       const validated = await validateCachedResolvedVideo(
@@ -4147,6 +4749,7 @@ async function resolveVideoCached(movie, env, fetchImpl) {
           validated,
           RESOLVE_CACHE_TTL_MS / 1000,
         );
+        RESOLVE_VIDEO_CACHE.write(key, validated);
         return validated;
       }
     }
@@ -4169,6 +4772,7 @@ async function resolveVideoCached(movie, env, fetchImpl) {
           validated,
           RESOLVE_CACHE_TTL_MS / 1000,
         );
+        RESOLVE_VIDEO_CACHE.write(key, validated);
         return validated;
       }
       // 这层旧结果已经被验证为不可播放；若后面解析失败，也不能再把它
@@ -4179,15 +4783,18 @@ async function resolveVideoCached(movie, env, fetchImpl) {
     try {
       const video = await resolveVideo(movie, env, fetchImpl);
       if (isUsableResolvedVideo(video)) {
-        await Promise.all([
-          edgeCacheWrite(
-            EDGE_NAMESPACE_VIDEO,
-            key,
-            video,
-            RESOLVE_CACHE_TTL_MS / 1000,
-          ),
-          writePersistedResolvedVideo(env, key, video),
-        ]);
+        if (resolvedVideoResolutionComplete(video)) {
+          await Promise.all([
+            edgeCacheWrite(
+              EDGE_NAMESPACE_VIDEO,
+              key,
+              video,
+              RESOLVE_CACHE_TTL_MS / 1000,
+            ),
+            writePersistedResolvedVideo(env, key, video),
+          ]);
+          RESOLVE_VIDEO_CACHE.write(key, video);
+        }
         return video;
       }
       if (persisted) {
@@ -4199,6 +4806,7 @@ async function resolveVideoCached(movie, env, fetchImpl) {
           persisted.video,
           RESOLVE_CACHE_TTL_MS / 1000,
         );
+        RESOLVE_VIDEO_CACHE.write(key, persisted.video);
         return persisted.video;
       }
       return video;
@@ -4210,6 +4818,7 @@ async function resolveVideoCached(movie, env, fetchImpl) {
           persisted.video,
           RESOLVE_CACHE_TTL_MS / 1000,
         );
+        RESOLVE_VIDEO_CACHE.write(key, persisted.video);
         return persisted.video;
       }
       throw error;
@@ -5033,7 +5642,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
       item.MediaStreams = [];
       item.MediaSourceCount = 0;
       item.HasSubtitles = false;
-      return jsonResponse(item);
+      return itemJsonResponse(item, request);
     }
     // 解析失败且没有旧成功源可用：不要返回没有真实地址的占位线路，
     // 否则客户端会选中假源并一直加载。后台解析完成后下一次请求会命中缓存。
@@ -5043,7 +5652,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     item.MediaSourceCount = 0;
     item.Container = undefined;
     item.HasSubtitles = subtitles.length > 0;
-    return jsonResponse(item);
+    return itemJsonResponse(item, request);
   }
   const mediaSources = mediaSourcesForVideo(
     item,
@@ -5059,7 +5668,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   item.MediaSourceCount = mediaSources.length;
   item.Container = source.Container;
   item.HasSubtitles = subtitles.length > 0;
-  return jsonResponse(item);
+  return itemJsonResponse(item, request);
 }
 
 function itemQuery(items, startIndex = 0) {
@@ -6396,13 +7005,13 @@ async function streamResponse(id, request, env, fetchImpl, token) {
           sourceUrl.toString(),
           candidate.sourceType || "",
         );
-        const upstream = await fetchImpl(sourceUrl.toString(), {
-          method: request.method,
-          headers: mediaProxyRequestHeaders(request, env, sourceUrl.toString(), {
-            hlsManifest,
-          }),
-          redirect: "follow",
-        });
+        const upstream = await fetchMediaUpstreamResponse(
+          request,
+          sourceUrl.toString(),
+          env,
+          fetchImpl,
+          { hlsManifest },
+        );
         if (
           !upstream.ok &&
           (upstream.status === 403 ||
@@ -7665,14 +8274,13 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       return errorResponse(403, "Media URL is not allowed");
     }
     const hlsManifest = requestTargetsHlsManifest(request, mediaUrl.toString());
-    const headers = mediaProxyRequestHeaders(request, env, mediaUrl.toString(), {
-      hlsManifest,
-    });
-    const upstream = await fetchImpl(mediaUrl.toString(), {
-      method: request.method,
-      headers,
-      redirect: "follow",
-    });
+    const upstream = await fetchMediaUpstreamResponse(
+      request,
+      mediaUrl.toString(),
+      env,
+      fetchImpl,
+      { hlsManifest },
+    );
     return proxyMediaResponse(
       upstream,
       mediaUrl.toString(),
@@ -7715,6 +8323,7 @@ export function resetEmbyCachesForTests() {
   RESOLVE_SUBTITLE_CACHE.clear();
   LIST_CACHE.clear();
   API_TOKEN_CACHE.clear();
+  MEDIA_SEGMENT_BODY_CACHE.clear();
   SUBTITLE_STREAM_TOKENS.clear();
   SUBTITLE_BODY_CACHE.clear();
   MEMORY_PLAYBACK_STATES.clear();

@@ -632,6 +632,49 @@ test("reports a D1 write failure instead of silently accepting playback state", 
   assert.equal(deleted.status, 503);
 });
 
+test("persists the exact DELETE PlayedItems route to D1 instead of only answering 200", async () => {
+  const env = { PLAYBACK_DB: createPlaybackD1() };
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-exact-delete",
+    PositionTicks: 120_000_000,
+  }), env);
+
+  // Emby 官方客户端的“移除播放记录”就是这个精确路由。它必须真的把
+  // playback 清空并写入墓碑，否则客户端刷新后旧进度会把记录带回来。
+  const deleted = await callLocalEmby(embyJsonRequest(
+    "/Users/bbjavdb-user/PlayedItems/42",
+    undefined,
+    "DELETE",
+  ), env);
+  assert.equal(deleted.status, 200);
+
+  const db = env.PLAYBACK_DB;
+  const stateRow = await db
+    .prepare("SELECT value FROM playback_json WHERE namespace = ? AND key = ?")
+    .bind("playback", "playback-state-v1")
+    .first();
+  assert.equal(stateRow.value, "{}");
+
+  const tombstoneRow = await db
+    .prepare("SELECT value FROM playback_json WHERE namespace = ? AND key = ?")
+    .bind("tombstone", "playback-state-v1:removed-v2")
+    .first();
+  assert.ok(tombstoneRow && tombstoneRow.value.includes("\"42\""), "tombstone for the removed item must be persisted");
+
+  // 全新实例（内存缓存清空）补发同一会话的旧进度也不能复活记录。
+  resetEmbyCachesForTests();
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing/Progress", {
+    ItemId: "42",
+    PlaySessionId: "session-exact-delete",
+    PositionTicks: 120_000_000,
+  }), env);
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ), env);
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
+});
+
 test("does not resurrect a batch-deleted record from late playback progress", async () => {
   await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
     ItemId: "42",
@@ -1437,7 +1480,7 @@ test("keeps late GetAV sources after early pseudo-HLS variants", async () => {
   }
 });
 
-test("keeps extensionless Google Drive HLS and drops .image pseudo-HLS", async () => {
+test("keeps extensionless Google Drive HLS and embedded TS .image HLS", async () => {
   const googlePlaylist = [
     "#EXTM3U",
     "#EXT-X-TARGETDURATION:8",
@@ -1456,6 +1499,16 @@ test("keeps extensionless Google Drive HLS and drops .image pseudo-HLS", async (
     `data:application/vnd.apple.mpegurl,${encodeURIComponent(googlePlaylist)}`;
   const imageSource =
     `data:application/vnd.apple.mpegurl,${encodeURIComponent(imagePlaylist)}`;
+  const imageSegmentUrl =
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/origin.image?token=abc";
+  const pngPrefix = Uint8Array.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ]);
+  const imageSegmentBytes = new Uint8Array(512);
+  imageSegmentBytes.set(pngPrefix, 0);
+  imageSegmentBytes[70] = 0x47;
+  imageSegmentBytes[258] = 0x47;
+  imageSegmentBytes[446] = 0x47;
 
   const response = await handleProxy(
     new Request("https://clone.example/Items/42/PlaybackInfo", {
@@ -1502,6 +1555,15 @@ test("keeps extensionless Google Drive HLS and drops .image pseudo-HLS", async (
           { headers: { "content-type": "application/json" } },
         );
       }
+      if (url === imageSegmentUrl) {
+        return new Response(imageSegmentBytes, {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-511/512",
+            "content-type": "image/png",
+          },
+        });
+      }
       assert.match(url, /\/api\/subtitle\?name=NQ7Mdg/);
       return new Response(
         JSON.stringify({ code: 0, data: [] }),
@@ -1512,15 +1574,82 @@ test("keeps extensionless Google Drive HLS and drops .image pseudo-HLS", async (
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 2);
+  assert.equal(payload.MediaSources.length, 4);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["fcjav_original", "压缩版"],
+    ["fcjav_original", "压缩版", "javgg_original", "压缩版"],
   );
   for (const source of payload.MediaSources) {
     assert.equal(source.Container, "m3u8");
     assert.match(source.Path, /\/Videos\/42\/stream\.m3u8/);
   }
+});
+
+test("drops .image pseudo-HLS sources when the body is a real PNG", async () => {
+  const imageSegmentUrl =
+    "https://p19-ad-site-sign-sg.tiktokcdn.com/video/origin.image?token=abc";
+  const imagePlaylist = [
+    "#EXTM3U",
+    "#EXT-X-TARGETDURATION:10",
+    "#EXTINF:10,",
+    imageSegmentUrl,
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const imageSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(imagePlaylist)}`;
+  const pngBytes = new Uint8Array(512);
+  pngBytes.set([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ], 0);
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url) => {
+      if (url.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "javgg_original",
+              sourceUrl: imageSource,
+              sourceType: "application/vnd.apple.mpegurl",
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url === imageSegmentUrl) {
+        return new Response(pngBytes, {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-511/512",
+            "content-type": "image/png",
+          },
+        });
+      }
+      assert.match(url, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.MediaSources.length, 0);
 });
 
 test("drops remote HLS sources whose segment body is real font data", async () => {
@@ -1810,7 +1939,7 @@ test("keeps AES-128 HLS sources whose encrypted segments use font paths", async 
   assert.equal(payload.MediaSources[0].Container, "m3u8");
   assert.equal(calls.includes(keyUrl), true);
   assert.equal(calls.includes(segmentUrl), true);
-  assert.equal(new Headers(segmentHeaders).get("range"), "bytes=0-127");
+  assert.equal(new Headers(segmentHeaders).get("range"), "bytes=0-511");
 });
 
 test("drops AES-128 HLS sources when the decryption key is not 16 bytes", async () => {
@@ -1959,7 +2088,7 @@ test("keeps a remote HLS source only after a playable segment probe", async () =
     calls.filter((target) => [masterUrl, childUrl, segmentUrl].includes(target)),
     [masterUrl, childUrl, segmentUrl],
   );
-  assert.equal(new Headers(segmentHeaders).get("range"), "bytes=0-127");
+  assert.equal(new Headers(segmentHeaders).get("range"), "bytes=0-511");
 });
 
 test("probes ordinary remote MP4 resolver sources before advertising them", async () => {
@@ -1996,7 +2125,7 @@ test("probes ordinary remote MP4 resolver sources before advertising them", asyn
         );
       }
       if (target === sourceUrl) {
-        assert.equal(init.headers.get("range"), "bytes=0-127");
+        assert.equal(init.headers.get("range"), "bytes=0-511");
         return new Response(new Uint8Array([0, 0, 0, 32]), {
           status: 206,
           headers: {
@@ -2054,7 +2183,7 @@ test("keeps a valid root-relative resolver source while starting self-hosted sup
         );
       }
       if (target === sourceUrl) {
-        assert.equal(init.headers.get("range"), "bytes=0-127");
+        assert.equal(init.headers.get("range"), "bytes=0-511");
         return new Response(new Uint8Array([0, 0, 0, 32]), {
           status: 206,
           headers: {
@@ -2141,7 +2270,7 @@ test("merges one public resolver source with two Javtiful qualities", async () =
         });
       }
       if ([publicUrl, fullHdUrl, hdUrl].includes(target)) {
-        assert.equal(init.headers.get("range"), "bytes=0-127");
+        assert.equal(init.headers.get("range"), "bytes=0-511");
         return new Response(new Uint8Array([0, 0, 0, 32]), {
           status: 206,
           headers: {
@@ -2243,7 +2372,7 @@ test("merges public resolver sources with GetAV qualities when the CDN requires 
         );
       }
       if ([public4kUrl, public1080Url].includes(target)) {
-        assert.equal(init.headers.get("range"), "bytes=0-127");
+        assert.equal(init.headers.get("range"), "bytes=0-511");
         return new Response(new Uint8Array([0, 0, 0, 32]), {
           status: 206,
           headers: {
@@ -2340,7 +2469,7 @@ test("keeps a public source when self-hosted supplement times out", async () => 
         });
       }
       if (target === publicUrl) {
-        assert.equal(init.headers.get("range"), "bytes=0-127");
+        assert.equal(init.headers.get("range"), "bytes=0-511");
         return new Response(new Uint8Array([0, 0, 0, 32]), {
           status: 206,
           headers: {
@@ -2361,6 +2490,232 @@ test("keeps a public source when self-hosted supplement times out", async () => 
   assert.equal(response.status, 200);
   assert.equal(payload.MediaSources.length, 1);
   assert.match(payload.MediaSources[0].Path, /public\.mp4/);
+});
+
+test("does not persist a thin GetAV result while supplement is pending", async () => {
+  const db = createPlaybackD1();
+  const env = {
+    PLAYBACK_DB: db,
+    SELF_HOSTED_MERGE_BUDGET_MS: 40,
+  };
+  const publicUrls = [
+    "https://fast-stream.jav.si/rctd-740/public-4k.mp4",
+    "https://fast-stream.jav.si/rctd-740/public-1080.mp4",
+  ];
+  const getavUrls = [
+    "https://static.worldstatic.com/rctd-740/4k/index.txt",
+    "https://static.worldstatic.com/rctd-740/1080/index.txt",
+    "https://static.worldstatic.com/rctd-740/720/index.txt",
+    "https://static.worldstatic.com/rctd-740/480/index.txt",
+  ];
+  const pageUrl = "https://getav.net/zh/videos/rctd-740";
+  const readerUrl = `https://r.jina.ai/${pageUrl}`;
+  let delayGetavPage = true;
+  const getavHtml =
+    `<html><title>RCTD-740 Test | GetAV</title>` +
+    JSON.stringify({
+      videoSources: [
+        { movieId: "RCTD-740", type: "raw_4k", url: getavUrls[0], quality: 2160 },
+        { movieId: "RCTD-740", type: "raw_1080p", url: getavUrls[1], quality: 1080 },
+        { movieId: "RCTD-740", type: "raw_720p", url: getavUrls[2], quality: 720 },
+        { movieId: "RCTD-740", type: "raw_480p", url: getavUrls[3], quality: 480 },
+      ],
+    }) +
+    "</html>";
+
+  const fetchImpl = async (url, init = {}) => {
+    const target = String(url);
+    if (target.includes("/v4/movies/42")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740 Test" } },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes(`${RESOLVER}/api/v/resolve?code=RCTD-740`)) {
+      return new Response(
+        JSON.stringify({
+          variants: publicUrls.map((sourceUrl, index) => ({
+            variant: index === 0 ? "original" : "backup",
+            sourceUrl,
+            sourceType: "video/mp4",
+          })),
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target === pageUrl || target === readerUrl) {
+      if (delayGetavPage) {
+        await new Promise((resolve) => setTimeout(resolve, 180));
+      }
+      return new Response(getavHtml, {
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (publicUrls.includes(target)) {
+      assert.equal(init.headers.get("range"), "bytes=0-511");
+      return new Response(new Uint8Array([0, 0, 0, 32]), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp4",
+        },
+      });
+    }
+    if (getavUrls.includes(target)) {
+      return new Response([
+        "#EXTM3U",
+        "#EXT-X-TARGETDURATION:6",
+        "#EXTINF:6,",
+        "segment.ts",
+        "#EXT-X-ENDLIST",
+      ].join("\n"), {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    }
+    if (/\/rctd-740\/\d+\/segment\.ts$/.test(target)) {
+      return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+        status: 206,
+        headers: { "content-type": "video/mp2t" },
+      });
+    }
+    assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+    return new Response(
+      JSON.stringify({ code: 0, data: [] }),
+      { headers: { "content-type": "application/json" } },
+    );
+  };
+
+  const firstResponse = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    env,
+    {},
+    fetchImpl,
+  );
+  const firstPayload = await firstResponse.json();
+  assert.equal(firstPayload.MediaSources.length, 2);
+  assert.equal(
+    [...db.rows.keys()].some((key) =>
+      key.startsWith("video-persist-v1\u0000")
+    ),
+    false,
+  );
+
+  delayGetavPage = false;
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  resetEmbyCachesForTests();
+
+  const secondResponse = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    env,
+    {},
+    fetchImpl,
+  );
+  const secondPayload = await secondResponse.json();
+  assert.equal(secondPayload.MediaSources.length, 6);
+  assert.deepEqual(
+    secondPayload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ),
+    [...publicUrls, ...getavUrls],
+  );
+});
+
+test("does not persist a thin result after the supplement finishes below target", async () => {
+  const db = createPlaybackD1();
+  const env = {
+    PLAYBACK_DB: db,
+    SELF_HOSTED_MERGE_BUDGET_MS: 60,
+  };
+  const publicUrls = [
+    "https://fast-stream.jav.si/rctd-740/public-4k.mp4",
+    "https://fast-stream.jav.si/rctd-740/public-1080.mp4",
+  ];
+  const pageUrl = "https://getav.net/zh/videos/rctd-740";
+  const readerUrl = `https://r.jina.ai/${pageUrl}`;
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    env,
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: {
+                id: 42,
+                number: "RCTD-740",
+                title: "RCTD-740 Test",
+              },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve?code=RCTD-740`)) {
+        return new Response(
+          JSON.stringify({
+            variants: publicUrls.map((sourceUrl, index) => ({
+              variant: index === 0 ? "original" : "backup",
+              sourceUrl,
+              sourceType: "video/mp4",
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+        return new Response("<html>No matching video</html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === pageUrl || target === readerUrl) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (publicUrls.includes(target)) {
+        assert.equal(init.headers.get("range"), "bytes=0-511");
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(payload.MediaSources.length, 2);
+  assert.equal(
+    [...db.rows.keys()].some((key) =>
+      key.startsWith("video-persist-v1\u0000")
+    ),
+    false,
+  );
 });
 
 test("drops pseudo-HLS supplements and keeps validated self-hosted lines", async () => {
@@ -2436,7 +2791,7 @@ test("drops pseudo-HLS supplements and keeps validated self-hosted lines", async
         );
       }
       if ([publicUrl, javtifulUrl].includes(target)) {
-        assert.equal(init.headers.get("range"), "bytes=0-127");
+        assert.equal(init.headers.get("range"), "bytes=0-511");
         return new Response(new Uint8Array([0, 0, 0, 32]), {
           status: 206,
           headers: {
@@ -2562,7 +2917,7 @@ test("deduplicates exact cross-source URLs but keeps distinct URLs", async () =>
         );
       }
       if ([publicUrl, sharedUrl].includes(target)) {
-        assert.equal(init.headers.get("range"), "bytes=0-127");
+        assert.equal(init.headers.get("range"), "bytes=0-511");
         return new Response(new Uint8Array([0, 0, 0, 32]), {
           status: 206,
           headers: {
@@ -2698,11 +3053,11 @@ test("loads Javtiful MP4 qualities in order and probes each stream", async () =>
   );
   assert.equal(calls.filter((target) => target === fullHdUrl).length, 1);
   assert.equal(calls.filter((target) => target === hdUrl).length, 1);
-  assert.equal(rangeHeaders.get(fullHdUrl), "bytes=0-127");
-  assert.equal(rangeHeaders.get(hdUrl), "bytes=0-127");
+  assert.equal(rangeHeaders.get(fullHdUrl), "bytes=0-511");
+  assert.equal(rangeHeaders.get(hdUrl), "bytes=0-511");
 });
 
-test("loads all GetAV qualities through Jina without a direct page request", async () => {
+test("loads all GetAV qualities through parallel page requests", async () => {
   const calls = [];
   const sourceQualities = [
     ["raw_4k", 2160],
@@ -2757,7 +3112,11 @@ test("loads all GetAV qualities through Jina without a direct page request", asy
         );
       }
       if (target === pageUrl) {
-        throw new Error("GetAV direct page request should not be made");
+        return new Response(
+          `<html><title>RCTD-740 Test | GetAV</title>` +
+          `${JSON.stringify({ videoSources })}</html>`,
+          { headers: { "content-type": "text/html" } },
+        );
       }
       if (/\/rctd-740\/\d+\/index\.txt$/.test(target)) {
         return new Response([
@@ -2786,7 +3145,8 @@ test("loads all GetAV qualities through Jina without a direct page request", asy
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(calls.includes(pageUrl), false);
+  assert.equal(calls.includes(readerUrl), true);
+  assert.equal(calls.includes(pageUrl), true);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
     [
@@ -2987,6 +3347,100 @@ test("embeds a directly streamable media source in movie details", async () => {
   assert.match(payload.Path, /\/Videos\/42\/stream\.mp4/);
   assert.equal(payload.MediaSources[0].MediaStreams[1].Type, "Audio");
   assert.equal(payload.MediaSources[0].DefaultSubtitleStreamIndex, 2);
+});
+
+test("returns a stable detail ETag and honors conditional detail requests", async () => {
+  const fetchImpl = async (url) => {
+    if (url.includes("/v4/movies/42")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: {
+            movie: {
+              id: 42,
+              number: "TEST-001",
+              title: "Test Movie",
+              can_play: true,
+            },
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (url.includes(`${RESOLVER}/api/v/resolve`)) {
+      return new Response(
+        JSON.stringify({
+          variants: [{
+            variant: "original",
+            sourceUrl: "https://fast-stream.jav.si/video/test.mp4",
+            sourceType: "video/mp4",
+          }],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    assert.match(url, /\/api\/subtitle\?name=TEST-001/);
+    return new Response(
+      JSON.stringify({ code: 0, data: [] }),
+      { headers: { "content-type": "application/json" } },
+    );
+  };
+
+  const first = await handleProxy(
+    new Request("https://clone.example/Items/42?api_key=bbjavdb-guest"),
+    {},
+    {},
+    fetchImpl,
+  );
+  const firstPayload = await first.json();
+  const etag = first.headers.get("etag");
+  assert.ok(etag);
+  assert.equal(firstPayload.Id, "42");
+  assert.equal(firstPayload.MediaSources[0].Id, firstPayload.MediaSources[0].MediaSourceId);
+  assert.equal(firstPayload.UserData.PlaybackPositionTicks, 0);
+
+  const unchanged = await handleProxy(
+    new Request("https://clone.example/Items/42?api_key=bbjavdb-guest", {
+      headers: { "if-none-match": etag },
+    }),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(unchanged.status, 304);
+  assert.equal(unchanged.headers.get("etag"), etag);
+
+  resetEmbyCachesForTests();
+  const changed = await handleProxy(
+    new Request("https://clone.example/Items/42?api_key=bbjavdb-guest", {
+      headers: { "if-none-match": etag },
+    }),
+    {},
+    {},
+    async (url, init) => {
+      if (url.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: {
+                id: 42,
+                number: "TEST-001",
+                title: "Test Movie Changed",
+                can_play: true,
+              },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      return fetchImpl(url, init);
+    },
+  );
+  assert.equal(changed.status, 200);
+  const changedPayload = await changed.json();
+  assert.equal(changedPayload.Name, "TEST-001 Test Movie Changed");
+  assert.notEqual(changed.headers.get("etag"), etag);
 });
 
 test("serves inline HLS variants through a short Emby stream URL", async () => {
@@ -3400,6 +3854,270 @@ test("allows GG HLS media hosts and caches only complete segment GETs", async ()
     `bytes 0-${bytes.length - 1}/${bytes.length}`,
   );
   assert.deepEqual(new Uint8Array(await rangeResponse.arrayBuffer()), bytes);
+
+  const pseudoPngSourceUrl =
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/origin.image?token=gg";
+  const pseudoPngBytes = new Uint8Array(512);
+  pseudoPngBytes.set([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ], 0);
+  pseudoPngBytes[70] = 0x47;
+  pseudoPngBytes[258] = 0x47;
+  pseudoPngBytes[446] = 0x47;
+  const expectedTsBytes = pseudoPngBytes.slice(70);
+  let pseudoPngFetches = 0;
+  const pseudoPngResponse = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(pseudoPngSourceUrl)}&kind=segment&hls=1`,
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      pseudoPngFetches += 1;
+      assert.equal(init.headers.get("range"), null);
+      return new Response(pseudoPngBytes, {
+        status: 200,
+        headers: {
+          "content-length": String(pseudoPngBytes.length),
+          "content-type": "image/png",
+        },
+      });
+    },
+  );
+
+  assert.equal(pseudoPngResponse.status, 200);
+  assert.equal(pseudoPngResponse.headers.get("content-type"), "video/mp2t");
+  assert.equal(
+    pseudoPngResponse.headers.get("content-length"),
+    String(expectedTsBytes.length),
+  );
+  assert.deepEqual(
+    new Uint8Array(await pseudoPngResponse.arrayBuffer()),
+    expectedTsBytes,
+  );
+
+  const pseudoPngRangeResponse = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(pseudoPngSourceUrl)}&kind=segment&hls=1`,
+      { headers: { range: "bytes=188-375" } },
+    ),
+    {},
+    {},
+    async () => {
+      throw new Error("cached pseudo PNG segment should not be fetched again");
+    },
+  );
+
+  assert.equal(pseudoPngFetches, 1);
+  assert.equal(pseudoPngRangeResponse.status, 206);
+  assert.equal(
+    pseudoPngRangeResponse.headers.get("content-range"),
+    `bytes 188-375/${expectedTsBytes.length}`,
+  );
+  assert.equal(pseudoPngRangeResponse.headers.get("content-length"), "188");
+  assert.deepEqual(
+    new Uint8Array(await pseudoPngRangeResponse.arrayBuffer()),
+    expectedTsBytes.slice(188, 376),
+  );
+
+  const rangeFirstSourceUrl =
+    "https://p19-ad-site-sign-sg.tiktokcdn.com/video/origin.image?token=gg";
+  const rangeFirstResponse = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(rangeFirstSourceUrl)}&kind=segment&hls=1`,
+      { headers: { range: "bytes=0-187" } },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      assert.equal(init.headers.get("range"), null);
+      return new Response(pseudoPngBytes, {
+        status: 200,
+        headers: {
+          "content-length": String(pseudoPngBytes.length),
+          "content-type": "image/png",
+        },
+      });
+    },
+  );
+
+  assert.equal(rangeFirstResponse.status, 206);
+  assert.equal(
+    rangeFirstResponse.headers.get("content-range"),
+    `bytes 0-187/${expectedTsBytes.length}`,
+  );
+  assert.deepEqual(
+    new Uint8Array(await rangeFirstResponse.arrayBuffer()),
+    expectedTsBytes.slice(0, 188),
+  );
+
+  const upstreamPartialSourceUrl =
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/origin.image?token=upstream-partial";
+  const upstreamPartialResponse = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(upstreamPartialSourceUrl)}&kind=segment&hls=1`,
+      { headers: { range: "bytes=0-187" } },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      assert.equal(init.headers.get("range"), null);
+      return new Response(pseudoPngBytes, {
+        status: 206,
+        headers: {
+          "content-length": String(pseudoPngBytes.length),
+          "content-range": `bytes 0-${pseudoPngBytes.length - 1}/${pseudoPngBytes.length}`,
+          "content-type": "image/png",
+        },
+      });
+    },
+  );
+
+  assert.equal(upstreamPartialResponse.status, 206);
+  assert.equal(
+    upstreamPartialResponse.headers.get("content-range"),
+    `bytes 0-${expectedTsBytes.length - 1}/${expectedTsBytes.length}`,
+  );
+  assert.deepEqual(
+    new Uint8Array(await upstreamPartialResponse.arrayBuffer()),
+    expectedTsBytes,
+  );
+
+  const malformedRangeResponse = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(pseudoPngSourceUrl)}&kind=segment&hls=1`,
+      { headers: { range: "bytes=not-a-range" } },
+    ),
+    {},
+    {},
+    async () => {
+      throw new Error("malformed range should fall back to the cached complete segment");
+    },
+  );
+
+  assert.equal(malformedRangeResponse.status, 200);
+  assert.deepEqual(
+    new Uint8Array(await malformedRangeResponse.arrayBuffer()),
+    expectedTsBytes,
+  );
+});
+
+test("caches complete GetAV HLS segments larger than 8 MiB", async () => {
+  const sourceUrl =
+    "https://static.worldstatic.com/cdn/assets/deliveries/v2/4k/seg-0.woff2?e=2104450940";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1&encrypted=1`;
+  const segmentLength = 13_357_600;
+  const segmentBytes = new Uint8Array(segmentLength);
+  segmentBytes.fill(0xa5);
+  let upstreamFetches = 0;
+
+  const firstFull = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    async (_url, init = {}) => {
+      upstreamFetches += 1;
+      assert.equal(init.headers.get("range"), null);
+      return new Response(segmentBytes, {
+        status: 200,
+        headers: {
+          "content-length": String(segmentLength),
+          "content-type": "application/octet-stream",
+        },
+      });
+    },
+  );
+
+  assert.equal(firstFull.status, 200);
+  assert.equal(firstFull.headers.get("content-length"), String(segmentLength));
+  assert.deepEqual(
+    new Uint8Array(await firstFull.arrayBuffer()),
+    segmentBytes,
+  );
+
+  const secondRange = await handleProxy(
+    new Request(proxyUrl, { headers: { range: "bytes=1024-1535" } }),
+    {},
+    {},
+    async () => {
+      throw new Error("large cached segment should not be fetched again");
+    },
+  );
+
+  assert.equal(upstreamFetches, 1);
+  assert.equal(secondRange.status, 206);
+  assert.equal(
+    secondRange.headers.get("content-range"),
+    `bytes 1024-1535/${segmentLength}`,
+  );
+  assert.equal(secondRange.headers.get("content-length"), "512");
+  assert.deepEqual(
+    new Uint8Array(await secondRange.arrayBuffer()),
+    segmentBytes.slice(1024, 1536),
+  );
+});
+
+test("does not cache a streamed media segment after an early client cancel", async () => {
+  const sourceUrl =
+    "https://static.worldstatic.com/cdn/assets/deliveries/v2/1080/seg-cancel.woff2?e=2104450940";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1&encrypted=1`;
+  const firstChunk = new Uint8Array([1, 2, 3, 4]);
+  const completeSegment = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  let upstreamFetches = 0;
+  let firstBodyCancelled = false;
+
+  const firstResponse = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    async () => {
+      upstreamFetches += 1;
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(firstChunk);
+        },
+        cancel() {
+          firstBodyCancelled = true;
+        },
+      }), {
+        status: 200,
+        headers: {
+          "content-length": String(completeSegment.byteLength),
+          "content-type": "application/octet-stream",
+        },
+      });
+    },
+  );
+
+  const reader = firstResponse.body.getReader();
+  const firstRead = await reader.read();
+  assert.deepEqual(firstRead.value, firstChunk);
+  await reader.cancel();
+  assert.equal(firstBodyCancelled, true);
+
+  const secondResponse = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    async () => {
+      upstreamFetches += 1;
+      return new Response(completeSegment, {
+        status: 200,
+        headers: {
+          "content-length": String(completeSegment.byteLength),
+          "content-type": "application/octet-stream",
+        },
+      });
+    },
+  );
+
+  assert.equal(upstreamFetches, 2);
+  assert.deepEqual(
+    new Uint8Array(await secondResponse.arrayBuffer()),
+    completeSegment,
+  );
 });
 
 test("uses the GetAV Referer for static.worldstatic.com media and keeps hotlink headers", async () => {
@@ -3703,7 +4421,7 @@ test("refreshes a stale media URL and accepts SenPlayer stream path variants", a
     "https://fast-stream.jav.si/video/fresh.mp4",
     "https://fast-stream.jav.si/video/fresh.mp4",
   ]);
-  assert.deepEqual(freshRanges, ["bytes=0-127", "bytes=0-3"]);
+  assert.deepEqual(freshRanges, ["bytes=0-511", "bytes=0-3"]);
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), videoBytes);
 });
 
@@ -3795,6 +4513,6 @@ test("streams relative URLs from alternate resolver response fields", async () =
     `${UPSTREAM}/video/fresh.mp4`,
     `${UPSTREAM}/video/fresh.mp4`,
   ]);
-  assert.deepEqual(freshRanges, ["bytes=0-127", "bytes=0-3"]);
+  assert.deepEqual(freshRanges, ["bytes=0-511", "bytes=0-3"]);
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), videoBytes);
 });
