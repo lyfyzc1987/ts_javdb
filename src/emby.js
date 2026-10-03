@@ -75,7 +75,12 @@ const MEDIA_HOSTS = new Set([
   "static.worldstatic.com",
   "www.fcjav.com",
 ]);
-const MEDIA_SUFFIXES = [".spfcas.com", ".gzankun.com"];
+const MEDIA_SUFFIXES = [
+  ".spfcas.com",
+  ".gzankun.com",
+  ".cloudvexario.xyz",
+  ".startupmarketingaid.cfd",
+];
 const GETAV_MEDIA_REFERER = "https://getav.net/";
 const INLINE_HLS_CONTENT_TYPES = new Set([
   "application/mpegurl",
@@ -102,7 +107,8 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v19";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v20";
+const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
 const HOME_MAX_SOURCE_PAGES = 40;
@@ -256,6 +262,8 @@ function jsonResponse(value, status = 200, extraHeaders = {}) {
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
+      "expires": "0",
+      "pragma": "no-cache",
       "access-control-allow-origin": "*",
       ...extraHeaders,
     },
@@ -453,12 +461,12 @@ const HLS_AES_BLOCK_LENGTH = 16;
 
 function hlsPathLooksLikeMediaSegment(pathname) {
   return INLINE_HLS_SEGMENT_PATTERN.test(pathname) ||
-    GOOGLE_DRIVE_MEDIA_PATH_PATTERN.test(pathname);
+    GOOGLE_DRIVE_MEDIA_PATH_PATTERN.test(pathname) ||
+    HLS_FONT_RESOURCE_PATTERN.test(pathname);
 }
 
-function hlsPathLooksLikeNonVideo(pathname, search = "", allowFont = false) {
-  return (!allowFont && HLS_FONT_RESOURCE_PATTERN.test(pathname)) ||
-    HLS_IMAGE_RESOURCE_PATTERN.test(pathname) ||
+function hlsPathLooksLikeNonVideo(pathname, search = "") {
+  return HLS_IMAGE_RESOURCE_PATTERN.test(pathname) ||
     INLINE_HLS_RESOURCE_PATTERN.test(`${pathname}${search}`);
 }
 
@@ -470,35 +478,26 @@ function absoluteHlsUri(value, baseUrl) {
   }
 }
 
-function hlsUriLooksLikeNonVideo(value, baseUrl, allowFont = false) {
+function hlsUriLooksLikeNonVideo(value, baseUrl) {
   const uri = absoluteHlsUri(value, baseUrl);
   if (!uri) return true;
   try {
     const url = new URL(uri);
-    return hlsPathLooksLikeNonVideo(url.pathname, url.search, allowFont);
+    return hlsPathLooksLikeNonVideo(url.pathname, url.search);
   } catch {
     return true;
   }
 }
 
-function hlsUriLooksLikeMediaSegment(value, baseUrl, allowFont = false) {
+function hlsUriLooksLikeMediaSegment(value, baseUrl) {
   const uri = absoluteHlsUri(value, baseUrl);
   if (!uri) return false;
   try {
     const url = new URL(uri);
-    return hlsPathLooksLikeMediaSegment(url.pathname) ||
-      (allowFont && HLS_FONT_RESOURCE_PATTERN.test(url.pathname));
+    return hlsPathLooksLikeMediaSegment(url.pathname);
   } catch {
     return false;
   }
-}
-
-function responseLooksLikeNonVideo(response) {
-  const contentType = String(response?.headers?.get("content-type") || "")
-    .split(";")[0]
-    .trim()
-    .toLowerCase();
-  return contentType.startsWith("font/") || contentType.startsWith("image/");
 }
 
 function bytesLookLikeFont(bytes) {
@@ -757,7 +756,6 @@ async function probeRemoteHlsSegment(
   try {
     const response = await fetchRemoteHlsResponse(url, fetchImpl, { range: true });
     if (!response?.ok) return false;
-    if (!keyContext && responseLooksLikeNonVideo(response)) return false;
     const bytes = new Uint8Array(await response.arrayBuffer()).subarray(0, 128);
     if (!bytes.length) return false;
     if (keyContext?.method === "AES-128") {
@@ -807,11 +805,10 @@ async function validateHlsPlaylistSource(
   let attemptedSegment = false;
   const childEntries = [];
   for (const entry of entries) {
-    const allowFont = Boolean(entry.key);
-    if (hlsUriLooksLikeNonVideo(entry.uri, baseUrl, allowFont)) {
+    if (hlsUriLooksLikeNonVideo(entry.uri, baseUrl)) {
       continue;
     }
-    if (hlsUriLooksLikeMediaSegment(entry.uri, baseUrl, allowFont)) {
+    if (hlsUriLooksLikeMediaSegment(entry.uri, baseUrl)) {
       attemptedSegment = true;
       if (await probeRemoteHlsSegment(
         entry.uri,
@@ -862,7 +859,6 @@ async function validateRemoteHlsPlaylist(
     return true;
   }
   if (!response?.ok) return false;
-  if (responseLooksLikeNonVideo(response)) return false;
 
   let playlist;
   try {
@@ -918,7 +914,6 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl) {
     .toLowerCase();
   if (
     contentType.startsWith("image/") ||
-    contentType.startsWith("font/") ||
     contentType === "text/html" ||
     contentType === "application/xhtml+xml" ||
     contentType === "application/json" ||
@@ -1073,12 +1068,18 @@ function mediaProxyRequestHeaders(request, env, sourceUrl = "", options = {}) {
   return headers;
 }
 
-function mediaProxyResponseHeaders(upstream) {
+function mediaProxyResponseHeaders(upstream, options = {}) {
+  const partialResponse = upstream.status === 206 ||
+    Boolean(upstream.headers.get("content-range"));
+  const cacheableMediaSegment = options.cacheableMediaSegment === true &&
+    !partialResponse;
   const headers = new Headers({
     "access-control-allow-origin": "*",
     "access-control-expose-headers":
       "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified",
-    "cache-control": "no-store",
+    "cache-control": cacheableMediaSegment
+      ? `public, max-age=${MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS}, stale-while-revalidate=30`
+      : "no-store",
     "x-content-type-options": "nosniff",
   });
   for (const name of [
@@ -1247,10 +1248,22 @@ function isHlsResponse(upstream, sourceUrl) {
 }
 
 async function proxyMediaResponse(upstream, sourceUrl, request, env, depth = 0) {
-  const headers = mediaProxyResponseHeaders(upstream);
   const requestUrl = new URL(request.url);
   const kind = String(requestUrl.searchParams.get("kind") || "").toLowerCase();
   const encrypted = requestUrl.searchParams.get("encrypted") === "1";
+  const hlsManifestRequest = requestTargetsHlsManifest(request, sourceUrl);
+  const cacheableMediaSegment =
+    request.method === "GET" &&
+    !request.headers.has("range") &&
+    !hlsManifestRequest &&
+    kind !== "key" &&
+    kind !== "manifest" &&
+    kind !== "map" &&
+    upstream.status >= 200 &&
+    upstream.status < 300;
+  const headers = mediaProxyResponseHeaders(upstream, {
+    cacheableMediaSegment,
+  });
   const upstreamType = String(headers.get("content-type") || "").toLowerCase();
   if (
     kind === "key" ||
@@ -1266,7 +1279,6 @@ async function proxyMediaResponse(upstream, sourceUrl, request, env, depth = 0) 
     });
   }
 
-  const hlsManifestRequest = requestTargetsHlsManifest(request, sourceUrl);
   if (
     !isHlsResponse(upstream, sourceUrl) ||
     (upstream.status === 206 && !hlsManifestRequest)

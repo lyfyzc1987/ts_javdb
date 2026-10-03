@@ -1523,8 +1523,9 @@ test("keeps extensionless Google Drive HLS and drops .image pseudo-HLS", async (
   }
 });
 
-test("drops remote HLS sources whose manifest points at font data", async () => {
+test("drops remote HLS sources whose segment body is real font data", async () => {
   const sourceUrl = "https://static.worldstatic.com/rctd-740/4k/index.txt";
+  const segmentUrl = "https://static.worldstatic.com/rctd-740/4k/seg-0.woff2";
   const calls = [];
   const response = await handleProxy(
     new Request("https://clone.example/Items/42/PlaybackInfo", {
@@ -1568,6 +1569,14 @@ test("drops remote HLS sources whose manifest points at font data", async () => 
           headers: { "content-type": "application/vnd.apple.mpegurl" },
         });
       }
+      if (target === segmentUrl) {
+        return new Response(Uint8Array.from([
+          0x77, 0x4f, 0x46, 0x32, 0x00, 0x01, 0x00, 0x00,
+        ]), {
+          status: 206,
+          headers: { "content-type": "font/woff2" },
+        });
+      }
       assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
       return new Response(
         JSON.stringify({ code: 0, data: [] }),
@@ -1580,7 +1589,138 @@ test("drops remote HLS sources whose manifest points at font data", async () => 
   assert.equal(response.status, 200);
   assert.equal(payload.MediaSources.length, 0);
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
-  assert.equal(calls.some((target) => /seg-0\.woff2/.test(target)), false);
+  assert.equal(calls.includes(segmentUrl), true);
+});
+
+test("keeps four RCTD-740 playback sources including GG font-path HLS variants", async () => {
+  const getav4kSource =
+    "https://static.worldstatic.com/rctd-740/4k/index.txt?t=4k";
+  const getav1080Source =
+    "https://static.worldstatic.com/rctd-740/1080/index.txt?t=1080";
+  const ggOriginalSegment =
+    "https://dd2stliwt0bc.cloudvexario.xyz/hls/01/08392/seg-1-f3-v1-a1.woff2";
+  const ggReducedSegment =
+    "https://wt4pjiive9agjpl.startupmarketingaid.cfd/hls/01/08392/seg-1-f3-v1-a1.woff2";
+  const inlinePlaylist = (segmentUrl) => [
+    "#EXTM3U",
+    "#EXT-X-TARGETDURATION:10",
+    "#EXT-X-VERSION:3",
+    "#EXT-X-MEDIA-SEQUENCE:1",
+    "#EXTINF:10.010,",
+    segmentUrl,
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const inlineSource = (playlist) =>
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(playlist)}`;
+  const segmentBytes = Uint8Array.from([0x47, 0x40, 0x11, 0x10, 0x00, 0x01]);
+  const calls = [];
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [
+              {
+                variant: "getav_raw_4k",
+                label: "原版 4K (GetAV)",
+                sourceUrl: getav4kSource,
+                sourceType: "application/vnd.apple.mpegurl",
+                quality: 2160,
+              },
+              {
+                variant: "getav_raw_1080p",
+                label: "原版 1080P (GetAV)",
+                sourceUrl: getav1080Source,
+                sourceType: "application/vnd.apple.mpegurl",
+                quality: 1080,
+              },
+              {
+                variant: "javgg_original",
+                label: "原版 (服务器GG)",
+                sourceUrl: inlineSource(inlinePlaylist(ggOriginalSegment)),
+                sourceType: "application/vnd.apple.mpegurl",
+              },
+              {
+                variant: "javgg_reducing_mosaic",
+                label: "去码版 (服务器GG)",
+                sourceUrl: inlineSource(inlinePlaylist(ggReducedSegment)),
+                sourceType: "application/vnd.apple.mpegurl",
+              },
+            ],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === getav4kSource || target === getav1080Source) {
+        const directory = target.includes("/4k/") ? "4k" : "1080";
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:10",
+          "#EXT-X-VERSION:3",
+          "#EXT-X-MEDIA-SEQUENCE:1",
+          "#EXTINF:10.010,",
+          `https://static.worldstatic.com/rctd-740/${directory}/seg-1.ts`,
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (
+        /static\.worldstatic\.com\/rctd-740\/(?:4k|1080)\/seg-1\.ts/.test(target) ||
+        target === ggOriginalSegment ||
+        target === ggReducedSegment
+      ) {
+        return new Response(segmentBytes, {
+          status: 206,
+          headers: { "content-type": "application/octet-stream" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(response.headers.get("expires"), "0");
+  assert.equal(response.headers.get("pragma"), "no-cache");
+  assert.equal(payload.MediaSources.length, 4);
+  assert.deepEqual(
+    payload.MediaSources.map((source) => source.Name),
+    [
+      "原版 4K (GetAV)",
+      "原版 1080P (GetAV)",
+      "原版 (服务器GG)",
+      "去码版 (服务器GG)",
+    ],
+  );
+  assert.equal(
+    payload.MediaSources.every((source) => source.Container === "m3u8"),
+    true,
+  );
+  assert.equal(calls.includes(ggOriginalSegment), true);
+  assert.equal(calls.includes(ggReducedSegment), true);
 });
 
 test("keeps AES-128 HLS sources whose encrypted segments use font paths", async () => {
@@ -3199,6 +3339,67 @@ test("forwards Range and conditional headers through the media proxy", async () 
     "Wed, 21 Oct 2015 07:28:00 GMT",
   );
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
+});
+
+test("allows GG HLS media hosts and caches only complete segment GETs", async () => {
+  const bytes = new Uint8Array([0x47, 0x40, 0x11, 0x10]);
+  const hosts = [
+    "https://dd2stliwt0bc.cloudvexario.xyz/hls/01/08392/seg-1-f3-v1-a1.woff2",
+    "https://wt4pjiive9agjpl.startupmarketingaid.cfd/hls/01/08392/seg-1-f3-v1-a1.woff2",
+  ];
+
+  for (const sourceUrl of hosts) {
+    const response = await handleProxy(
+      new Request(
+        `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`,
+      ),
+      {},
+      {},
+      async () => new Response(bytes, {
+        status: 200,
+        headers: {
+          "content-length": String(bytes.length),
+          "content-type": "application/octet-stream",
+        },
+      }),
+    );
+
+    assert.equal(response.status, 200);
+    assert.match(
+      response.headers.get("cache-control"),
+      /^public, max-age=90, stale-while-revalidate=30$/,
+    );
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
+  }
+
+  const rangeSourceUrl = hosts[0];
+  const rangeResponse = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(rangeSourceUrl)}&kind=segment&hls=1`,
+      { headers: { range: `bytes=0-${bytes.length - 1}` } },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      assert.equal(init.headers.get("range"), `bytes=0-${bytes.length - 1}`);
+      return new Response(bytes, {
+        status: 206,
+        headers: {
+          "content-length": String(bytes.length),
+          "content-range": `bytes 0-${bytes.length - 1}/${bytes.length}`,
+          "content-type": "application/octet-stream",
+        },
+      });
+    },
+  );
+
+  assert.equal(rangeResponse.status, 206);
+  assert.equal(rangeResponse.headers.get("cache-control"), "no-store");
+  assert.equal(
+    rangeResponse.headers.get("content-range"),
+    `bytes 0-${bytes.length - 1}/${bytes.length}`,
+  );
+  assert.deepEqual(new Uint8Array(await rangeResponse.arrayBuffer()), bytes);
 });
 
 test("uses the GetAV Referer for static.worldstatic.com media and keeps hotlink headers", async () => {
