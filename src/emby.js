@@ -4112,7 +4112,7 @@ async function getMoviePage(query, env, fetchImpl, token = "", options = {}) {
   const explicitParentId = query.get("ParentId") || "";
   // Emby 的“搜索”是不带 ParentId 的全局搜索：同一个关键词的作品会分散在
   // “中文字幕/有码/无码/欧美”四个片库里，只查默认的“中文字幕”库会明显少结果
-  // （实测标题搜“母”只有 560 多条，跨库并集有 1200+）。所以这里把全局搜索
+  // （实测标题搜“母”只有 560 多条，跨库并集有 830 多条）。所以这里把全局搜索
   // 交给 keywordMoviesPage 跨库汇总；带 ParentId 的库内搜索仍走下面的单库逻辑。
   if (searchTerm && !explicitParentId) {
     return keywordMoviesPage(query, env, fetchImpl, token, searchTerm, "search", {
