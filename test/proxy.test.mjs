@@ -294,7 +294,7 @@ function expectedItemEtag(payload) {
     }))
     : [];
   const stableDto = {
-    version: "item-dto-v11",
+    version: "item-dto-v12",
     Id: payload?.Id || "",
     Name: payload?.Name || "",
     OriginalTitle: payload?.OriginalTitle || "",
@@ -307,6 +307,7 @@ function expectedItemEtag(payload) {
     People: payload?.People || [],
     Studios: payload?.Studios || [],
     ImageTags: payload?.ImageTags || {},
+    BackdropImageTags: payload?.BackdropImageTags || [],
     MediaSourceCount: Number(payload?.MediaSourceCount) || sources.length,
     MediaSources: sources,
     Played: Boolean(userData.Played),
@@ -1146,6 +1147,140 @@ test("reports the exact search count after filtering fuzzy results", async () =>
   assert.equal(response.status, 200);
   assert.equal(payload.TotalRecordCount, 1);
   assert.deepEqual(payload.Items.map((item) => item.Id), ["NQ7Mdg"]);
+});
+
+test("expands single-character searches with a wildcard and a larger page size", async () => {
+  const searchCalls = [];
+  const movies = [
+    {
+      id: "mother-1",
+      number: "ABC-001",
+      title: "母の日",
+      can_play: true,
+      has_cnsub: true,
+    },
+  ];
+  const response = await handleProxy(
+    new Request(
+      "https://clone.example/emby/Items?SearchTerm=%E6%AF%8D&Recursive=true&IncludeItemTypes=Movie&Limit=20",
+    ),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v2/search?") || target.includes("/v2/search&")) {
+        searchCalls.push(target);
+      }
+      return new Response(
+        JSON.stringify({ success: 1, data: { movies } }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(payload.Items.map((item) => item.Id), ["mother-1"]);
+  assert.equal(searchCalls.length > 0, true);
+  for (const target of searchCalls) {
+    // 单字关键词必须补通配符，否则上游固定返回 0 条。
+    assert.match(target, /q=%E6%AF%8D\*/);
+    // 每页 50 条（上游上限决定单库最多 ~950 条，20 条/页时只有 ~380 条）。
+    assert.match(target, /limit=50/);
+  }
+});
+
+test("spans every library for a global search without a ParentId", async () => {
+  const filters = [];
+  const moviesByFilter = {
+    subtitle: [
+      {
+        id: "cn-1",
+        number: "CN-001",
+        title: "母 中文字幕",
+        can_play: true,
+        has_cnsub: true,
+      },
+    ],
+    can_play: [
+      {
+        id: "cn-1",
+        number: "CN-001",
+        title: "母 中文字幕",
+        can_play: true,
+        has_cnsub: true,
+      },
+      {
+        id: "raw-1",
+        number: "RAW-001",
+        title: "母 无字幕",
+        can_play: true,
+        has_cnsub: false,
+      },
+    ],
+  };
+  const response = await handleProxy(
+    new Request(
+      "https://clone.example/emby/Items?SearchTerm=%E6%AF%8D&Recursive=true&IncludeItemTypes=Movie&Limit=20",
+    ),
+    {},
+    {},
+    async (url) => {
+      const filter = new URL(String(url)).searchParams.get("movie_filter_by");
+      filters.push(filter);
+      return new Response(
+        JSON.stringify({ success: 1, data: { movies: moviesByFilter[filter] || [] } }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  // 不带 ParentId 的全局搜索要覆盖“中文字幕”和其余三个片库（can_play），
+  // 否则搜索结果会明显少于片库里实际存在的作品。
+  assert.equal(filters.includes("subtitle"), true);
+  assert.equal(filters.includes("can_play"), true);
+  // 合并去重后两类结果都在（cn-1 重复出现只保留一次）。
+  assert.deepEqual(payload.Items.map((item) => item.Id).sort(), ["cn-1", "raw-1"]);
+  // TotalRecordCount 必须是跨库合并后的真实数量，客户端才会继续往下翻页。
+  assert.equal(payload.TotalRecordCount, 2);
+});
+
+test("keeps a ParentId search inside that single library", async () => {
+  const filters = [];
+  const response = await handleProxy(
+    new Request(
+      "https://clone.example/emby/Items?SearchTerm=%E6%AF%8D&ParentId=bbjavdb-chinese-playable&Recursive=true&IncludeItemTypes=Movie&Limit=20",
+    ),
+    {},
+    {},
+    async (url) => {
+      filters.push(new URL(String(url)).searchParams.get("movie_filter_by"));
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: {
+            movies: [
+              {
+                id: "cn-1",
+                number: "CN-001",
+                title: "母 中文字幕",
+                can_play: true,
+                has_cnsub: true,
+              },
+            ],
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual([...new Set(filters)], ["subtitle"]);
+  assert.deepEqual(payload.Items.map((item) => item.Id), ["cn-1"]);
 });
 
 test("resolves a movie number through exact search and exposes all playback sources", async () => {
@@ -5362,6 +5497,65 @@ test("serves a movie primary image through the Emby endpoint", async () => {
   assert.equal(imageUrl, "https://jdforrepam.com/covers/test.jpg");
   assert.equal(response.headers.get("content-type"), "image/jpeg");
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), imageBytes);
+});
+
+test("exposes upstream preview images as Emby backdrop art", async () => {
+  const imageBytes = new Uint8Array([255, 216, 255, 217]);
+  const encryptedImageBytes = new Uint8Array([234, 21, 50, 21, 51]);
+  const movie = {
+    id: "42",
+    number: "TEST-042",
+    cover_url: "https://jdforrepam.com/covers/test.jpg",
+    preview_images: [
+      {
+        thumb_url: "https://jdforrepam.com/samples/test_s_0.jpg",
+        large_url: "https://jdforrepam.com/samples/test_l_0.jpg",
+      },
+      {
+        thumb_url: "https://jdforrepam.com/samples/test_s_1.jpg",
+        large_url: "https://jdforrepam.com/samples/test_l_1.jpg",
+      },
+    ],
+  };
+  const movieResponse = () => new Response(
+    JSON.stringify({ success: 1, data: { movie } }),
+    { headers: { "content-type": "application/json" } },
+  );
+
+  const detail = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    {},
+    {},
+    async (url) => String(url).includes("/v4/movies/42")
+      ? movieResponse()
+      : new Response(encryptedImageBytes, { headers: { "content-type": "image/jpeg" } }),
+  );
+  const payload = await detail.json();
+  assert.equal(detail.status, 200);
+  // 客户端凭这两个 tag 才知道“艺术图”区块有几张图。
+  assert.deepEqual(payload.BackdropImageTags, ["0", "1"]);
+
+  let backdropUrl;
+  const image = await handleProxy(
+    new Request("https://clone.example/Items/42/Images/Backdrop/1"),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return movieResponse();
+      }
+      backdropUrl = target;
+      return new Response(encryptedImageBytes, {
+        headers: { "content-type": "binary/octet-stream" },
+      });
+    },
+  );
+  assert.equal(image.status, 200);
+  // 艺术图取上游预览剧照的大图，而不是封面。
+  assert.equal(backdropUrl, "https://jdforrepam.com/samples/test_l_1.jpg");
+  assert.equal(image.headers.get("content-type"), "image/jpeg");
+  assert.deepEqual(new Uint8Array(await image.arrayBuffer()), imageBytes);
 });
 
 test("serves the advertised Chinese subtitle stream", async () => {

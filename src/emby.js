@@ -102,10 +102,10 @@ const MAX_HLS_REWRITE_DEPTH = 8;
 const HLS_PLAYLIST_SCAN_MAX_CHARS = 64 * 1024;
 const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // DTO 结构变化时提升版本，客户端会把它当成新的实体版本并刷新旧详情页缓存。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v11";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v12";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-05-instant-detail-6";
+const SERVER_BUILD_ID = "2026-10-06-search-backdrop-3";
 const REMOTE_HLS_PROBE_TIMEOUT_MS = 3500;
 // 整个“播放源可用性校验”的总预算。校验是逐条线路探测上游分片，慢 CDN 上
 // 单条就可能超过 3 秒；如果让所有线路都校验完再返回，冷启动详情/PlaybackInfo
@@ -141,10 +141,15 @@ const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
 const HOME_MAX_SOURCE_PAGES = 40;
-// 上游 /v2/search 无论 limit 传多少都固定返回 20 条；按 50 判断末页会把
-// 第一页误判成最后一页，导致后页资源搜不到。
-const SEARCH_SOURCE_PAGE_SIZE = 20;
+// 上游 /v2/search 会遵守 limit（实测 limit=20 → 每页 20 条；limit=50 → 每页 50 条），
+// 但最多只翻到第 20 页左右，所以“每页条数”直接决定能搜到的总量。
+// 原先用 20：单库最多 ~19 页 ×20 ≈ 380 条（“母亲”“母”只有 300 多条的根因）。
+// 改成 50 后单库最多 ~19 页 ×50 = 950 条，恢复客户端以前看到的数量级。
+const SEARCH_SOURCE_PAGE_SIZE = 50;
+// 上游在第 20 页（limit=50 时）会返回空页，循环会自然结束；给一个宽松上界即可。
 const SEARCH_MAX_SOURCE_PAGES = 40;
+// 详情页“艺术图（Backdrop）”最多暴露多少张上游预览剧照。
+const BACKDROP_IMAGE_LIMIT = 20;
 const IMAGE_CONTENT_TYPES = new Map([
   [".avif", "image/avif"],
   [".gif", "image/gif"],
@@ -3199,6 +3204,18 @@ function exactSearchCode(searchTerm) {
   return movieNumberFromText(String(searchTerm || "").trim());
 }
 
+// 上游对“单个汉字/单字母”这种极短关键词直接返回 0 条（实测 q=母 → 0 条，
+// q=人 / q=大 / q=A / q=1 同样为 0），必须补通配符才搜得到（q=母* → 950 条）。
+// 多字符关键词加不加 "*" 结果数量一致（母亲 / 温泉 / 时间停止 / nsps 实测相同），
+// 所以只在短关键词上补，既修好单字搜索，又不改变既有搜索语义。
+function upstreamSearchQuery(searchTerm, exactCode) {
+  const term = String(searchTerm || "").trim();
+  if (!term || exactCode || term.includes("*")) {
+    return term;
+  }
+  return [...term].length <= 2 ? `${term}*` : term;
+}
+
 function movieMatchesExactSearch(movie, code) {
   if (!code) return false;
   return movieNumberFromText(movieNumber(movie)) === code;
@@ -3242,6 +3259,9 @@ async function collectSearchRoundMovies(options) {
     acceptMovie,
   } = options;
 
+  // 单字关键词要补 "*" 上游才返回结果（见 upstreamSearchQuery 注释）。
+  const upstreamQuery = upstreamSearchQuery(searchTerm, exactCode);
+
   return fetchPagesInParallel({
     maxPages: SEARCH_MAX_SOURCE_PAGES,
     pageSize: SEARCH_SOURCE_PAGE_SIZE,
@@ -3251,7 +3271,7 @@ async function collectSearchRoundMovies(options) {
       : movies.length >= requiredCount,
     fetchPage: (page) => javdbRequest("/v2/search", env, fetchImpl, {
       query: {
-        q: searchTerm,
+        q: upstreamQuery,
         page,
         type: "movie",
         movie_filter_by: filterBy,
@@ -3613,6 +3633,32 @@ function movieTaglines(movie) {
   return tagline ? [tagline] : undefined;
 }
 
+// 上游影片详情里的 preview_images 是“预览剧照”数组，元素形如
+// { thumb_url, large_url }。Emby 客户端详情页的“艺术图（Backdrop）”就用它来填：
+// 有剧照才返回，没剧照就不给 BackdropImageTags，避免客户端显示空白区块。
+// 注意：只有 /v4/movies/{id} 详情接口会返回真实图片地址；
+// /v2/search 的列表项只带 has_preview_images 标记，preview_images 是空数组。
+function movieBackdropImages(movie) {
+  const raw = movie?.preview_images;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const urls = [];
+  for (const entry of raw) {
+    const value = typeof entry === "string"
+      ? entry
+      : entry?.large_url || entry?.thumb_url || entry?.url || "";
+    const url = String(value || "").trim();
+    if (url) {
+      urls.push(url);
+    }
+    if (urls.length >= BACKDROP_IMAGE_LIMIT) {
+      break;
+    }
+  }
+  return urls;
+}
+
 function itemEtag(item) {
   const userData = item?.UserData || {};
   const sources = Array.isArray(item?.MediaSources)
@@ -3639,6 +3685,7 @@ function itemEtag(item) {
     People: item?.People || [],
     Studios: item?.Studios || [],
     ImageTags: item?.ImageTags || {},
+    BackdropImageTags: item?.BackdropImageTags || [],
     MediaSourceCount: Number(item?.MediaSourceCount) || sources.length,
     MediaSources: sources,
     Played: Boolean(userData.Played),
@@ -3683,6 +3730,7 @@ function itemJsonResponse(item, request) {
 function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRARY_ID) {
   const id = String(movie.id ?? movie.number ?? "");
   const image = movie.cover_url || movie.thumb_url || "";
+  const backdropImages = movieBackdropImages(movie);
   const displayDate = movieDisplayDate(movie);
   const date = displayDate || movie.release_date || movie.released_at || "";
   const year = Number.parseInt(String(date).slice(0, 4), 10);
@@ -3743,7 +3791,9 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
     TagItems: uniqueTags.map((name) => ({ Name: name, Id: tagIdForName(name) })),
     People: actors,
     ImageTags: image ? { Primary: id } : {},
-    BackdropImageTags: [],
+    // 用上游预览剧照当“艺术图”：客户端凭这里的 tag + 下标请求
+    // /Items/{id}/Images/Backdrop/{index}，服务端再回源取真实图片。
+    BackdropImageTags: backdropImages.map((_, index) => String(index)),
     PrimaryImageAspectRatio: image ? 0.667 : undefined,
     ProviderIds: { JavDB: id },
     UserData: {
@@ -4048,14 +4098,28 @@ function sortMoviesForClient(movies, comparators, sortOrder) {
   return sorted;
 }
 
-async function getMoviePage(query, env, fetchImpl, token = "") {
+async function getMoviePage(query, env, fetchImpl, token = "", options = {}) {
+  // fastSearch：搜索结果页需要“准确的 TotalRecordCount”（客户端凭它决定还能
+  // 往下翻多少），所以要全量扫描后给真实数量；只有搜索联想（SearchHints）
+  // 这种“边打字边请求”的场景才保留快速分页，避免每次输入都等全量抓取。
+  const fastSearch = Boolean(options.fastSearch);
   const startIndex = Math.max(0, Number(query.get("StartIndex") || 0));
   const limit = Math.min(
     DEFAULT_PAGE_SIZE,
     Math.max(1, Number(query.get("Limit") || DEFAULT_PAGE_SIZE)),
   );
   const searchTerm = query.get("SearchTerm") || query.get("searchTerm") || "";
-  const requestedParentId = query.get("ParentId") || CHINESE_PLAYABLE_LIBRARY_ID;
+  const explicitParentId = query.get("ParentId") || "";
+  // Emby 的“搜索”是不带 ParentId 的全局搜索：同一个关键词的作品会分散在
+  // “中文字幕/有码/无码/欧美”四个片库里，只查默认的“中文字幕”库会明显少结果
+  // （实测标题搜“母”只有 560 多条，跨库并集有 1200+）。所以这里把全局搜索
+  // 交给 keywordMoviesPage 跨库汇总；带 ParentId 的库内搜索仍走下面的单库逻辑。
+  if (searchTerm && !explicitParentId) {
+    return keywordMoviesPage(query, env, fetchImpl, token, searchTerm, "search", {
+      exactTotal: !fastSearch,
+    });
+  }
+  const requestedParentId = explicitParentId || CHINESE_PLAYABLE_LIBRARY_ID;
   const library = libraryForRequestedId(requestedParentId);
   const parentId = requestedParentId === ROOT_ID ? ROOT_ID : library.id;
   const requiredCount = startIndex + limit;
@@ -4064,7 +4128,9 @@ async function getMoviePage(query, env, fetchImpl, token = "") {
   const sortComparators = buildSortComparators(sortBy);
   // 默认“最新上架”顺序走原有快速路径；
   // 一旦客户端明确要求“按年份/名称”等排序，就抓全量后再排序分页，保证排序真的生效。
-  const needsFullCatalog = !isNaturalCatalogOrder(sortComparators, sortOrder);
+  const needsFullCatalog =
+    !isNaturalCatalogOrder(sortComparators, sortOrder) ||
+    (Boolean(searchTerm) && !fastSearch);
   const upstreamToken = await apiToken(token, env);
 
   // 同一页数据短时间内直接复用：客户端返回再进、翻页回退、重复请求都不再回源。
@@ -4321,7 +4387,7 @@ function personItemDto(id, name, env) {
 // 按关键词回源搜索作品（跨分类汇总、去重后返回）。
 // searchTerm 可以是演员名、类别名、标签名、片商名或系列名；
 // 传空字符串表示不搜索、直接按“最新上架”浏览（“可播放 / 中文字幕”这类内置标签用）。
-async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cacheKind) {
+async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cacheKind, options = {}) {
   const startIndex = Math.max(0, Number(query.get("StartIndex") || 0));
   const limit = Math.min(
     DEFAULT_PAGE_SIZE,
@@ -4341,7 +4407,11 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
   const sortOrder = /^asc/i.test(String(query.get("SortOrder") || "")) ? "asc" : "desc";
   const sortBy = String(query.get("SortBy") || "");
   const sortComparators = buildSortComparators(sortBy);
-  const needsFullCatalog = !isNaturalCatalogOrder(sortComparators, sortOrder);
+  // exactTotal：关键词搜索要在“结果条数”上给客户端一个准确数字。
+  // 快速分页只抓到“够当前页”就停，未抓完时只能报一个近似值（matches.length+1），
+  // 客户端会据此以为总共只有这么多，搜索结果看起来就“变少了”。
+  const needsFullCatalog =
+    Boolean(options.exactTotal) || !isNaturalCatalogOrder(sortComparators, sortOrder);
   const upstreamToken = await apiToken(token, env);
 
   const cacheKey = [
@@ -4457,7 +4527,10 @@ async function collectionMoviesPage(query, env, fetchImpl, token, name) {
     browseQuery.delete("ParentId");
     return keywordMoviesPage(browseQuery, env, fetchImpl, token, "", "collection-all");
   }
-  return keywordMoviesPage(query, env, fetchImpl, token, name, "collection");
+  // 点标签/类别/片商/系列后，客户端同样会显示“共 N 条”，所以这里也要真实数量。
+  return keywordMoviesPage(query, env, fetchImpl, token, name, "collection", {
+    exactTotal: true,
+  });
 }
 
 // 演员：客户端点演员后带的请求一般是 /Items?PersonIds=person:<名字>&...
@@ -4480,7 +4553,9 @@ async function personMoviesPage(query, env, fetchImpl, token) {
       StartIndex: Math.max(0, Number(query.get("StartIndex") || 0)),
     };
   }
-  return keywordMoviesPage(query, env, fetchImpl, token, searchTerm, "person");
+  return keywordMoviesPage(query, env, fetchImpl, token, searchTerm, "person", {
+    exactTotal: true,
+  });
 }
 
 // 在单个分类里抓取作品：给了关键词就回源搜索，没给关键词就按“最新上架”浏览。
@@ -8032,7 +8107,11 @@ function isEmbyClientRequest(request) {
   );
 }
 
-async function imageResponse(id, request, env, fetchImpl, token) {
+// imageType: Primary（封面）/ Backdrop（艺术图）。Backdrop 取上游预览剧照；
+// 指定下标越界或没有剧照时退回封面，保证客户端不会拿到 404 空白图。
+async function imageResponse(id, request, env, fetchImpl, token, options = {}) {
+  const imageType = String(options.imageType || "Primary").toLowerCase();
+  const imageIndex = Math.max(0, Number(options.imageIndex) || 0);
   // 图片是列表滚动时最密集的请求：先看 Cloudflare 边缘缓存能不能直接命中。
   const edgeCache = typeof caches !== "undefined" && caches && caches.default
     ? caches.default
@@ -8049,7 +8128,10 @@ async function imageResponse(id, request, env, fetchImpl, token) {
     } catch {}
   }
   const movie = await getMovieCached(id, env, fetchImpl, token);
-  const imageUrl = safeMediaUrl(movie?.cover_url || movie?.thumb_url, env);
+  const cover = movie?.cover_url || movie?.thumb_url || "";
+  const backdrops = movieBackdropImages(movie);
+  const picked = imageType === "backdrop" ? backdrops[imageIndex] || "" : "";
+  const imageUrl = safeMediaUrl(picked || cover, env);
   if (!imageUrl) {
     return errorResponse(404, "Movie image not found");
   }
@@ -9306,7 +9388,8 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       const hintLimit = Number(url.searchParams.get("Limit") || 100);
       if (Number.isFinite(hintStart) && hintStart > 0) hintQuery.set("StartIndex", String(hintStart));
       if (Number.isFinite(hintLimit) && hintLimit > 0) hintQuery.set("Limit", String(hintLimit));
-      const result = await getMoviePage(hintQuery, env, fetchImpl, token);
+      // 搜索联想是“边打字边发”的，保留快速分页；它不需要准确的 TotalRecordCount。
+      const result = await getMoviePage(hintQuery, env, fetchImpl, token, { fastSearch: true });
       prewarmSearchResults(result, env, fetchImpl, ctx);
       return jsonResponse({
         SearchHints: result.Items.map((item) => ({
@@ -9361,10 +9444,24 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
     return genericFallbackDelete;
   }
 
-  const imageMatch = path.match(/^\/Items\/([^/]+)\/Images\/Primary$/i);
+  // Emby 标准图片地址：/Items/{id}/Images/{ImageType}[/{index}]
+  // 客户端详情页的“艺术图”就用 /Images/Backdrop/{index} 取图。
+  const imageMatch = path.match(
+    /^\/Items\/([^/]+)\/Images\/([A-Za-z]+)(?:\/(\d+))?$/i,
+  );
   if (imageMatch) {
     try {
-      return await imageResponse(decodeURIComponent(imageMatch[1]), request, env, fetchImpl, token);
+      return await imageResponse(
+        decodeURIComponent(imageMatch[1]),
+        request,
+        env,
+        fetchImpl,
+        token,
+        {
+          imageType: imageMatch[2],
+          imageIndex: imageMatch[3] ? Number(imageMatch[3]) : 0,
+        },
+      );
     } catch (error) {
       return errorResponse(502, error instanceof Error ? error.message : "Movie image unavailable");
     }
