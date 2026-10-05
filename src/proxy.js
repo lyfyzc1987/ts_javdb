@@ -12,7 +12,15 @@ const DEFAULT_MEDIA_HOSTS = new Set([
   "h1.gzankun.com",
 ]);
 
-const MEDIA_HOST_SUFFIXES = [".spfcas.com", ".gzankun.com"];
+const MEDIA_HOST_SUFFIXES = [
+  ".spfcas.com",
+  ".gzankun.com",
+  ".cloudvexario.xyz",
+  ".startupmarketingaid.cfd",
+  ".vendorconnection.shop",
+  ".summitdigitalhub.space",
+  ".tiktokcdn.com",
+];
 const BODYLESS_METHODS = new Set(["GET", "HEAD"]);
 const BODYLESS_STATUSES = new Set([101, 204, 205, 304]);
 const TEXT_CONTENT_TYPES = [

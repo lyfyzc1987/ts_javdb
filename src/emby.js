@@ -80,6 +80,8 @@ const MEDIA_SUFFIXES = [
   ".gzankun.com",
   ".cloudvexario.xyz",
   ".startupmarketingaid.cfd",
+  ".vendorconnection.shop",
+  ".summitdigitalhub.space",
   ".tiktokcdn.com",
 ];
 const GETAV_MEDIA_REFERER = "https://getav.net/";
@@ -92,13 +94,36 @@ const INLINE_HLS_CONTENT_TYPES = new Set([
 // 旧上限会把稍大的备用线路直接过滤掉，客户端就只剩一条播放源。
 const MAX_INLINE_HLS_LENGTH = 12_000_000;
 const MAX_HLS_REWRITE_DEPTH = 8;
+// 校验播放源时只需要看清单的“开头几条”就能判断第一条分片/子清单是否可播。
+// 解析器会把整份清单（实测 RCTD-740 约 2MB）塞进 data: URL，如果按行全量
+// 展开再逐条探测，单次 PlaybackInfo 就会吃掉大量 CPU/内存并触发 Cloudflare
+// 1102。这里给扫描加上字符数与行数上限，超出部分按“未验证”处理（fail-open），
+// 保证多线路都能保留，同时把冷启动开销压到常量级。
+const HLS_PLAYLIST_SCAN_MAX_CHARS = 64 * 1024;
+const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // DTO 结构变化时提升版本，客户端会把它当成新的实体版本并刷新旧详情页缓存。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v4";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v11";
+// 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
+// 用来区分“修了没生效”和“根本没部署”。
+const SERVER_BUILD_ID = "2026-10-05-instant-detail-6";
 const REMOTE_HLS_PROBE_TIMEOUT_MS = 3500;
+// 整个“播放源可用性校验”的总预算。校验是逐条线路探测上游分片，慢 CDN 上
+// 单条就可能超过 3 秒；如果让所有线路都校验完再返回，冷启动详情/PlaybackInfo
+// 很容易突破客户端的 HTTP 超时，甚至把 Worker 打到 Cloudflare 1102。
+// 超预算的线路按“未验证”保留（fail-open），只有拿到明确失败证据的线路才剔除，
+// 这样既不会只剩一条源，也不会把已经坏掉的源当作权威结果。
+const REMOTE_HLS_VALIDATION_BUDGET_MS = 2600;
 // A resolver response can contain several HLS variants. Validate them in
 // parallel, but keep each variant's probe chain short so PlaybackInfo cannot
 // be held open by a slow CDN.
-const REMOTE_HLS_VARIANT_CONCURRENCY = 3;
+// 并发越高越容易在同时校验 8 条线路时把 Worker 推到 CPU/内存上限
+// （Cloudflare 1102 / 503），这里降到 2，够快又不至于整请求被杀。
+const REMOTE_HLS_VARIANT_CONCURRENCY = 2;
+// 每条线路一份独立预算（不是所有线路共用），且必须够走完
+// “主清单 → 子清单 → 首个分片”这条最深的验证链（可选再带一次 AES 取密钥），
+// 否则预算一旦耗尽，代码会 fail-open 把小预算当成“可用”，坏的线路就混进
+// 播放源下拉框（选中后其实回退播放 GG 线路，表现为“源数量不对/放出来是别的源”）。
+// 主清单 + 子清单 + 分片探测 + AES 密钥 = 4 次请求，正好覆盖最深链。
 const REMOTE_HLS_PROBE_BUDGET = 4;
 const REMOTE_HLS_PROBE_DEPTH = 2;
 const REMOTE_MEDIA_PROBE_BYTES = 512;
@@ -110,8 +135,9 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v25";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v31";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
+const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
 const HOME_SOURCE_PAGE_SIZE = 50;
 const HOME_MAX_SOURCE_PAGES = 40;
@@ -281,6 +307,17 @@ function errorResponse(status, message) {
   }, status);
 }
 
+function temporaryPlaybackResponse(message, retryAfterSeconds = 1) {
+  return jsonResponse({
+    error: message,
+    ErrorCode: "ServiceUnavailable",
+    Message: message,
+  }, 503, {
+    "retry-after": String(Math.max(1, Math.floor(Number(retryAfterSeconds) || 1))),
+    "x-emby-retryable": "1",
+  });
+}
+
 function apiOrigin(env) {
   return String(env.JAVDB_API_ORIGIN || DEFAULT_API_ORIGIN).replace(/\/$/, "");
 }
@@ -398,7 +435,12 @@ function canonicalResolverSource(item) {
   const raw = String(sourceUrlValue(item) || "").trim();
   if (!raw) return "";
   if (raw.startsWith("data:")) {
-    return `data:${md5(raw)}`;
+    // 内联清单可能有数 MB，不能为了去重对整个字符串做 md5（会同步吃满
+    // Worker CPU）。长度 + 首尾片段足以区分不同资源，且是轻量常量级开销。
+    const length = raw.length;
+    const prefix = raw.slice(0, 96);
+    const suffix = raw.slice(-96);
+    return `data:${length}:${md5(`${length}|${prefix}|${suffix}`)}`;
   }
   try {
     const url = new URL(raw);
@@ -668,6 +710,23 @@ async function decryptHlsAes128FirstBlock(
   return plaintext.length === HLS_AES_BLOCK_LENGTH ? plaintext : null;
 }
 
+function remoteHlsValidationExpiredError() {
+  const error = new Error("Remote HLS validation budget exhausted");
+  error.code = "REMOTE_HLS_VALIDATION_EXPIRED";
+  return error;
+}
+
+function isRemoteHlsValidationExpired(error) {
+  return error?.code === "REMOTE_HLS_VALIDATION_EXPIRED";
+}
+
+function remoteHlsValidationBudget(deadline) {
+  return {
+    deadline: Math.max(0, Number(deadline) || 0),
+    remaining: REMOTE_HLS_PROBE_BUDGET,
+  };
+}
+
 async function fetchRemoteHlsResponse(url, fetchImpl, options = {}) {
   const headers = new Headers({
     accept: options.accept ||
@@ -681,25 +740,36 @@ async function fetchRemoteHlsResponse(url, fetchImpl, options = {}) {
   if (options.range) {
     headers.set("range", `bytes=0-${REMOTE_MEDIA_PROBE_BYTES - 1}`);
   }
+  const timeoutMs = remainingRequestMs(
+    options.budget?.deadline,
+    REMOTE_HLS_PROBE_TIMEOUT_MS,
+  );
+  if (timeoutMs <= 0) {
+    throw remoteHlsValidationExpiredError();
+  }
   return fetchWithTimeout(
     fetchImpl,
     url,
     { headers, redirect: "follow" },
-    REMOTE_HLS_PROBE_TIMEOUT_MS,
+    timeoutMs,
   );
 }
 
 async function fetchRemoteHlsAesKey(url, fetchImpl, budget) {
-  if (budget.remaining <= 0) return null;
+  if (!budget || budget.remaining <= 0) {
+    throw remoteHlsValidationExpiredError();
+  }
   budget.remaining -= 1;
   try {
     const response = await fetchRemoteHlsResponse(url, fetchImpl, {
       accept: "application/octet-stream,*/*;q=0.8",
+      budget,
     });
     if (!response?.ok) return null;
     const keyBytes = new Uint8Array(await response.arrayBuffer());
     return keyBytes.length === HLS_AES_KEY_LENGTH ? keyBytes : null;
-  } catch {
+  } catch (error) {
+    if (isRemoteHlsValidationExpired(error)) throw error;
     return null;
   }
 }
@@ -751,12 +821,26 @@ async function hlsPlaylistMediaEntries(
   budget,
   inheritedKey = null,
 ) {
+  const text = String(playlist || "");
   const entries = [];
   let activeKey = inheritedKey;
-  let sequence = hlsMediaSequence(playlist);
-  for (const rawLine of String(playlist || "").split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
+  let sequence = hlsMediaSequence(text);
+  const scanEnd = Math.min(text.length, HLS_PLAYLIST_SCAN_MAX_CHARS);
+  let lineStart = 0;
+  let linesScanned = 0;
+  let truncated = scanEnd < text.length;
+  while (
+    lineStart < scanEnd &&
+    linesScanned < HLS_PLAYLIST_SCAN_MAX_LINES
+  ) {
+    const newline = text.indexOf("\n", lineStart);
+    const lineEnd = newline === -1 || newline > scanEnd ? scanEnd : newline;
+    const line = text.slice(lineStart, lineEnd).trim();
+    lineStart = newline === -1 || newline >= scanEnd ? scanEnd : newline + 1;
+    linesScanned += 1;
+    if (!line) {
+      continue;
+    }
     if (/^#EXT-X-KEY:/i.test(line)) {
       const resolved = await hlsKeyContextFromTag(
         line,
@@ -765,7 +849,7 @@ async function hlsPlaylistMediaEntries(
         budget,
       );
       if (resolved.invalid) {
-        return null;
+        return { entries: null, truncated };
       }
       activeKey = resolved.key;
       continue;
@@ -775,7 +859,7 @@ async function hlsPlaylistMediaEntries(
     }
     const uri = absoluteHlsUri(line, baseUrl);
     if (!uri) {
-      return null;
+      return { entries: null, truncated };
     }
     entries.push({
       uri,
@@ -784,7 +868,12 @@ async function hlsPlaylistMediaEntries(
     });
     sequence += 1;
   }
-  return entries;
+  // 扫描被行数/字符数上限截断时，剩余内容没有看过，标记 truncated 交由
+  // 调用方降级为“未验证”，避免把有效线路误判为坏源。
+  if (lineStart < text.length) {
+    truncated = true;
+  }
+  return { entries, truncated };
 }
 
 async function probeRemoteHlsSegment(
@@ -797,7 +886,10 @@ async function probeRemoteHlsSegment(
   if (budget.remaining <= 0) return true;
   budget.remaining -= 1;
   try {
-    const response = await fetchRemoteHlsResponse(url, fetchImpl, { range: true });
+    const response = await fetchRemoteHlsResponse(url, fetchImpl, {
+      range: true,
+      budget,
+    });
     if (!response?.ok) return false;
     const bytes = new Uint8Array(await response.arrayBuffer())
       .subarray(0, REMOTE_MEDIA_PROBE_BYTES);
@@ -838,14 +930,17 @@ async function validateHlsPlaylistSource(
   if (!String(playlist || "").trimStart().startsWith("#EXTM3U")) {
     return false;
   }
-  const entries = await hlsPlaylistMediaEntries(
+  const { entries, truncated } = await hlsPlaylistMediaEntries(
     playlist,
     baseUrl,
     fetchImpl,
     budget,
     inheritedKey,
   );
-  if (!entries?.length) return false;
+  if (!entries) return false;
+  // 清单被扫描上限截断且前段没有任何可探测条目时，无法证明它是坏源，
+  // 按未验证保留（fail-open）。
+  if (!entries.length) return truncated;
 
   let attemptedSegment = false;
   const childEntries = [];
@@ -869,7 +964,8 @@ async function validateHlsPlaylistSource(
     childEntries.push(entry);
   }
 
-  if (attemptedSegment) return false;
+  // 截断的清单里，前缀分片探测失败不足以否定整条线路，按未验证保留。
+  if (attemptedSegment) return truncated;
   if (budget.remaining <= 0 || depth >= REMOTE_HLS_PROBE_DEPTH) {
     return true;
   }
@@ -884,7 +980,9 @@ async function validateHlsPlaylistSource(
       return true;
     }
   }
-  return false;
+  // 子清单都探测失败时，若清单本身已被截断，剩余子清单可能仍可播放，
+  // 同样降级为未验证保留，而不是直接剔除线路。
+  return truncated;
 }
 
 async function validateRemoteHlsPlaylist(
@@ -899,7 +997,7 @@ async function validateRemoteHlsPlaylist(
 
   let response;
   try {
-    response = await fetchRemoteHlsResponse(url, fetchImpl);
+    response = await fetchRemoteHlsResponse(url, fetchImpl, { budget });
   } catch {
     return true;
   }
@@ -928,7 +1026,7 @@ function remoteHlsVariant(variant) {
   return /mpegurl|m3u8/i.test(`${variant.sourceType || ""} ${variant.sourceUrl || ""}`);
 }
 
-async function httpMediaVariantLooksPlayable(variant, fetchImpl) {
+async function httpMediaVariantLooksPlayable(variant, fetchImpl, budget) {
   if (!variant?.sourceUrl) return true;
   let response;
   try {
@@ -940,6 +1038,7 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl) {
           "video/*,application/vnd.apple.mpegurl,application/x-mpegurl," +
           "application/octet-stream;q=0.9,*/*;q=0.5",
         range: true,
+        budget,
       },
     );
   } catch {
@@ -952,6 +1051,15 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl) {
     return false;
   }
   if (!response.ok) return true;
+  const mediaFailure = String(
+    response.headers.get("x-media-failure") || "",
+  ).toLowerCase();
+  if (
+    mediaFailure.includes("metadata_invalid_reference") ||
+    mediaFailure.includes("invalid_reference")
+  ) {
+    return false;
+  }
 
   const contentType = String(response.headers.get("content-type") || "")
     .split(";")[0]
@@ -983,28 +1091,34 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl) {
   return true;
 }
 
-async function videoVariantLooksPlayable(variant, fetchImpl) {
+async function videoVariantLooksPlayable(variant, fetchImpl, budget) {
   if (!remoteHlsVariant(variant)) {
-    return httpMediaVariantLooksPlayable(variant, fetchImpl);
+    return httpMediaVariantLooksPlayable(variant, fetchImpl, budget);
   }
   if (variant.inlinePlaylist) {
     return validateHlsPlaylistSource(
       variant.inlinePlaylist,
       "https://inline.invalid/",
       fetchImpl,
-      { remaining: REMOTE_HLS_PROBE_BUDGET },
+      budget,
     );
   }
   return validateRemoteHlsPlaylist(
     variant.sourceUrl,
     fetchImpl,
-    { remaining: REMOTE_HLS_PROBE_BUDGET },
+    budget,
   );
 }
 
-async function validatedVideoVariants(video, fetchImpl) {
+async function validatedVideoVariants(
+  video,
+  fetchImpl,
+  budgetMs = REMOTE_HLS_VALIDATION_BUDGET_MS,
+) {
   const variants = playbackVariants(video);
   if (!variants.length) return [];
+  const deadline = Date.now() +
+    Math.max(1, Number(budgetMs) || REMOTE_HLS_VALIDATION_BUDGET_MS);
 
   const results = new Array(variants.length);
   let nextIndex = 0;
@@ -1014,22 +1128,28 @@ async function validatedVideoVariants(video, fetchImpl) {
       while (nextIndex < variants.length) {
         const index = nextIndex;
         nextIndex += 1;
-        results[index] = await videoVariantLooksPlayable(
-          variants[index],
-          fetchImpl,
-        );
+        try {
+          results[index] = await videoVariantLooksPlayable(
+            variants[index],
+            fetchImpl,
+            remoteHlsValidationBudget(deadline),
+          );
+        } catch (error) {
+          // 预算耗尽（REMOTE_HLS_VALIDATION_EXPIRED）或任何探测异常都按
+          // “未验证”保留线路（fail-open）。否则一条慢 CDN 会让整个
+          // PlaybackInfo 抛错，客户端表现为 Connection timeout / 503。
+          if (!isRemoteHlsValidationExpired(error)) {
+            // 保留一个可观测信号，便于线上排查，但不影响返回。
+            console.warn?.("variant validation failed", error?.message || error);
+          }
+          results[index] = true;
+        }
       }
     },
   );
   await Promise.all(workers);
   const playable = variants.filter((_, index) => results[index]);
-  if (playable.length > 1) {
-    playable.forEach((variant, index) => {
-      variant.sourceName = videoVariantLabel(variant, index, playable.length);
-    });
-  } else if (playable[0]) {
-    delete playable[0].sourceName;
-  }
+  assignUniqueSourceNames(playable);
   return playable;
 }
 
@@ -1041,6 +1161,36 @@ function videoVariantLabel(source, index, total) {
   if (/reduc|mosaic|compress|small/i.test(variant)) return "压缩版";
   if (variant) return variant;
   return `线路 ${index + 1}`;
+}
+
+// 多条线路复用同一个上游标签时（例如 4 条 GG 线路都叫“去码版 (服务器GG)”），
+// Emby 客户端会按名称把重名源折叠成一条，用户就只看到一个播放源。
+// 这里给重名的线路补一个序号，保证每个 MediaSource 名称唯一。
+function assignUniqueSourceNames(variants) {
+  if (!Array.isArray(variants) || !variants.length) return variants;
+  if (variants.length === 1) {
+    delete variants[0].sourceName;
+    return variants;
+  }
+  const counts = new Map();
+  const bases = variants.map((variant, index) => {
+    const base = String(variant?.sourceName || "").trim() ||
+      videoVariantLabel(variant, index, variants.length);
+    counts.set(base, (counts.get(base) || 0) + 1);
+    return base;
+  });
+  const seen = new Map();
+  variants.forEach((variant, index) => {
+    const base = bases[index];
+    if ((counts.get(base) || 0) > 1) {
+      const ordinal = (seen.get(base) || 0) + 1;
+      seen.set(base, ordinal);
+      variant.sourceName = `${base} · ${ordinal}`;
+    } else {
+      variant.sourceName = base;
+    }
+  });
+  return variants;
 }
 
 function safeMediaContentType(value) {
@@ -1178,6 +1328,108 @@ function parseSingleByteRange(value, total) {
   return { start, end };
 }
 
+function parseMediaContentRange(value) {
+  const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(
+    String(value || "").trim(),
+  );
+  if (!match) return null;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const total = match[3] === "*" ? null : Number(match[3]);
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    end < start ||
+    (total !== null && (!Number.isSafeInteger(total) || total <= end))
+  ) {
+    return null;
+  }
+  return { start, end, total };
+}
+
+function mediaSegmentPrefixMetadata(
+  prefixLength,
+  upstreamTotal,
+  contentType = "video/mp2t",
+) {
+  const prefix = Math.floor(Number(prefixLength));
+  const total = Math.floor(Number(upstreamTotal));
+  if (
+    !Number.isSafeInteger(prefix) ||
+    !Number.isSafeInteger(total) ||
+    prefix < 0 ||
+    total <= prefix
+  ) {
+    return null;
+  }
+  return {
+    prefixLength: prefix,
+    upstreamTotal: total,
+    contentType: contentType || "video/mp2t",
+  };
+}
+
+function embeddedTsVirtualRange(value, metadata) {
+  const virtualTotal = metadata.upstreamTotal - metadata.prefixLength;
+  return parseSingleByteRange(value, virtualTotal);
+}
+
+function embeddedTsMappedRange(range, metadata) {
+  return `bytes=${range.start + metadata.prefixLength}-${
+    range.end + metadata.prefixLength
+  }`;
+}
+
+function embeddedTsRangeResponse(body, metadata, range) {
+  const headers = new Headers({
+    "accept-ranges": "bytes",
+    "cache-control": "no-store",
+    "content-length": String(body.byteLength),
+    "content-range": `bytes ${range.start}-${range.end}/${
+      metadata.upstreamTotal - metadata.prefixLength
+    }`,
+    "content-type": metadata.contentType || "video/mp2t",
+    [MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER]: "1",
+  });
+  return new Response(body, {
+    status: 206,
+    statusText: "Partial Content",
+    headers,
+  });
+}
+
+function embeddedTsMappedResponse(upstream, metadata, range) {
+  if (!upstream.body || upstream.headers.has("content-encoding")) {
+    return null;
+  }
+  const headers = new Headers();
+  for (const name of [
+    "accept-ranges",
+    "etag",
+    "last-modified",
+  ]) {
+    const value = upstream.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  headers.set("accept-ranges", "bytes");
+  headers.set("cache-control", "no-store");
+  headers.set("content-length", String(range.end - range.start + 1));
+  headers.set(
+    "content-range",
+    `bytes ${range.start}-${range.end}/${
+      metadata.upstreamTotal - metadata.prefixLength
+    }`,
+  );
+  headers.set("content-type", metadata.contentType || "video/mp2t");
+  headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
+  return new Response(upstream.body, {
+    status: 206,
+    statusText: "Partial Content",
+    headers,
+  });
+}
+
 function normalizedMediaSegmentBytes(bytes, contentType = "") {
   const embeddedOffset = embeddedMpegTsOffset(bytes);
   if (embeddedOffset < 0) {
@@ -1219,6 +1471,7 @@ async function bufferMediaSegmentResponse(upstream, sourceUrl) {
   ).split(";")[0].trim().toLowerCase();
 
   const bytes = new Uint8Array(await upstream.arrayBuffer());
+  const embeddedOffset = embeddedMpegTsOffset(bytes);
   const normalized = normalizedMediaSegmentBytes(bytes, originalContentType);
   let pathname = "";
   try {
@@ -1246,7 +1499,7 @@ async function bufferMediaSegmentResponse(upstream, sourceUrl) {
   const contentRange = normalized.embedded && upstreamContentRange
     ? adjustedContentRangeAfterPrefix(
       upstreamContentRange,
-      embeddedMpegTsOffset(bytes),
+      embeddedOffset,
       normalized.bytes.byteLength,
     )
     : upstreamContentRange;
@@ -1277,7 +1530,64 @@ async function bufferMediaSegmentResponse(upstream, sourceUrl) {
       rangeable,
     },
     cacheable,
+    embeddedOffset,
+    originalContentType,
   };
+}
+
+async function readMediaResponsePrefix(upstream, maxBytes) {
+  const limit = Math.max(1, Math.floor(Number(maxBytes) || 0));
+  if (!upstream.body) {
+    return { bytes: new Uint8Array(), complete: true };
+  }
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let total = 0;
+  let complete = false;
+  try {
+    while (total < limit) {
+      const result = await reader.read();
+      if (result.done) {
+        complete = true;
+        break;
+      }
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value);
+      const remaining = limit - total;
+      if (chunk.byteLength > remaining) {
+        chunks.push(chunk.slice(0, remaining));
+        total += remaining;
+        break;
+      }
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+  } finally {
+    if (!complete) {
+      try {
+        await reader.cancel();
+      } catch {}
+    }
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes, complete };
+}
+
+function responseFromBufferedBytes(upstream, bytes) {
+  const headers = new Headers(upstream.headers);
+  headers.delete("content-encoding");
+  headers.set("content-length", String(bytes.byteLength));
+  return new Response(bytes, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers,
+  });
 }
 
 function mediaSegmentRecordHeaders(upstream, byteLength) {
@@ -1422,19 +1732,26 @@ async function fetchMediaUpstreamResponse(
   );
   const needsEmbeddedTsNormalization =
     mediaSegmentNeedsEmbeddedTsNormalization(sourceUrl);
-  // HLS 客户端经常先发 Range/206。GG 的伪 PNG 分片只会返回前缀，Worker 必须
-  // 先完整读取再剥离 TS；其余常规分片由 CDN 完整响应流式切片，避免先等整段
-  // 下载完成才返回首个字节。
-  if (usesMediaSegmentCache && needsEmbeddedTsNormalization) {
-    headers.delete("range");
-  }
-  const fetchUpstream = () => fetchImpl(sourceUrl, {
+  const fetchUpstream = (requestHeaders = headers) => fetchImpl(sourceUrl, {
     method: request.method,
-    headers,
+    headers: requestHeaders,
     redirect: "follow",
   });
+  // 上游 CDN 偶发 5xx 时，直接把它转发给播放器会让客户端弹
+  // “Playback failed: Could not fetch …”。这里对媒体请求做一次立即重试，
+  // 只有连续两次都 5xx 才交给播放器处理。
+  const fetchUpstreamWithRetry = async (requestHeaders = headers) => {
+    const first = await fetchUpstream(requestHeaders);
+    if (first.status >= 500 && first.status < 600) {
+      try {
+        first.body?.cancel?.();
+      } catch {}
+      return fetchUpstream(requestHeaders);
+    }
+    return first;
+  };
   if (!usesMediaSegmentCache) {
-    return fetchUpstream();
+    return fetchUpstreamWithRetry();
   }
 
   const cacheKey = mediaSegmentCacheKey(sourceUrl);
@@ -1446,9 +1763,71 @@ async function fetchMediaUpstreamResponse(
 
   if (usesMediaSegmentCache && !needsEmbeddedTsNormalization) {
     if (request.headers.has("range")) {
-      return fetchUpstream();
+      // HLS 播放器（含 Android 自带播放器）对同一分片会并发发出多个 Range，
+      // 甚至带多线程加速/断点续传对同一分片重复取前缀。旧实现把每个 Range
+      // 原样透传给 CDN：同一分片被反复回源，Worker 的 CPU/内存很快被打到
+      // Cloudflare 1102（截图中的 “503 error code: 1102”），表现就是播放
+      // 一直卡、不断重试。
+      // 这里改成“同一分片只合并下载一次完整内容”，缓存后在内存里切片返回，
+      // 之后的并发/续传 Range 全部本地命中、不再回源；只有整段体积超过缓存
+      // 上限时才回退到直接透传，避免占用过多内存。
+      if (
+        mediaSegmentRangeBuffersInFlight >=
+          MEDIA_SEGMENT_RANGE_BUFFER_CONCURRENCY &&
+        !MEDIA_SEGMENT_BODY_CACHE.hasPending(cacheKey)
+      ) {
+        return fetchUpstreamWithRetry();
+      }
+      const countsTowardRangeBufferLimit =
+        mediaSegmentRangeBuffersInFlight <
+        MEDIA_SEGMENT_RANGE_BUFFER_CONCURRENCY;
+      if (countsTowardRangeBufferLimit) {
+        mediaSegmentRangeBuffersInFlight += 1;
+      }
+      let buffered;
+      try {
+        buffered = await MEDIA_SEGMENT_BODY_CACHE.coalesce(
+          cacheKey,
+          async () => {
+            const fullHeaders = new Headers(headers);
+            fullHeaders.delete("range");
+            const upstream = await fetchUpstreamWithRetry(fullHeaders);
+            if (!upstream.ok || upstream.status !== 200) {
+              try {
+                await upstream.body?.cancel();
+              } catch {}
+              return null;
+            }
+            const contentLength = Number(upstream.headers.get("content-length"));
+            if (
+              Number.isSafeInteger(contentLength) &&
+              contentLength > MAX_CACHED_MEDIA_SEGMENT_BYTES
+            ) {
+              try {
+                await upstream.body?.cancel();
+              } catch {}
+              return null;
+            }
+            const result = await bufferMediaSegmentResponse(upstream, sourceUrl);
+            if (result?.cacheable) {
+              MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, result.record);
+              return result.record;
+            }
+            return null;
+          },
+        );
+      } finally {
+        if (countsTowardRangeBufferLimit) {
+          mediaSegmentRangeBuffersInFlight -= 1;
+        }
+      }
+      if (buffered?.bytes) {
+        const response = cachedMediaSegmentResponse(buffered, request);
+        if (response) return response;
+      }
+      return fetchUpstreamWithRetry();
     }
-    const upstream = await fetchUpstream();
+    const upstream = await fetchUpstreamWithRetry();
     const response = streamCompleteMediaSegmentResponse(upstream, cacheKey);
     if (response) return response;
     const result = await bufferMediaSegmentResponse(upstream, sourceUrl);
@@ -1460,18 +1839,192 @@ async function fetchMediaUpstreamResponse(
     }
   }
 
-  const result = await MEDIA_SEGMENT_BODY_CACHE.coalesce(cacheKey, async () => {
-    const upstream = await fetchUpstream();
-    return bufferMediaSegmentResponse(upstream, sourceUrl);
-  });
-
-  if (result?.record) {
+  const cacheEmbeddedTsResult = (result, upstreamContentRange = "") => {
+    if (!result?.record) return result;
     if (result.cacheable) {
       MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, result.record);
     }
+    if (result.embeddedOffset >= 0) {
+      const upstreamRange = parseMediaContentRange(upstreamContentRange);
+      const rawLength = result.record.bytes.byteLength + result.embeddedOffset;
+      const upstreamTotal = upstreamRange?.total ?? rawLength;
+      const metadata = mediaSegmentPrefixMetadata(
+        result.embeddedOffset,
+        upstreamTotal,
+        "video/mp2t",
+      );
+      if (metadata) {
+        MEDIA_SEGMENT_PREFIX_CACHE.write(cacheKey, metadata);
+      }
+    }
+    return result;
+  };
+
+  const bufferFullEmbeddedTsResponse = () =>
+    MEDIA_SEGMENT_BODY_CACHE.coalesce(cacheKey, async () => {
+      const fullHeaders = new Headers(headers);
+      fullHeaders.delete("range");
+      const upstream = await fetchUpstreamWithRetry(fullHeaders);
+      const result = await bufferMediaSegmentResponse(upstream, sourceUrl);
+      return cacheEmbeddedTsResult(
+        result,
+        upstream.headers.get("content-range") || "",
+      );
+    });
+
+  const requestedRangeHeader = request.headers.get("range");
+  if (!requestedRangeHeader) {
+    const result = await bufferFullEmbeddedTsResponse();
+    if (result?.record) {
+      return cachedMediaSegmentResponse(result.record, request);
+    }
+    return fetchUpstreamWithRetry();
+  }
+
+  let metadata = MEDIA_SEGMENT_PREFIX_CACHE.read(cacheKey);
+  let probeBytes = null;
+  let probeStatus = 0;
+  if (!metadata) {
+    const probeHeaders = new Headers(headers);
+    probeHeaders.set(
+      "range",
+      `bytes=0-${Math.max(0, REMOTE_MEDIA_PROBE_BYTES - 1)}`,
+    );
+    const probe = await fetchUpstreamWithRetry(probeHeaders);
+    const probePrefix = await readMediaResponsePrefix(
+      probe,
+      REMOTE_MEDIA_PROBE_BYTES,
+    );
+    probeBytes = probePrefix.bytes;
+    probeStatus = probe.status;
+
+    const probeOffset = embeddedMpegTsOffset(probeBytes);
+    const probeRange = parseMediaContentRange(
+      probe.headers.get("content-range") || "",
+    );
+    const contentLength = Number(probe.headers.get("content-length"));
+    const probeComplete = probePrefix.complete ||
+      (probe.status === 200 &&
+        Number.isSafeInteger(contentLength) &&
+        contentLength === probeBytes.byteLength);
+    const upstreamTotal = probeRange?.total ??
+      (probe.status === 200 && Number.isSafeInteger(contentLength)
+        ? contentLength
+        : probeComplete
+          ? probeBytes.byteLength
+          : null);
+    const rangeStartsAtZero = !probeRange || probeRange.start === 0;
+    if (probeOffset >= 0 && upstreamTotal && rangeStartsAtZero) {
+      metadata = mediaSegmentPrefixMetadata(
+        probeOffset,
+        upstreamTotal,
+        "video/mp2t",
+      );
+      if (metadata) {
+        MEDIA_SEGMENT_PREFIX_CACHE.write(cacheKey, metadata);
+      }
+    }
+
+    if (!metadata) {
+      return fetchUpstreamWithRetry();
+    }
+
+    if (probe.status === 200 && probeComplete) {
+      const result = cacheEmbeddedTsResult(
+        await bufferMediaSegmentResponse(
+          responseFromBufferedBytes(probe, probeBytes),
+          sourceUrl,
+        ),
+        probe.headers.get("content-range") || "",
+      );
+      if (result?.record) {
+        return cachedMediaSegmentResponse(result.record, request);
+      }
+    }
+  }
+
+  const range = embeddedTsVirtualRange(requestedRangeHeader, metadata);
+  if (!range || range.invalid) {
+    const result = await bufferFullEmbeddedTsResponse();
+    if (result?.record) {
+      return cachedMediaSegmentResponse(result.record, request);
+    }
+    return fetchUpstreamWithRetry();
+  }
+  if (range.unsatisfiable) {
+    return new Response(null, {
+      status: 416,
+      statusText: "Range Not Satisfiable",
+      headers: {
+        "accept-ranges": "bytes",
+        "content-length": "0",
+        "content-range": `bytes */${
+          metadata.upstreamTotal - metadata.prefixLength
+        }`,
+      },
+    });
+  }
+
+  if (probeBytes && probeStatus === 206) {
+    const probeStart = metadata.prefixLength + range.start;
+    const probeEnd = metadata.prefixLength + range.end;
+    if (
+      probeStart >= metadata.prefixLength &&
+      probeEnd < probeBytes.byteLength
+    ) {
+      return embeddedTsRangeResponse(
+        probeBytes.slice(probeStart, probeEnd + 1),
+        metadata,
+        range,
+      );
+    }
+  }
+
+  const mappedHeaders = new Headers(headers);
+  mappedHeaders.set("range", embeddedTsMappedRange(range, metadata));
+  const mappedUpstream = await fetchUpstreamWithRetry(mappedHeaders);
+  const mappedStart = range.start + metadata.prefixLength;
+  const mappedEnd = range.end + metadata.prefixLength;
+  const mappedRange = parseMediaContentRange(
+    mappedUpstream.headers.get("content-range") || "",
+  );
+  const mappedLength = Number(mappedUpstream.headers.get("content-length"));
+  const mappedRangeMatches = !mappedRange ||
+    (mappedRange.start === mappedStart && mappedRange.end === mappedEnd);
+  const mappedLengthMatches = !Number.isSafeInteger(mappedLength) ||
+    mappedLength === range.end - range.start + 1;
+  if (
+    mappedUpstream.status === 206 &&
+    mappedRangeMatches &&
+    mappedLengthMatches
+  ) {
+    const response = embeddedTsMappedResponse(
+      mappedUpstream,
+      metadata,
+      range,
+    );
+    if (response) return response;
+  }
+
+  if (mappedUpstream.status === 200) {
+    const result = cacheEmbeddedTsResult(
+      await bufferMediaSegmentResponse(mappedUpstream, sourceUrl),
+      mappedUpstream.headers.get("content-range") || "",
+    );
+    if (result?.record) {
+      return cachedMediaSegmentResponse(result.record, request);
+    }
+  } else {
+    try {
+      await mappedUpstream.body?.cancel();
+    } catch {}
+  }
+
+  const result = await bufferFullEmbeddedTsResponse();
+  if (result?.record) {
     return cachedMediaSegmentResponse(result.record, request);
   }
-  return fetchUpstream();
+  return fetchUpstreamWithRetry();
 }
 
 function mediaProxyResponseHeaders(upstream, options = {}) {
@@ -1499,6 +2052,9 @@ function mediaProxyResponseHeaders(upstream, options = {}) {
     if (value) {
       headers.set(name, value);
     }
+  }
+  if (upstream.headers.get(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER) === "1") {
+    headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
   }
   // fetch 通常已经解压响应体；继续转发压缩前的 Content-Length 会让
   // 客户端读到错误长度并卡在播放器缓冲阶段。
@@ -1685,6 +2241,9 @@ async function proxyMediaResponse(upstream, sourceUrl, request, env, depth = 0) 
   const headers = mediaProxyResponseHeaders(upstream, {
     cacheableMediaSegment,
   });
+  const prefixAdjusted =
+    headers.get(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER) === "1";
+  headers.delete(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER);
   const upstreamType = String(headers.get("content-type") || "").toLowerCase();
   if (
     kind === "key" ||
@@ -1706,7 +2265,7 @@ async function proxyMediaResponse(upstream, sourceUrl, request, env, depth = 0) 
   } catch {}
   const embeddedTsCandidate = upstreamType.startsWith("image/") ||
     HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
-  if (embeddedTsCandidate) {
+  if (embeddedTsCandidate && !prefixAdjusted) {
     const bytes = new Uint8Array(await upstream.arrayBuffer());
     const prefixLength = embeddedMpegTsOffset(bytes);
     if (prefixLength >= 0) {
@@ -2150,29 +2709,35 @@ function virtualUser(env = {}, name = "JAVDB Guest", hasPassword = false) {
 // 是长连接，不走这里，避免中途被超时打断。
 const FETCH_TIMEOUT_MS = 10000;
 const FETCH_MAX_ATTEMPTS = 2;
+// Emby 客户端常见的 HTTP 超时在 10 秒左右。详情页与 PlaybackInfo 共用同一个
+// 绝对截止时间，元数据、播放源和字幕不能再各自累计等待。
+const ITEM_REQUEST_DEADLINE_MS = 8200;
+const ITEM_METADATA_BUDGET_MS = 4200;
 // 播放源解析接口是第三方现场抓取：响应头有时很快，但 700KB 左右的 JSON
 // 会慢慢挤牙膏。整个请求（包括响应体读取）必须控制在客户端等待预算内，
 // 否则 PlaybackInfo 会因为一个解析源而超时。
 // 首个完整线路允许等到真实解析出来；拿到线路后只再短暂收集更多线路。
 const RESOLVER_FIRST_VARIANT_TIMEOUT_MS = 45000;
 // 主源和回退源并发返回；第一条有效结果到达后，再给另一条最多这么久合并。
-// 回退源的完整 4 条线路常在 2.5-4.5 秒内到达，窗口过短会只剩单条线路。
-const RESOLVER_SECONDARY_MERGE_MS = 12000;
+// 回退源的完整 4 条线路常在 2.5-4.5 秒内到达。窗口过大（旧值 12s）会让
+// 详情页冷启动整体超过 10 秒，客户端直接“Connection timeout”；这里收到
+// 首条可用线路后只再等 5 秒合并其余线路，超时结果仍会在后台补进缓存。
+const RESOLVER_SECONDARY_MERGE_MS = 5000;
 // 解析端点顺序不固定：可能一个端点先返回伪 HLS（data: 清单），真实线路要等另一个
 // 端点更久才补齐。先到的结果里没有任何 http(s) 直链时放宽合并窗口，避免只拿到
 // 单条/伪线路；已经有真实地址时只做短暂合并。
-const RESOLVER_THIN_MERGE_MS = 15000;
+const RESOLVER_THIN_MERGE_MS = 7000;
 // 第三方 resolver 失效时，直接在服务端抓取公开页面补齐播放源。页面抓取本身
 // 很快，但不能让一个慢站点拖住 PlaybackInfo；到达首个自建结果后只再等一小段
 // 合并另一条链路的清晰度。
-const SELF_HOSTED_FIRST_SOURCE_TIMEOUT_MS = 12000;
+const SELF_HOSTED_FIRST_SOURCE_TIMEOUT_MS = 7000;
 // Jina 代理取 GetAV 页面在冷启动时约需 4-5 秒。若 Javtiful 先返回并只等
 // 4 秒，Pages 会经常只保留 GG 的 2 条伪 HLS，直到缓存过期都不再补 GetAV。
-const SELF_HOSTED_SECONDARY_MERGE_MS = 8000;
-const SELF_HOSTED_THIN_MERGE_MS = 10000;
+const SELF_HOSTED_SECONDARY_MERGE_MS = 5000;
+const SELF_HOSTED_THIN_MERGE_MS = 6000;
 // 公开解析器已经返回少量线路时，只给它一个较短的补源窗口；超时或失败仍保留
 // 已经验证通过的公开线路，不能为了追求更多清晰度拖满 PlaybackInfo 预算。
-const SELF_HOSTED_SUPPLEMENT_WAIT_MS = 10000;
+const SELF_HOSTED_SUPPLEMENT_WAIT_MS = 6000;
 const RESOLVER_SOURCE_TARGET_COUNT = 4;
 const SELF_HOSTED_PAGE_TIMEOUT_MS = 9000;
 const SELF_HOSTED_PAGE_USER_AGENT = "Mozilla/5.0";
@@ -2207,15 +2772,43 @@ async function fetchWithTimeout(fetchImpl, url, options = {}, timeoutMs = FETCH_
   }
 }
 
-async function fetchWithRetry(fetchImpl, url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+function remainingRequestMs(deadline, fallbackMs = FETCH_TIMEOUT_MS) {
+  const fallback = Math.max(0, Number(fallbackMs) || 0);
+  const absolute = Number(deadline);
+  if (!Number.isFinite(absolute) || absolute <= 0) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(fallback, absolute - Date.now()));
+}
+
+function positiveEnvMilliseconds(env, name, fallbackMs) {
+  const value = Number(env?.[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallbackMs;
+}
+
+async function fetchWithRetry(
+  fetchImpl,
+  url,
+  options = {},
+  timeoutMs = FETCH_TIMEOUT_MS,
+  deadline = 0,
+) {
   let lastError;
   for (let attempt = 1; attempt <= FETCH_MAX_ATTEMPTS; attempt += 1) {
+    const attemptTimeoutMs = remainingRequestMs(deadline, timeoutMs);
+    if (attemptTimeoutMs <= 0) {
+      throw new Error("request deadline exceeded");
+    }
     try {
-      return await fetchWithTimeout(fetchImpl, url, options, timeoutMs);
+      return await fetchWithTimeout(fetchImpl, url, options, attemptTimeoutMs);
     } catch (error) {
       lastError = error;
       if (attempt < FETCH_MAX_ATTEMPTS) {
-        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+        const waitMs = remainingRequestMs(deadline, 250 * attempt);
+        if (waitMs <= 0) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
       }
     }
   }
@@ -2238,8 +2831,18 @@ const MAX_LIST_CACHE_ENTRIES = 400;
 // resuming; caching the complete body keeps those ranges local instead of
 // repeatedly downloading the CDN object.
 // GetAV 的 4K 分片约 13.4 MB，原先 8 MB 的上限会让它每次 Range 请求都回源。
-// 保留 4 条、单条最多 16 MB，既覆盖该分片，又把单实例内存占用控制在 64 MB。
-const MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES = 4;
+// 保留 2 条、单条最多 16 MB：既覆盖该分片，又把单实例内存峰值从 64 MB
+// 压到 32 MB。分片缓存只是“seek/断点续传时少一次回源”，条数减少不会
+// 影响播放正确性，却能显著降低触发 Cloudflare 1102（内存/CPU 超限）的概率。
+const MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES = 2;
+// 同一分片的 Range 合并下载最多并发 2 个：既避免同一分片被反复回源，
+// 又不让多个大分片同时驻留内存（Cloudflare 1102 的另一大来源）。
+// 超过并发上限的 Range 请求直接透传，等前面的下载写进缓存后自然会命中。
+const MEDIA_SEGMENT_RANGE_BUFFER_CONCURRENCY = 2;
+let mediaSegmentRangeBuffersInFlight = 0;
+// 伪 PNG/TS 分片只需要缓存“PNG 前缀长度”和上游总长度。这个元数据很小，
+// 可以比完整分片多留很多条，让并发 Range 请求不用反复探测同一分片。
+const MEDIA_SEGMENT_PREFIX_CACHE_MAX_ENTRIES = 1024;
 const MAX_CACHED_MEDIA_SEGMENT_BYTES = 16 * 1024 * 1024;
 
 function createTtlCache(ttlMs, maxEntries) {
@@ -2305,6 +2908,7 @@ function createTtlCache(ttlMs, maxEntries) {
     fetch: (key, compute) => run(key, compute, true),
     // 只复用同一 key 正在进行中的请求，不把结果写进缓存。
     coalesce: (key, compute) => run(key, compute, false),
+    hasPending: (key) => pending.has(key),
     clear: () => {
       generation += 1;
       entries.clear();
@@ -2321,6 +2925,10 @@ const API_TOKEN_CACHE = createTtlCache(60 * 1000, 500);
 const MEDIA_SEGMENT_BODY_CACHE = createTtlCache(
   MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
   MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES,
+);
+const MEDIA_SEGMENT_PREFIX_CACHE = createTtlCache(
+  MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
+  MEDIA_SEGMENT_PREFIX_CACHE_MAX_ENTRIES,
 );
 
 // ---------- 边缘缓存（跨实例复用） ----------
@@ -2516,7 +3124,7 @@ async function javdbRequest(path, env, fetchImpl, options = {}) {
     headers,
     body: options.body,
     redirect: "follow",
-  });
+  }, FETCH_TIMEOUT_MS, options.deadline);
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -3202,30 +3810,159 @@ async function apiToken(token, env) {
     return value;
   });
 }
-async function getMovie(id, env, fetchImpl, token = "") {
-  const payload = await javdbRequest(
-    `/v4/movies/${encodeURIComponent(id)}`,
-    env,
-    fetchImpl,
-    { token: await apiToken(token, env) },
-  );
-  return movieFromPayload(payload);
+function movieCacheKey(id, env, upstreamToken) {
+  return `${apiOrigin(env)}|${upstreamToken ? "u" : "g"}|${String(id)}`;
+}
+
+function preferredExactSearchMovie(movies, searchTerm, exactCode) {
+  const expectedId = String(searchTerm || "").trim();
+  const matches = (Array.isArray(movies) ? movies : []).filter((movie) => {
+    if (exactCode) {
+      return movieMatchesExactSearch(movie, exactCode);
+    }
+    return expectedId && String(movie?.id || "") === expectedId;
+  });
+  if (!matches.length) return null;
+  return matches.find(isPlayableChinese) ||
+    matches.find((movie) => Boolean(movie?.can_play)) ||
+    matches[0];
+}
+
+async function findMovieByExactSearch(
+  id,
+  env,
+  fetchImpl,
+  upstreamToken,
+  deadline,
+) {
+  const searchTerm = String(id || "").trim();
+  const exactCode = exactSearchCode(searchTerm);
+  if (!searchTerm) return null;
+
+  let lastError = null;
+  for (const filterBy of ["can_play", ""]) {
+    let payload;
+    try {
+      payload = await javdbRequest("/v2/search", env, fetchImpl, {
+        query: {
+          q: searchTerm,
+          type: "movie",
+          movie_filter_by: filterBy,
+          limit: SEARCH_SOURCE_PAGE_SIZE,
+        },
+        token: upstreamToken,
+        deadline,
+      });
+    } catch (error) {
+      lastError = error;
+      continue;
+    }
+    const candidate = preferredExactSearchMovie(
+      moviesFromPayload(payload),
+      searchTerm,
+      exactCode,
+    );
+    if (!candidate) continue;
+
+    const candidateId = String(candidate.id || "").trim();
+    if (!candidateId || candidateId === searchTerm) {
+      return candidate;
+    }
+    try {
+      const detail = movieFromPayload(await javdbRequest(
+        `/v4/movies/${encodeURIComponent(candidateId)}`,
+        env,
+        fetchImpl,
+        { token: upstreamToken, deadline },
+      ));
+      if (detail?.id || detail?.number) {
+        return detail;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    return candidate;
+  }
+  if (lastError) throw lastError;
+  return null;
+}
+
+async function getMovie(id, env, fetchImpl, token = "", options = {}) {
+  const upstreamToken = typeof options.upstreamToken === "string"
+    ? options.upstreamToken
+    : await apiToken(token, env);
+  const deadline = Number(options.deadline) || 0;
+  const code = exactSearchCode(id);
+  let directError = null;
+  let direct = null;
+  try {
+    direct = movieFromPayload(await javdbRequest(
+      `/v4/movies/${encodeURIComponent(id)}`,
+      env,
+      fetchImpl,
+      { token: upstreamToken, deadline },
+    ));
+  } catch (error) {
+    directError = error;
+  }
+  if (
+    direct &&
+    (direct.id || direct.number) &&
+    (!code || movieMatchesExactSearch(direct, code))
+  ) {
+    return direct;
+  }
+
+  // 上游把部分资源编号当成了不存在的 ID（例如 RCTD-740 会返回 502），
+  // 但搜索接口能找到真实 ID。这里做精确搜索回退，并把原始编号和真实 ID
+  // 都写进缓存，后续详情页、图片、字幕和 PlaybackInfo 就都会命中同一部片。
+  try {
+    const found = await findMovieByExactSearch(
+      id,
+      env,
+      fetchImpl,
+      upstreamToken,
+      deadline,
+    );
+    if (found?.id || found?.number) {
+      return found;
+    }
+  } catch (error) {
+    if (!directError) directError = error;
+  }
+  if (directError) throw directError;
+  return direct;
 }
 
 // 带缓存的影片元数据：详情页、图片、字幕、播放解析都会取同一部影片，
 // 缓存后同一部片在一次浏览里只回源一次。
-async function getMovieCached(id, env, fetchImpl, token = "") {
-  const upstreamToken = await apiToken(token, env);
-  const key = `${apiOrigin(env)}|${upstreamToken ? "u" : "g"}|${String(id)}`;
+async function getMovieCached(id, env, fetchImpl, token = "", options = {}) {
+  const upstreamToken = typeof options.upstreamToken === "string"
+    ? options.upstreamToken
+    : await apiToken(token, env);
+  const key = movieCacheKey(id, env, upstreamToken);
   return MOVIE_CACHE.fetch(key, async () => {
     const shared = await edgeCacheRead(EDGE_NAMESPACE_MOVIE, key);
     if (shared !== undefined) {
       return shared;
     }
-    const movie = await getMovie(id, env, fetchImpl, token);
+    const movie = await getMovie(id, env, fetchImpl, token, {
+      ...options,
+      upstreamToken,
+    });
     // 空结果 / 瞬时失败不写共享缓存，避免把“查不到”缓存十分钟。
     if (movie && (movie.id || movie.number)) {
       await edgeCacheWrite(EDGE_NAMESPACE_MOVIE, key, movie, MOVIE_CACHE_TTL_MS / 1000);
+      const realKey = movieCacheKey(movie.id || movie.number, env, upstreamToken);
+      if (realKey !== key) {
+        await edgeCacheWrite(
+          EDGE_NAMESPACE_MOVIE,
+          realKey,
+          movie,
+          MOVIE_CACHE_TTL_MS / 1000,
+        );
+        MOVIE_CACHE.write(realKey, movie);
+      }
     }
     return movie;
   });
@@ -3863,11 +4600,7 @@ function videoFromResolverPayloads(payloads, movie, code, env) {
     return null;
   }
   const orderedVariants = [variant, ...variants.filter((item) => item !== variant)];
-  if (orderedVariants.length > 1) {
-    orderedVariants.forEach((item, index) => {
-      item.sourceName = videoVariantLabel(item, index, orderedVariants.length);
-    });
-  }
+  assignUniqueSourceNames(orderedVariants);
 
   return {
     ...variant,
@@ -3882,17 +4615,7 @@ function videoFromResolverPayload(payload, movie, code, env) {
 function normalizedResolvedVideo(variants) {
   if (!Array.isArray(variants) || !variants.length) return null;
   const normalized = variants.map((variant) => ({ ...variant }));
-  if (normalized.length > 1) {
-    normalized.forEach((variant, index) => {
-      variant.sourceName = videoVariantLabel(
-        variant,
-        index,
-        normalized.length,
-      );
-    });
-  } else {
-    delete normalized[0].sourceName;
-  }
+  assignUniqueSourceNames(normalized);
   return {
     ...normalized[0],
     alternates: normalized.slice(1),
@@ -3920,9 +4643,14 @@ function mergeResolvedVideoVariants(env, ...videos) {
   return normalizedResolvedVideo(variants);
 }
 
-async function validatedResolvedVideo(video, fetchImpl) {
+async function validatedResolvedVideo(video, fetchImpl, env = {}) {
   if (!isUsableResolvedVideo(video)) return null;
-  const variants = await validatedVideoVariants(video, fetchImpl);
+  const budgetMs = positiveEnvMilliseconds(
+    env,
+    "REMOTE_HLS_VALIDATION_BUDGET_MS",
+    REMOTE_HLS_VALIDATION_BUDGET_MS,
+  );
+  const variants = await validatedVideoVariants(video, fetchImpl, budgetMs);
   return normalizedResolvedVideo(variants);
 }
 
@@ -4280,7 +5008,7 @@ async function resolveVideo(movie, env, fetchImpl) {
   }
 
   const finalizeVideo = async (video) => {
-    return validatedResolvedVideo(video, fetchImpl);
+    return validatedResolvedVideo(video, fetchImpl, env);
   };
   const loadResolverVideo = async (resolverUrl) => {
     const payload = await resolverJsonUrl(resolverUrl, env, fetchImpl);
@@ -4648,7 +5376,7 @@ async function validateCachedResolvedVideo(
 ) {
   let video = null;
   try {
-    video = await validatedResolvedVideo(candidate, fetchImpl);
+    video = await validatedResolvedVideo(candidate, fetchImpl, env);
   } catch {
     // A failed validation path is treated as unusable so a dead cached URL
     // cannot keep every client stuck on the same source.
@@ -4660,7 +5388,24 @@ async function validateCachedResolvedVideo(
   return video;
 }
 
-async function peekCachedResolvedVideo(movie, env, fetchImpl) {
+// 缓存写入（尤其是数 MB 内联 HLS 的序列化 + Cache API/D1 落盘）会明显拉长
+// PlaybackInfo 的响应时间，冷启动时甚至把 Worker 推到 Cloudflare 1102。
+// 有 ExecutionContext 时把写入登记到 waitUntil 后台执行，先把播放源返回给
+// 客户端；没有 ctx（单测 / 非 Worker 运行）时仍然同步等待，保证结果可预测。
+async function settleCacheWrite(task, ctx) {
+  const guarded = Promise.resolve(task).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") {
+    try {
+      ctx.waitUntil(guarded);
+      return;
+    } catch {
+      // 登记失败时退回同步等待。
+    }
+  }
+  await guarded;
+}
+
+async function peekCachedResolvedVideo(movie, env, fetchImpl, ctx = null) {
   const key = resolvedVideoCacheKey(movie, env);
   if (!key) return null;
   const memory = RESOLVE_VIDEO_CACHE.read(key);
@@ -4688,11 +5433,14 @@ async function peekCachedResolvedVideo(movie, env, fetchImpl) {
         "edge",
       );
       if (validated) {
-        await edgeCacheWrite(
-          EDGE_NAMESPACE_VIDEO,
-          key,
-          validated,
-          RESOLVE_CACHE_TTL_MS / 1000,
+        await settleCacheWrite(
+          edgeCacheWrite(
+            EDGE_NAMESPACE_VIDEO,
+            key,
+            validated,
+            RESOLVE_CACHE_TTL_MS / 1000,
+          ),
+          ctx,
         );
         RESOLVE_VIDEO_CACHE.write(key, validated);
         return validated;
@@ -4725,7 +5473,7 @@ async function peekCachedResolvedVideo(movie, env, fetchImpl) {
   return null;
 }
 
-async function resolveVideoCached(movie, env, fetchImpl) {
+async function resolveVideoCached(movie, env, fetchImpl, ctx = null) {
   const key = resolvedVideoCacheKey(movie, env);
   if (!key) {
     return resolveVideo(movie, env, fetchImpl);
@@ -4743,11 +5491,14 @@ async function resolveVideoCached(movie, env, fetchImpl) {
         "edge",
       );
       if (validated) {
-        await edgeCacheWrite(
-          EDGE_NAMESPACE_VIDEO,
-          key,
-          validated,
-          RESOLVE_CACHE_TTL_MS / 1000,
+        await settleCacheWrite(
+          edgeCacheWrite(
+            EDGE_NAMESPACE_VIDEO,
+            key,
+            validated,
+            RESOLVE_CACHE_TTL_MS / 1000,
+          ),
+          ctx,
         );
         RESOLVE_VIDEO_CACHE.write(key, validated);
         return validated;
@@ -4766,11 +5517,14 @@ async function resolveVideoCached(movie, env, fetchImpl) {
         "persisted",
       );
       if (validated) {
-        await edgeCacheWrite(
-          EDGE_NAMESPACE_VIDEO,
-          key,
-          validated,
-          RESOLVE_CACHE_TTL_MS / 1000,
+        await settleCacheWrite(
+          edgeCacheWrite(
+            EDGE_NAMESPACE_VIDEO,
+            key,
+            validated,
+            RESOLVE_CACHE_TTL_MS / 1000,
+          ),
+          ctx,
         );
         RESOLVE_VIDEO_CACHE.write(key, validated);
         return validated;
@@ -4784,15 +5538,18 @@ async function resolveVideoCached(movie, env, fetchImpl) {
       const video = await resolveVideo(movie, env, fetchImpl);
       if (isUsableResolvedVideo(video)) {
         if (resolvedVideoResolutionComplete(video)) {
-          await Promise.all([
-            edgeCacheWrite(
-              EDGE_NAMESPACE_VIDEO,
-              key,
-              video,
-              RESOLVE_CACHE_TTL_MS / 1000,
-            ),
-            writePersistedResolvedVideo(env, key, video),
-          ]);
+          await settleCacheWrite(
+            Promise.all([
+              edgeCacheWrite(
+                EDGE_NAMESPACE_VIDEO,
+                key,
+                video,
+                RESOLVE_CACHE_TTL_MS / 1000,
+              ),
+              writePersistedResolvedVideo(env, key, video),
+            ]),
+            ctx,
+          );
           RESOLVE_VIDEO_CACHE.write(key, video);
         }
         return video;
@@ -4800,11 +5557,14 @@ async function resolveVideoCached(movie, env, fetchImpl) {
       if (persisted) {
         // 解析接口返回了空结果也可能只是上游临时异常，旧的成功结果仍比
         // 直接返回空列表更有用。
-        await edgeCacheWrite(
-          EDGE_NAMESPACE_VIDEO,
-          key,
-          persisted.video,
-          RESOLVE_CACHE_TTL_MS / 1000,
+        await settleCacheWrite(
+          edgeCacheWrite(
+            EDGE_NAMESPACE_VIDEO,
+            key,
+            persisted.video,
+            RESOLVE_CACHE_TTL_MS / 1000,
+          ),
+          ctx,
         );
         RESOLVE_VIDEO_CACHE.write(key, persisted.video);
         return persisted.video;
@@ -4812,11 +5572,14 @@ async function resolveVideoCached(movie, env, fetchImpl) {
       return video;
     } catch (error) {
       if (persisted) {
-        await edgeCacheWrite(
-          EDGE_NAMESPACE_VIDEO,
-          key,
-          persisted.video,
-          RESOLVE_CACHE_TTL_MS / 1000,
+        await settleCacheWrite(
+          edgeCacheWrite(
+            EDGE_NAMESPACE_VIDEO,
+            key,
+            persisted.video,
+            RESOLVE_CACHE_TTL_MS / 1000,
+          ),
+          ctx,
         );
         RESOLVE_VIDEO_CACHE.write(key, persisted.video);
         return persisted.video;
@@ -4835,11 +5598,23 @@ async function resolveVideoForResponse(
   ctx,
   budgetMs,
 ) {
-  const resolveTask = resolveVideoCached(movie, env, fetchImpl);
-  const stale = await withTimeout(
-    peekCachedResolvedVideo(movie, env, fetchImpl),
+  const totalBudgetMs = Math.max(0, Number(budgetMs) || 0);
+  const startedAt = Date.now();
+  const remainingBudgetMs = () => Math.max(
+    0,
+    totalBudgetMs - (Date.now() - startedAt),
+  );
+  const resolveTask = resolveVideoCached(movie, env, fetchImpl, ctx);
+  const firstPeekBudgetMs = Math.min(
     RESOLVE_VIDEO_STALE_PEEK_MS,
-  ).catch(() => null);
+    remainingBudgetMs(),
+  );
+  const stale = firstPeekBudgetMs > 0
+    ? await withTimeout(
+      peekCachedResolvedVideo(movie, env, fetchImpl, ctx),
+      firstPeekBudgetMs,
+    ).catch(() => null)
+    : null;
   if (isUsableResolvedVideo(stale)) {
     // 已有一个可用结果时先响应，真实解析继续刷新缓存。
     keepAlive(resolveTask.catch(() => null), ctx);
@@ -4850,11 +5625,20 @@ async function resolveVideoForResponse(
       error: null,
     };
   }
+  if (remainingBudgetMs() <= 0) {
+    keepAlive(resolveTask.catch(() => null), ctx);
+    return {
+      video: null,
+      resolutionFinished: false,
+      stale: false,
+      error: null,
+    };
+  }
 
   try {
     const video = await withTimeout(
       resolveTask,
-      budgetMs,
+      remainingBudgetMs(),
     );
     if (isUsableResolvedVideo(video)) {
       return {
@@ -4868,8 +5652,16 @@ async function resolveVideoForResponse(
     // 响应预算用完不代表解析失败:后台继续跑完并写入缓存,
     // 下一次请求(客户端重试/刷新)就能直接命中结果。
     keepAlive(resolveTask.catch(() => null), ctx);
-    const fallback = await peekCachedResolvedVideo(movie, env, fetchImpl)
-      .catch(() => null);
+    const fallbackBudgetMs = Math.min(
+      RESOLVE_VIDEO_STALE_PEEK_MS,
+      remainingBudgetMs(),
+    );
+    const fallback = fallbackBudgetMs > 0
+      ? await withTimeout(
+        peekCachedResolvedVideo(movie, env, fetchImpl, ctx),
+        fallbackBudgetMs,
+      ).catch(() => null)
+      : null;
     if (isUsableResolvedVideo(fallback)) {
       return {
         video: fallback,
@@ -4886,8 +5678,16 @@ async function resolveVideoForResponse(
     };
   }
 
-  const fallback = await peekCachedResolvedVideo(movie, env, fetchImpl)
-    .catch(() => null);
+  const fallbackBudgetMs = Math.min(
+    RESOLVE_VIDEO_STALE_PEEK_MS,
+    remainingBudgetMs(),
+  );
+  const fallback = fallbackBudgetMs > 0
+    ? await withTimeout(
+      peekCachedResolvedVideo(movie, env, fetchImpl, ctx),
+      fallbackBudgetMs,
+    ).catch(() => null)
+    : null;
   if (isUsableResolvedVideo(fallback)) {
     return {
       video: fallback,
@@ -5064,6 +5864,20 @@ async function cachedSubtitleBody(subtitle, env, fetchImpl) {
   return result;
 }
 
+// Emby 客户端（尤其 Android 端）在 MediaSource 缺少 Size/Bitrate 时会显示
+// “SD · 0.00 MB”，并在正式取流前做一次体积/能力探测，探测失败就直接弹
+// “Playback failed: Could not fetch …”。上游并不返回真实体积，这里按清晰度
+// 估一个码率，再乘时长得到体积；只要能给出一个合理的非零值即可。
+function estimatedMediaBitrate(isHls, height) {
+  const h = Math.max(0, Number(height) || 0);
+  if (h >= 2160) return 24_000_000;
+  if (h >= 1440) return 12_000_000;
+  if (h >= 1080) return 6_000_000;
+  if (h >= 720) return 3_500_000;
+  if (h > 0) return 1_800_000;
+  return isHls ? 4_000_000 : 3_000_000;
+}
+
 function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = item.Id) {
   const isHls = Boolean(
     video.inlinePlaylist ||
@@ -5076,6 +5890,24 @@ function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = 
   const mediaSourceId = String(sourceId || item.Id);
   const height = Number(video.quality || 0);
   const width = height > 0 ? Math.round((height * 16) / 9 / 2) * 2 : undefined;
+  const explicitBitrate = Number(video.bitrate || video.Bitrate || 0);
+  const bitrate = Number.isFinite(explicitBitrate) && explicitBitrate > 0
+    ? Math.round(explicitBitrate)
+    : estimatedMediaBitrate(isHls, height);
+  const runtimeTicks = Math.max(
+    0,
+    Number(video.RunTimeTicks) || Number(item?.RunTimeTicks) || 0,
+  );
+  const runtimeSeconds = runtimeTicks / 10_000_000;
+  const explicitSize = Number(video.size || video.Size || 0);
+  // 上游多数线路没有 RunTimeTicks，旧代码此时 Size 为 undefined，客户端会
+  // 显示 “SD · 0.00 MB” 并在取流前做体积探测（代理网址上常失败，弹
+  // “Playback failed: Could not fetch”）。无时长时按名义时长估一个非零体积，
+  // 让客户端跳过探测即可。
+  const sizeSeconds = runtimeSeconds > 0 ? runtimeSeconds : 3600;
+  const size = Number.isFinite(explicitSize) && explicitSize > 0
+    ? Math.round(explicitSize)
+    : Math.max(1, Math.round((sizeSeconds * bitrate) / 8));
   const buildStreamUrl = (extension) => {
     const url = new URL(
       publicRoutePath(
@@ -5143,6 +5975,10 @@ function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = 
     RequiresClosing: false,
     RequiredHttpHeaders: {},
     RunTimeTicks: item.RunTimeTicks,
+    // 非零的 Size/Bitrate 让客户端不再显示 “0.00 MB”，也跳过取流前的
+    // 体积探测（该探测在代理网址上常常失败并弹 “Playback failed”）。
+    Bitrate: bitrate,
+    Size: size,
     DefaultAudioStreamIndex: 1,
     DefaultSubtitleStreamIndex: subtitleStreams[0]?.Index,
     MediaStreams: [
@@ -5157,6 +5993,7 @@ function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = 
         Index: 0,
         Width: width,
         Height: height || undefined,
+        BitRate: bitrate,
         AspectRatio: "16:9",
         VideoRange: "SDR",
         VideoRangeType: "SDR",
@@ -5392,6 +6229,7 @@ function systemInfo(requestUrl, env) {
     LocalAddress: new URL(requestUrl).origin,
     ServerName: PRODUCT_NAME,
     Version: serverVersion(env),
+    BuildId: SERVER_BUILD_ID,
     ProductName: "Emby Compatible Server",
     Id: serverId(env),
     OperatingSystem: "Cloudflare Workers",
@@ -5457,16 +6295,25 @@ function virtualFolder(library) {
   };
 }
 
-// 真实解析器首次抓取通常需要十几秒。预算过短会在解析完成前返回，
-// 客户端只能看到空列表或反复加载；这里给完整解析留出足够时间。
-const ITEM_DETAIL_RESOLVE_BUDGET_MS = 20000;
-const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 20000;
+// 详情页预算必须远小于客户端自带的 HTTP 超时（Emby 客户端常见 8~10 秒），
+// 否则冷启动解析还没结束，客户端已经弹“Connection timeout”，并把本次
+// 详情请求当成失败，连带清掉播放记录、进度条和播放按钮。
+// 因此详情页只等一个很短的窗口：命中内存/边缘/持久层旧源时能立刻返回完整
+// 线路；冷缓存则先返回元数据（PlayAccess 仍为 Full，保留进度条与播放按钮），
+// 真正的解析交给后台继续跑完并写进缓存，用户在 PlaybackInfo 阶段拿到线路。
+const ITEM_DETAIL_RESOLVE_BUDGET_MS = 3000;
+// PlaybackInfo 是用户“点了播放”之后的请求，客户端对它的超时更宽容，给足
+// 时间让冷启动解析（约 10 秒）跑完，避免点播放后立刻弹“Playback failed”。
+const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 12000;
+// PlaybackInfo 单独放宽整个请求的截止时间，否则会被详情页共用的 8.2 秒
+// 截止时间提前截断，导致冷启动时反复 503。
+const PLAYBACK_INFO_REQUEST_DEADLINE_MS = 15000;
 // 详情页也只等一个很小的字幕窗口：播放源就绪后立刻返回会让首次打开详情
 // 缺省字幕轨；冷启动字幕仍由后台任务继续完成。
-const ITEM_DETAIL_SUBTITLE_WAIT_MS = 2500;
+const ITEM_DETAIL_SUBTITLE_WAIT_MS = 1500;
 // PlaybackInfo 首次请求如果播放源已经先返回、字幕仍在解析，短暂等待，
 // 避免客户端第一次点击播放拿到没有字幕轨的 MediaSource。
-const PLAYBACK_INFO_SUBTITLE_WAIT_MS = 2500;
+const PLAYBACK_INFO_SUBTITLE_WAIT_MS = 1500;
 
 const SEARCH_PREWARM_LIMIT = 3;
 
@@ -5506,7 +6353,7 @@ function prewarmResolve(movie, env, fetchImpl, ctx = null) {
   if (!movie?.id && !movie?.number) return;
   // 播放源与字幕并行解析,不要在后台排队等两次冷启动。
   const task = Promise.all([
-    resolveVideoCached(movie, env, fetchImpl).catch(() => {}),
+    resolveVideoCached(movie, env, fetchImpl, ctx).catch(() => {}),
     resolveSubtitlesCached(movie, env, fetchImpl).catch(() => {}),
   ]);
   // Worker 响应返回后后台任务可能被直接杀掉:有 ctx.waitUntil 就登记上,
@@ -5588,7 +6435,18 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   if (personNameFromId) {
     return jsonResponse(personItemDto(id, personNameFromId, env));
   }
-  const movie = await getMovieCached(id, env, fetchImpl, token);
+  const requestDeadline = Date.now() + ITEM_REQUEST_DEADLINE_MS;
+  const metadataBudgetMs = remainingRequestMs(
+    requestDeadline,
+    ITEM_METADATA_BUDGET_MS,
+  );
+  const metadataDeadline = Date.now() + metadataBudgetMs;
+  const movie = await withTimeout(
+    getMovieCached(id, env, fetchImpl, token, {
+      deadline: metadataDeadline,
+    }),
+    metadataBudgetMs,
+  );
   if (!movie?.id && !movie?.number) {
     return errorResponse(404, "Movie not found");
   }
@@ -5618,13 +6476,24 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     env,
     fetchImpl,
     ctx,
-    ITEM_DETAIL_RESOLVE_BUDGET_MS,
+    remainingRequestMs(
+      requestDeadline,
+      positiveEnvMilliseconds(
+        env,
+        "ITEM_DETAIL_RESOLVE_BUDGET_MS",
+        ITEM_DETAIL_RESOLVE_BUDGET_MS,
+      ),
+    ),
   );
   video = videoResolution.video;
   resolutionFinished = videoResolution.resolutionFinished;
+  const subtitleWaitMs = Math.min(
+    ITEM_DETAIL_SUBTITLE_WAIT_MS,
+    remainingRequestMs(requestDeadline, ITEM_DETAIL_SUBTITLE_WAIT_MS),
+  );
   subtitles = subtitleResolution.record.done
     ? subtitleResolution.record.value || []
-    : await settledWithin(subtitleResolution.tracked, ITEM_DETAIL_SUBTITLE_WAIT_MS);
+    : await settledWithin(subtitleResolution.tracked, subtitleWaitMs);
   if (!Array.isArray(subtitles)) {
     subtitles = await peekCachedSubtitles(movie, env);
   }
@@ -5635,23 +6504,26 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
 
   if (!video) {
-    if (resolutionFinished && !videoResolution.error) {
-      // 解析已完成但确实没有可播放源：明确标成不可播放，避免客户端去请求播放。
-      item.PlayAccess = "None";
+    if (!resolutionFinished || videoResolution.error) {
+      // 解析还在后台继续，或上游临时失败。绝不能用 503 / PlayAccess=None /
+      // 空 MediaSources 当作最终结果返回：Emby 客户端会把整次详情请求判为失败，
+      // 于是把已经缓存的播放记录、进度条和播放按钮一起清掉（用户已多次遇到）。
+      // 这里照常返回元数据（mapMovie 默认 PlayAccess=Full、UserData 里带进度），
+      // 详情页立刻可用且不报错；真正的线路由后台解析写进缓存，用户点播放时
+      // 由 /PlaybackInfo 命中缓存返回。只有“解析已完成且确实没有任何线路”才
+      // 标成不可播放（见下面的分支）。
       item.MediaSources = [];
-      item.MediaStreams = [];
       item.MediaSourceCount = 0;
-      item.HasSubtitles = false;
+      item.HasSubtitles = subtitles.length > 0;
       return itemJsonResponse(item, request);
     }
-    // 解析失败且没有旧成功源可用：不要返回没有真实地址的占位线路，
-    // 否则客户端会选中假源并一直加载。后台解析完成后下一次请求会命中缓存。
+    // 解析已完成但确实没有可播放源：明确标成不可播放，避免客户端去请求播放。
+    // 这是权威的“无源”结果，不是解析超时，因此可以安全覆盖旧状态。
     item.PlayAccess = "None";
     item.MediaSources = [];
     item.MediaStreams = [];
     item.MediaSourceCount = 0;
-    item.Container = undefined;
-    item.HasSubtitles = subtitles.length > 0;
+    item.HasSubtitles = false;
     return itemJsonResponse(item, request);
   }
   const mediaSources = mediaSourcesForVideo(
@@ -5809,6 +6681,10 @@ async function durableDbWrite(db, namespace, key, value) {
 //   tombstone —— “已移除”墓碑（比状态更关键：它负责挡住迟到的脏写回）。
 const EDGE_NAMESPACE_PLAYBACK = "playback";
 const EDGE_NAMESPACE_TOMBSTONE = "tombstone";
+// token -> 用户名 的映射。必须和播放记录一样走持久化存储：只写 KV 时，
+// 一旦部署改成只绑定 D1（本项目的部署方式），映射就会丢，token 找不到用户名
+// 会退回一个全新的 token 分桶，表现就是“部署新代码后播放记录/进度条全没了”。
+const EDGE_NAMESPACE_SESSION = "session-user";
 const EDGE_NAMESPACE_PLAYBACK_MIRROR = "playback-mirror-v1";
 const EDGE_NAMESPACE_TOMBSTONE_MIRROR = "tombstone-mirror-v1";
 const PLAYBACK_CACHE_TTL_S = 30 * 24 * 60 * 60;
@@ -5975,17 +6851,27 @@ function sessionUserKey(token) {
 }
 
 async function storeSessionUser(env, token, username, deviceId = "", extra = {}) {
-  const kv = playbackKv(env);
-  if (!kv || !token || !username) return;
+  const hasStateKey = Boolean(
+    extra && typeof extra.stateKey === "string" && extra.stateKey,
+  );
+  if (!token || (!username && !hasStateKey)) return;
   try {
-    const record = { username: String(username), at: Date.now() };
+    const record = { at: Date.now() };
+    if (username) {
+      record.username = String(username);
+    }
     if (deviceId) {
       record.deviceId = String(deviceId);
     }
     if (extra && extra.trusted) {
       record.trusted = true;
     }
-    await kv.put(sessionUserKey(token), JSON.stringify(record));
+    if (extra && typeof extra.stateKey === "string" && extra.stateKey) {
+      record.stateKey = extra.stateKey;
+    }
+    // 走统一持久化入口：D1 绑定存在时写 D1，只有 KV 时写 KV，都没有时退到
+    // 边缘缓存。这样无论部署形态怎么变，token -> 用户名 的映射都不会丢。
+    await durableJsonWrite(env, EDGE_NAMESPACE_SESSION, sessionUserKey(token), record);
   } catch (error) {
     console.error(JSON.stringify({
       message: "Session user mapping write failed",
@@ -5995,10 +6881,9 @@ async function storeSessionUser(env, token, username, deviceId = "", extra = {})
 }
 
 async function lookupSessionRecord(env, token) {
-  const kv = playbackKv(env);
-  if (!kv || !token) return null;
+  if (!token) return null;
   try {
-    const value = await kv.get(sessionUserKey(token), "json");
+    const value = await durableJsonRead(env, EDGE_NAMESPACE_SESSION, sessionUserKey(token));
     return value && typeof value === "object" ? value : null;
   } catch (error) {
     return null;
@@ -6072,6 +6957,282 @@ async function storeStoredLoginPassword(env, username, password) {
 const MEMORY_PLAYBACK_KEYS = new Map();
 const PLAYBACK_KEY_CACHE_MS = 5 * 60 * 1000;
 
+// 旧部署只绑定了 KV 时，token -> 用户名 的映射会随 KV 缺失而丢失，
+// 老 token 只能落到一个全新的、空的 token 分桶，表现为“记录/进度条全消失”。
+// 这里做一次一次性恢复：D1 里如果只存在唯一一个“用户名分桶”，就把该分桶
+// 认作当前账号并写回映射。多用户部署不会满足“唯一”条件，会安全地保持原行为。
+async function soleUsernamePlaybackKey(env) {
+  const db = playbackDb(env);
+  if (!db) return "";
+  try {
+    const rows = await db
+      .prepare(
+        "SELECT key FROM playback_json WHERE namespace = ? AND key LIKE ? LIMIT 2",
+      )
+      .bind(EDGE_NAMESPACE_PLAYBACK, `${PLAYBACK_STATE_KEY}:u:%`)
+      .all();
+    const list = Array.isArray(rows?.results) ? rows.results : [];
+    if (list.length === 1 && list[0] && typeof list[0].key === "string") {
+      return list[0].key;
+    }
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Playback username bucket lookup failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+  return "";
+}
+
+// —— 旧 token 分桶 → 用户名分桶 一次性迁移 ——
+// 历史版本把进度存在 token 分桶里。token -> 用户名 的映射一旦丢失（例如从 KV
+// 切换到 D1、或换了部署方式），新代码会去读一个空的“用户名分桶”，表现就是
+// “部署新代码后播放记录、进度条全消失”。这里在用户名分桶为空时，把同一用户
+// 的历史 token 分桶（连同删除墓碑）合并进用户名分桶，之后只写用户名分桶。
+//
+// 安全前提：只有能确定这些旧分桶属于当前用户时才合并——
+//   1. 当前 token 自己的分桶（映射关系是确定的）；
+//   2. session-user 表里登记为同一用户名的 token 分桶；
+//   3. 整个部署只出现过“唯一一个用户名”时，才把没有登记归属的孤儿 token
+//      分桶视为该用户的历史数据（单用户部署的恢复路径）。多用户名部署不会
+//      满足这个条件，会安全地放弃合并，绝不抢占别人的记录。
+const MEMORY_PLAYBACK_MIGRATION_GUARDS = new Set();
+const PLAYBACK_MIGRATION_MARKER_PREFIX = "migrate-v1:";
+const PLAYBACK_MIGRATION_MAX_SESSION_ROWS = 500;
+const PLAYBACK_MIGRATION_MAX_BUCKET_ROWS = 500;
+const TOKEN_BUCKET_SUFFIX_RE = /^:[0-9a-f]{32}$/i;
+
+function playbackMigrationMarkerKey(username) {
+  return `${SESSION_USER_KEY_PREFIX}${PLAYBACK_MIGRATION_MARKER_PREFIX}${
+    md5(normalizedLoginName(username))
+  }`;
+}
+
+function sessionTokenHash(key) {
+  const suffix = String(key || "").slice(SESSION_USER_KEY_PREFIX.length);
+  return /^[0-9a-f]{32}$/i.test(suffix) ? suffix.toLowerCase() : "";
+}
+
+// 扫描 token -> 用户名 映射表，解析出每个 token 对应的用户名。
+async function scanSessionUserRecords(env) {
+  const db = playbackDb(env);
+  if (!db) return [];
+  const rows = await db
+    .prepare(
+      "SELECT key, value FROM playback_json WHERE namespace = ? AND key LIKE ? LIMIT ?",
+    )
+    .bind(EDGE_NAMESPACE_SESSION, `${SESSION_USER_KEY_PREFIX}%`, PLAYBACK_MIGRATION_MAX_SESSION_ROWS)
+    .all();
+  const list = Array.isArray(rows?.results) ? rows.results : [];
+  const records = [];
+  for (const row of list) {
+    const hash = sessionTokenHash(row && row.key);
+    if (!hash) continue;
+    let value;
+    try {
+      value = parsePlaybackDbValue(row.value);
+    } catch {
+      continue;
+    }
+    if (!value || typeof value !== "object") continue;
+    records.push({
+      hash,
+      username: String(value.username || ""),
+      stateKey: String(value.stateKey || ""),
+    });
+  }
+  return records;
+}
+
+// 读出所有“播放状态”分桶（含旧的 token 分桶和用户名分桶），用于合并。
+async function scanPlaybackBuckets(env) {
+  const db = playbackDb(env);
+  if (!db) return new Map();
+  const rows = await db
+    .prepare(
+      "SELECT key, value FROM playback_json WHERE namespace = ? AND key LIKE ? LIMIT ?",
+    )
+    .bind(EDGE_NAMESPACE_PLAYBACK, `${PLAYBACK_STATE_KEY}%`, PLAYBACK_MIGRATION_MAX_BUCKET_ROWS)
+    .all();
+  const list = Array.isArray(rows?.results) ? rows.results : [];
+  const buckets = new Map();
+  for (const row of list) {
+    const key = row && typeof row.key === "string" ? row.key : "";
+    if (!key) continue;
+    let value;
+    try {
+      value = parsePlaybackDbValue(row.value);
+    } catch {
+      continue;
+    }
+    buckets.set(key, value && typeof value === "object" && !Array.isArray(value) ? value : {});
+  }
+  return buckets;
+}
+
+// 一次读出所有墓碑分桶：迁移时逐个 readTombstones 会多打几倍的 D1 查询，
+// 冷启动那一次请求本来就很敏感，这里合并成单条查询。
+async function scanTombstoneStores(env) {
+  const db = playbackDb(env);
+  if (!db) return new Map();
+  const rows = await db
+    .prepare(
+      "SELECT key, value FROM playback_json WHERE namespace = ? AND key LIKE ? LIMIT ?",
+    )
+    .bind(EDGE_NAMESPACE_TOMBSTONE, `%${PLAYBACK_TOMBSTONE_SUFFIX}`, PLAYBACK_MIGRATION_MAX_BUCKET_ROWS)
+    .all();
+  const list = Array.isArray(rows?.results) ? rows.results : [];
+  const stores = new Map();
+  for (const row of list) {
+    const key = row && typeof row.key === "string" ? row.key : "";
+    if (!key.endsWith(PLAYBACK_TOMBSTONE_SUFFIX)) continue;
+    let value;
+    try {
+      value = parsePlaybackDbValue(row.value);
+    } catch {
+      continue;
+    }
+    const stateKey = key.slice(0, -PLAYBACK_TOMBSTONE_SUFFIX.length);
+    stores.set(stateKey, tombstoneStore(value));
+  }
+  return stores;
+}
+
+// 同一部片在多个分桶里各有一条记录时，保留“最近看过”的那条；时间相同再比较
+// 播放进度与已播标记，避免恢复出来的进度条停在更早的位置。
+function mergePlaybackRecord(left, right) {
+  if (!left) return right;
+  if (!right) return left;
+  const leftMs = recordTimestampMs(left);
+  const rightMs = recordTimestampMs(right);
+  if (rightMs !== leftMs) return rightMs > leftMs ? right : left;
+  const leftTicks = Math.max(0, Number(left.positionTicks) || 0);
+  const rightTicks = Math.max(0, Number(right.positionTicks) || 0);
+  if (rightTicks !== leftTicks) return rightTicks > leftTicks ? right : left;
+  if (Boolean(right.played) !== Boolean(left.played)) {
+    return right.played ? right : left;
+  }
+  return left;
+}
+
+async function migrateLegacyPlaybackBuckets(env, username, token, destinationKey) {
+  const name = normalizedLoginName(username);
+  if (!name || !destinationKey) return false;
+  const sessions = await scanSessionUserRecords(env);
+  const usernames = new Set(
+    sessions.map((record) => normalizedLoginName(record.username)).filter(Boolean),
+  );
+  // 只有“当前部署只出现过这一个用户名”时，才敢认领没有归属登记的孤儿分桶。
+  const soleUser = usernames.size === 1 && usernames.has(name);
+  const ownedHashes = new Set();
+  const ownHash = playbackTokenPart(token);
+  if (ownHash) ownedHashes.add(ownHash);
+  for (const record of sessions) {
+    if (normalizedLoginName(record.username) === name) ownedHashes.add(record.hash);
+    // 已经被迁移过的 token 会直接登记目标分桶 key，跟着一起认领。
+    if (record.stateKey === destinationKey) ownedHashes.add(record.hash);
+  }
+  const buckets = await scanPlaybackBuckets(env);
+  const sourceKeys = [];
+  for (const key of buckets.keys()) {
+    if (key === destinationKey) continue;
+    const suffix = key.slice(PLAYBACK_STATE_KEY.length);
+    // 别的账号的用户名分桶绝不合并。
+    if (suffix.startsWith(":u:")) continue;
+    if (TOKEN_BUCKET_SUFFIX_RE.test(suffix)) {
+      const hash = suffix.slice(1).toLowerCase();
+      if (!soleUser && !ownedHashes.has(hash)) continue;
+      sourceKeys.push(key);
+      continue;
+    }
+    // 无账号的旧部署会把进度写进基础分桶；仍按“唯一用户”条件决定是否认领。
+    if (suffix === "" && soleUser) sourceKeys.push(key);
+  }
+  if (sourceKeys.length === 0) return false;
+
+  const tombstoneStores = await scanTombstoneStores(env);
+  const mergedTombstones = {};
+  for (const key of sourceKeys) {
+    const store = tombstoneStores.get(key) || {};
+    for (const itemId of Object.keys(store || {})) {
+      const marker = normalizeTombstone(store[itemId]);
+      if (!marker) continue;
+      const existing = normalizeTombstone(mergedTombstones[itemId]);
+      if (!existing || marker.at > existing.at) mergedTombstones[itemId] = marker;
+    }
+  }
+
+  const merged = {};
+  for (const key of sourceKeys) {
+    const bucket = buckets.get(key) || {};
+    for (const itemId of Object.keys(bucket)) {
+      if (itemId === "__removedAt") continue;
+      const record = bucket[itemId];
+      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+      merged[itemId] = mergePlaybackRecord(merged[itemId], record);
+    }
+  }
+
+  // 先把合并后的墓碑落盘，再按墓碑剪掉被删过的条目，避免旧分桶把“已移除”
+  // 的记录又带回来（这正是用户反馈的“删除记录后又出现”）。
+  const destinationTombstones = await readTombstones(env, destinationKey, { fresh: true })
+    .catch(() => ({}));
+  for (const itemId of Object.keys(mergedTombstones)) {
+    const existing = normalizeTombstone(destinationTombstones[itemId]);
+    const incoming = mergedTombstones[itemId];
+    if (!existing || incoming.at >= existing.at) destinationTombstones[itemId] = incoming;
+  }
+  await writeTombstones(env, destinationKey, destinationTombstones);
+  filterStateByTombstones(merged, destinationTombstones);
+  await writePlaybackStateByKey(env, destinationKey, merged);
+  await durableJsonWrite(env, EDGE_NAMESPACE_SESSION, playbackMigrationMarkerKey(name), {
+    at: Date.now(),
+    username: name,
+    sources: sourceKeys,
+  });
+  console.log(JSON.stringify({
+    message: "Migrated legacy playback buckets",
+    username: name,
+    destination: destinationKey,
+    sources: sourceKeys,
+    items: Object.keys(merged).length,
+  }));
+  return true;
+}
+
+// 每次实例冷启动最多检查一次：用户名分桶已经有数据（或已经迁移过）就直接跳过，
+// 不给每个请求都加一次全表扫描。
+async function ensureLegacyPlaybackMigration(env, token, username, key) {
+  if (!username || !token || !key) return;
+  if (!key.startsWith(`${PLAYBACK_STATE_KEY}:u:`)) return;
+  if (!playbackDb(env)) return;
+  const guard = `${key}|${playbackTokenPart(token)}`;
+  if (MEMORY_PLAYBACK_MIGRATION_GUARDS.has(guard)) return;
+  try {
+    const marker = await durableJsonRead(
+      env,
+      EDGE_NAMESPACE_SESSION,
+      playbackMigrationMarkerKey(username),
+    );
+    if (marker && typeof marker === "object") {
+      MEMORY_PLAYBACK_MIGRATION_GUARDS.add(guard);
+      return;
+    }
+    const existing = await durableJsonRead(env, EDGE_NAMESPACE_PLAYBACK, key);
+    if (existing && typeof existing === "object" && Object.keys(existing).length > 0) {
+      MEMORY_PLAYBACK_MIGRATION_GUARDS.add(guard);
+      return;
+    }
+    await migrateLegacyPlaybackBuckets(env, username, token, key);
+    MEMORY_PLAYBACK_MIGRATION_GUARDS.add(guard);
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Legacy playback migration failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
+
 async function playbackStateKey(env, token) {
   const scope = String(token || "").trim();
   if (!scope || scope === guestToken(env)) {
@@ -6081,11 +7242,38 @@ async function playbackStateKey(env, token) {
   if (cached && Date.now() - cached.at < PLAYBACK_KEY_CACHE_MS) {
     return cached.key;
   }
-  const username = await lookupSessionUsername(env, scope);
-  const key = username
-    ? `${PLAYBACK_STATE_KEY}:u:${md5(username)}`
-    : `${PLAYBACK_STATE_KEY}:${playbackTokenPart(scope)}`;
-  if (username) {
+  const record = await lookupSessionRecord(env, scope);
+  const username = record && record.username ? String(record.username) : "";
+  let key = "";
+  if (record && typeof record.stateKey === "string" && record.stateKey) {
+    // 恢复出来的映射直接记的是分桶 key（原始用户名已不可考）。
+    key = record.stateKey;
+  } else if (username) {
+    key = `${PLAYBACK_STATE_KEY}:u:${md5(username)}`;
+  }
+  if (!key) {
+    // 先看这个 token 自己有没有历史分桶；有就照旧用，绝不抢占别的账号。
+    const tokenScopedKey = `${PLAYBACK_STATE_KEY}:${playbackTokenPart(scope)}`;
+    const ownValue = await durableJsonRead(env, EDGE_NAMESPACE_PLAYBACK, tokenScopedKey)
+      .catch(() => undefined);
+    if (ownValue && typeof ownValue === "object" && Object.keys(ownValue).length > 0) {
+      key = tokenScopedKey;
+    } else {
+      const adopted = await soleUsernamePlaybackKey(env);
+      if (adopted) {
+        key = adopted;
+        await storeSessionUser(env, scope, "", "", {
+          trusted: true,
+          stateKey: adopted,
+        });
+      }
+    }
+  }
+  if (!key) {
+    key = `${PLAYBACK_STATE_KEY}:${playbackTokenPart(scope)}`;
+  }
+  if (username || key.startsWith(`${PLAYBACK_STATE_KEY}:u:`)) {
+    await ensureLegacyPlaybackMigration(env, scope, username, key);
     MEMORY_PLAYBACK_KEYS.set(scope, { key, at: Date.now() });
     if (MEMORY_PLAYBACK_KEYS.size > MAX_MEMORY_PLAYBACK_STATES) {
       const oldestKey = MEMORY_PLAYBACK_KEYS.keys().next().value;
@@ -6954,7 +8142,7 @@ async function subtitleResponse(id, index, request, env, fetchImpl, token) {
   }
 }
 
-async function streamResponse(id, request, env, fetchImpl, token) {
+async function streamResponse(id, request, env, fetchImpl, token, ctx = null) {
   if (!token && !guestAccessEnabled(env)) {
     return errorResponse(401, "Emby token is required for playback");
   }
@@ -7055,7 +8243,12 @@ async function streamResponse(id, request, env, fetchImpl, token) {
     }
 
     const movieForStream = await getMovieCached(id, env, fetchImpl, token);
-    const resolvedVideo = await resolveVideoCached(movieForStream, env, fetchImpl);
+    const resolvedVideo = await resolveVideoCached(
+      movieForStream,
+      env,
+      fetchImpl,
+      ctx,
+    );
     const response = await tryVideo(selectedPlaybackVideo(resolvedVideo, id, requestUrl));
     if (response) {
       return response;
@@ -7065,7 +8258,12 @@ async function streamResponse(id, request, env, fetchImpl, token) {
     if (resolvedVideo) {
       await forgetResolveVideoCache(movieForStream, env);
       triedSources.clear();
-      const retriedVideo = await resolveVideoCached(movieForStream, env, fetchImpl);
+      const retriedVideo = await resolveVideoCached(
+        movieForStream,
+        env,
+        fetchImpl,
+        ctx,
+      );
       const retriedResponse = await tryVideo(selectedPlaybackVideo(retriedVideo, id, requestUrl));
       if (retriedResponse) {
         return retriedResponse;
@@ -7508,7 +8706,9 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
   }
 
   if (path === "/System/Info/Public" || path === "/System/Info") {
-    return jsonResponse(systemInfo(request.url, env));
+    return jsonResponse(systemInfo(request.url, env), 200, {
+      "x-emby-build": SERVER_BUILD_ID,
+    });
   }
   if (path === "/System/Endpoint") {
     return jsonResponse({ IsLocal: false, IsInNetwork: false });
@@ -8173,7 +9373,21 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
   const playbackMatch = path.match(/^\/Items\/([^/]+)\/PlaybackInfo$/i);
   if (playbackMatch) {
     try {
-      const movie = await getMovieCached(decodeURIComponent(playbackMatch[1]), env, fetchImpl, token);
+      const requestDeadline = Date.now() + PLAYBACK_INFO_REQUEST_DEADLINE_MS;
+      const metadataBudgetMs = remainingRequestMs(
+        requestDeadline,
+        ITEM_METADATA_BUDGET_MS,
+      );
+      const movie = await withTimeout(
+        getMovieCached(
+          decodeURIComponent(playbackMatch[1]),
+          env,
+          fetchImpl,
+          token,
+          { deadline: Date.now() + metadataBudgetMs },
+        ),
+        metadataBudgetMs,
+      );
       const item = mapMovie(movie, request.url, env);
       const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
       const subtitleResolution = trackResolution(
@@ -8188,14 +9402,25 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
         env,
         fetchImpl,
         ctx,
-        PLAYBACK_INFO_RESOLVE_BUDGET_MS,
+        remainingRequestMs(
+          requestDeadline,
+          positiveEnvMilliseconds(
+            env,
+            "PLAYBACK_INFO_RESOLVE_BUDGET_MS",
+            PLAYBACK_INFO_RESOLVE_BUDGET_MS,
+          ),
+        ),
       );
       const video = videoResolution.video;
+      const subtitleWaitMs = Math.min(
+        PLAYBACK_INFO_SUBTITLE_WAIT_MS,
+        remainingRequestMs(requestDeadline, PLAYBACK_INFO_SUBTITLE_WAIT_MS),
+      );
       let subtitles = subtitleResolution.record.done
         ? subtitleResolution.record.value || []
         : await settledWithin(
           subtitleResolution.tracked,
-          PLAYBACK_INFO_SUBTITLE_WAIT_MS,
+          subtitleWaitMs,
         );
       if (!Array.isArray(subtitles)) {
         subtitles = await peekCachedSubtitles(movie, env);
@@ -8205,10 +9430,33 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
         keepAlive(subtitleResolution.tracked, ctx);
       }
 
-      const mediaSources = video
-        ? mediaSourcesForVideo(item, request.url, playbackToken, video, subtitles)
-        : [];
-
+      if (!video) {
+        if (!videoResolution.resolutionFinished || videoResolution.error) {
+          // 没有真实源时不能生成 PlaySessionId。否则客户端会认为播放信息已经
+          // 就绪，随后拿空列表播放并超时；详情页也可能因此丢掉旧源和进度。
+          return temporaryPlaybackResponse(
+            "Playback sources are still resolving; retry the request",
+          );
+        }
+        // 解析已完成且上游明确没有可播放源。这是稳定结果，不创建播放会话。
+        return jsonResponse({
+          PlaySessionId: "",
+          ItemId: item.Id,
+          MediaSources: [],
+        });
+      }
+      const mediaSources = mediaSourcesForVideo(
+        item,
+        request.url,
+        playbackToken,
+        video,
+        subtitles,
+      );
+      if (!mediaSources.length) {
+        return temporaryPlaybackResponse(
+          "Playback sources are not ready; retry the request",
+        );
+      }
       const playSessionId = crypto.randomUUID();
       // 记住这次播放用的会话号:之后“移除播放记录”才能认出哪些上报是残留。
       rememberPlaySession(await playbackStateKey(env, playbackToken), item.Id, playSessionId);
@@ -8229,6 +9477,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       env,
       fetchImpl,
       token,
+      ctx,
     );
   }
 
@@ -8256,7 +9505,13 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
   }
 
   const streamMatch = path.match(
-    /^\/Videos\/([^/]+)(?:\/[^/]+)?\/(?:stream(?:ing)?|original|download|playback)(?:[._-][^/]*)?$/i,
+    // 有些客户端（ExoPlayer / 部分 Android TV 外壳）拿到 HLS 媒体源后不请求
+    // stream.m3u8，而是按 Emby 原生习惯先请求 master.m3u8 / main.m3u8。
+    // 旧代码只认 stream/original/download/playback，这两个路径直接 404，
+    // 客户端表现为 “Playback failed: Could not fetch …”。这里把它们并入
+    // 同一条取流分支：单条媒体源直接回放，重写后的清单里已经是可直接播放的
+    // 分片地址，不需要再生成多码率 master。
+    /^\/Videos\/([^/]+)(?:\/[^/]+)?\/(?:stream(?:ing)?|original|download|playback|master|main)(?:[._-][^/]*)?$/i,
   );
   if (streamMatch) {
     return streamResponse(
@@ -8265,6 +9520,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       env,
       fetchImpl,
       token,
+      ctx,
     );
   }
 
@@ -8279,7 +9535,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       mediaUrl.toString(),
       env,
       fetchImpl,
-      { hlsManifest },
+      { hlsManifest, ctx },
     );
     return proxyMediaResponse(
       upstream,
@@ -8324,6 +9580,7 @@ export function resetEmbyCachesForTests() {
   LIST_CACHE.clear();
   API_TOKEN_CACHE.clear();
   MEDIA_SEGMENT_BODY_CACHE.clear();
+  MEDIA_SEGMENT_PREFIX_CACHE.clear();
   SUBTITLE_STREAM_TOKENS.clear();
   SUBTITLE_BODY_CACHE.clear();
   MEMORY_PLAYBACK_STATES.clear();
