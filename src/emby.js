@@ -21,6 +21,17 @@ const DEFAULT_GUEST_TOKEN = "bbjavdb-guest";
 // 旧版客户端仍可能请求早期版本暴露的“可播放”片库。入口已从可见片库移除，
 // 这里只保留隐藏的兼容映射，避免旧请求落空或误落到“中文字幕”筛选。
 const LEGACY_PLAYABLE_LIBRARY_ID = "bbjavdb-playable";
+// 全局搜索（客户端不带 ParentId 的搜索）默认用的视图：只要求“可播放”，
+// 不要求中文字幕。它不是片库，不出现在 /Views 列表里，只是搜索的默认过滤条件；
+// 仍然按 libraryForRequestedId 解析，所以客户端带着这个 ParentId 回访也不会落空。
+const PLAYABLE_SEARCH_LIBRARY_ID = "bbjavdb-playable-search";
+const PLAYABLE_SEARCH_LIBRARY = {
+  id: PLAYABLE_SEARCH_LIBRARY_ID,
+  name: "可播放",
+  sourceType: "all",
+  sourceFilter: "can_play",
+  matches: (movie) => Boolean(movie?.can_play),
+};
 const LIBRARIES = [
   {
     id: CHINESE_PLAYABLE_LIBRARY_ID,
@@ -61,6 +72,9 @@ function libraryForRequestedId(parentId) {
       sourceFilter: "can_play",
       matches: (movie) => Boolean(movie?.can_play),
     };
+  }
+  if (parentId === PLAYABLE_SEARCH_LIBRARY_ID) {
+    return PLAYABLE_SEARCH_LIBRARY;
   }
   return LIBRARIES.find((item) => item.id === parentId) ||
     LIBRARIES.find((item) => item.id === CHINESE_PLAYABLE_LIBRARY_ID);
@@ -105,7 +119,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v12";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-06-search-backdrop-3";
+const SERVER_BUILD_ID = "2026-10-06-search-playable-4";
 const REMOTE_HLS_PROBE_TIMEOUT_MS = 3500;
 // 整个“播放源可用性校验”的总预算。校验是逐条线路探测上游分片，慢 CDN 上
 // 单条就可能超过 3 秒；如果让所有线路都校验完再返回，冷启动详情/PlaybackInfo
@@ -4110,16 +4124,12 @@ async function getMoviePage(query, env, fetchImpl, token = "", options = {}) {
   );
   const searchTerm = query.get("SearchTerm") || query.get("searchTerm") || "";
   const explicitParentId = query.get("ParentId") || "";
-  // Emby 的“搜索”是不带 ParentId 的全局搜索：同一个关键词的作品会分散在
-  // “中文字幕/有码/无码/欧美”四个片库里，只查默认的“中文字幕”库会明显少结果
-  // （实测标题搜“母”只有 560 多条，跨库并集有 830 多条）。所以这里把全局搜索
-  // 交给 keywordMoviesPage 跨库汇总；带 ParentId 的库内搜索仍走下面的单库逻辑。
-  if (searchTerm && !explicitParentId) {
-    return keywordMoviesPage(query, env, fetchImpl, token, searchTerm, "search", {
-      exactTotal: !fastSearch,
-    });
-  }
-  const requestedParentId = explicitParentId || CHINESE_PLAYABLE_LIBRARY_ID;
+  // Emby 的搜索是不带 ParentId 的全局搜索。这里不再默认按“中文字幕”过滤：
+  // 否则片库浏览里看得到的作品，一搜索就“消失”（搜索只返回中文可播片）。
+  // 全局搜索改成只要求“可播放”，用一次上游查询拿到全部可播放结果，
+  // 不做多片库汇总；带 ParentId 的库内搜索语义不变。
+  const requestedParentId = explicitParentId ||
+    (searchTerm ? PLAYABLE_SEARCH_LIBRARY_ID : CHINESE_PLAYABLE_LIBRARY_ID);
   const library = libraryForRequestedId(requestedParentId);
   const parentId = requestedParentId === ROOT_ID ? ROOT_ID : library.id;
   const requiredCount = startIndex + limit;

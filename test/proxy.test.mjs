@@ -1190,35 +1190,31 @@ test("expands single-character searches with a wildcard and a larger page size",
   }
 });
 
-test("spans every library for a global search without a ParentId", async () => {
+test("returns every playable movie for a global search without a ParentId", async () => {
   const filters = [];
-  const moviesByFilter = {
-    subtitle: [
-      {
-        id: "cn-1",
-        number: "CN-001",
-        title: "母 中文字幕",
-        can_play: true,
-        has_cnsub: true,
-      },
-    ],
-    can_play: [
-      {
-        id: "cn-1",
-        number: "CN-001",
-        title: "母 中文字幕",
-        can_play: true,
-        has_cnsub: true,
-      },
-      {
-        id: "raw-1",
-        number: "RAW-001",
-        title: "母 无字幕",
-        can_play: true,
-        has_cnsub: false,
-      },
-    ],
-  };
+  const movies = [
+    {
+      id: "cn-1",
+      number: "CN-001",
+      title: "母 中文字幕",
+      can_play: true,
+      has_cnsub: true,
+    },
+    {
+      id: "raw-1",
+      number: "RAW-001",
+      title: "母 无字幕",
+      can_play: true,
+      has_cnsub: false,
+    },
+    {
+      id: "off-1",
+      number: "OFF-001",
+      title: "母 不能播",
+      can_play: false,
+      has_cnsub: true,
+    },
+  ];
   const response = await handleProxy(
     new Request(
       "https://clone.example/emby/Items?SearchTerm=%E6%AF%8D&Recursive=true&IncludeItemTypes=Movie&Limit=20",
@@ -1226,10 +1222,9 @@ test("spans every library for a global search without a ParentId", async () => {
     {},
     {},
     async (url) => {
-      const filter = new URL(String(url)).searchParams.get("movie_filter_by");
-      filters.push(filter);
+      filters.push(new URL(String(url)).searchParams.get("movie_filter_by"));
       return new Response(
-        JSON.stringify({ success: 1, data: { movies: moviesByFilter[filter] || [] } }),
+        JSON.stringify({ success: 1, data: { movies } }),
         { headers: { "content-type": "application/json" } },
       );
     },
@@ -1237,13 +1232,11 @@ test("spans every library for a global search without a ParentId", async () => {
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  // 不带 ParentId 的全局搜索要覆盖“中文字幕”和其余三个片库（can_play），
-  // 否则搜索结果会明显少于片库里实际存在的作品。
-  assert.equal(filters.includes("subtitle"), true);
-  assert.equal(filters.includes("can_play"), true);
-  // 合并去重后两类结果都在（cn-1 重复出现只保留一次）。
+  // 全局搜索不再限制“中文字幕”，只按上游 can_play 过滤，单次查询、不跨库汇总。
+  assert.deepEqual([...new Set(filters)], ["can_play"]);
+  // 可播放的都返回（含没有中文字幕的），不能播放的仍然被过滤掉。
   assert.deepEqual(payload.Items.map((item) => item.Id).sort(), ["cn-1", "raw-1"]);
-  // TotalRecordCount 必须是跨库合并后的真实数量，客户端才会继续往下翻页。
+  // TotalRecordCount 要是过滤后的真实数量，客户端才会继续往下翻页。
   assert.equal(payload.TotalRecordCount, 2);
 });
 
