@@ -1660,7 +1660,7 @@ test("returns a retryable detail response while cold resolution continues", asyn
     expectedItemEtag(secondPayload, { refreshSources: true }),
   );
   assert.equal(
-    [...db.rows.keys()].some((key) => key.includes("sources-v32|RCTD-740")),
+    [...db.rows.keys()].some((key) => key.includes("sources-v33|RCTD-740")),
     true,
   );
 });
@@ -4380,6 +4380,120 @@ test("does not answer the first screen with a single line while more lines are s
       if (target.includes("/api/v/resolve?code=RCTD-740")) {
         // 公共解析器：慢，但一次给 5 条。
         await new Promise((resolve) => setTimeout(resolve, 1800));
+        return new Response(
+          JSON.stringify({
+            variants: publicUrls.map((sourceUrl, index) => ({
+              variant: index === 0 ? "original" : "backup",
+              sourceUrl,
+              sourceType: "video/mp4",
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+        return new Response(`<a href="${detailUrl}">RCTD-740 Test</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        // 自建补源：秒回 2 条。
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: "RCTD-740 Test",
+            playerSources: [
+              { src: javtifulUrls[0], type: "video/mp4", size: 1080 },
+              { src: javtifulUrls[1], type: "video/mp4", size: 720 },
+            ],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (allUrls.includes(target)) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
+  // 关键断言：首屏是 7 条，不是自建链路先到的那 2 条。
+  assert.equal(payload.MediaSourceCount, allUrls.length);
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ).sort(),
+    [...allUrls].sort(),
+  );
+});
+
+test("waits for the slow public batch instead of answering with the first self-hosted lines", async () => {
+  // 线上真实时序（本轮实测）：自建补源（Javtiful）0.3~1.3 秒先回 1~2 条，
+  // 公共解析器要 1.9~4.3 秒才回 5 条（单个响应 1.1~1.8MB）。
+  // 旧实现只要拿到自建快照就武装 3000ms 的静默窗口，于是 3.0 秒用 2 条答复、
+  // 3.5 秒才到的公共批次被丢掉：客户端详情页只显示一个/两个播放源，点播放又
+  // 因为落在“自动线路”占位源上而一直加载。这里断言首屏必须等到公共批次。
+  const detailUrl = "https://javtiful.com/zh/video/99996/RCTD-740";
+  const javtifulUrls = [
+    "https://fast-stream.jav.si/rctd-740/self-1080.mp4",
+    "https://fast-stream.jav.si/rctd-740/self-720.mp4",
+  ];
+  const publicUrls = [
+    "https://fast-stream.jav.si/rctd-740/pub-original.mp4",
+    "https://fast-stream.jav.si/rctd-740/pub-reducing.mp4",
+    "https://fast-stream.jav.si/rctd-740/pub-original-2.mp4",
+    "https://fast-stream.jav.si/rctd-740/pub-mosaic.mp4",
+    "https://fast-stream.jav.si/rctd-740/pub-mosaic-gg.mp4",
+  ];
+  const allUrls = [...javtifulUrls, ...publicUrls];
+  const env = {
+    // 预算比公共批次（3.5 秒）更宽，但比“首屏上限 + 自建补齐”更窄：
+    // 首屏应该由公共批次决定，而不是被预算截断。
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 6500,
+  };
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: { id: 42, number: "RCTD-740", title: "RCTD-740 Slow public" },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes("/api/v/resolve?code=RCTD-740")) {
+        // 公共解析器：慢到超过自建快照的旧静默窗口，但一次给 5 条。
+        await new Promise((resolve) => setTimeout(resolve, 3500));
         return new Response(
           JSON.stringify({
             variants: publicUrls.map((sourceUrl, index) => ({

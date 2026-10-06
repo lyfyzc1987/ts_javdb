@@ -122,7 +122,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v15";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-07-first-screen-18";
+const SERVER_BUILD_ID = "2026-10-07-first-screen-19";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -171,7 +171,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v32";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v33";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -5401,6 +5401,11 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   // 自建补源（Javtiful / GetAV）最坏要 9 秒，客户端根本等不到，必须让调用方
   // 先把这部分真实线路发出去，而不是回一条“解析中”的占位源。
   const onPartial = typeof options.onPartial === "function" ? options.onPartial : null;
+  // onPublicPhaseSettled：公共解析器那两条链路彻底跑完（合并窗口也过了）时回调一次。
+  // 详情页据此判断“后面不可能再出现主批次快照”，不必再空等到首屏上限。
+  const onPublicPhaseSettled = typeof options.onPublicPhaseSettled === "function"
+    ? options.onPublicPhaseSettled
+    : null;
   const code = movieNumber(movie) || movie.id || movie.title;
   if (!code) {
     return null;
@@ -5452,6 +5457,9 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   // 的快照合并进一份累积结果，只有线路条数真的增加时才对外发布。
   let publishedVideo = null;
   let publishedSourceCount = -1;
+  // 是否至少发布过一次“主批次”（公共解析器）快照。详情页首屏用它判断
+  // “上游的全部线路是不是已经到齐”。
+  let majorPublished = false;
   // major=true 表示这份快照来自“主批次”（公共解析器）：它基本代表了上游
   // 到底有几条线路，之后通常只会再有零星补充。自建补源的第一批（Javtiful
   // 秒回 1~2 条）不是主批次，详情页不能拿它当“线路齐了”就提前返回。
@@ -5464,6 +5472,7 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
     if (count <= publishedSourceCount) return;
     publishedVideo = merged;
     publishedSourceCount = count;
+    if (major === true) majorPublished = true;
     try {
       // 未收尾的快照不能进长期持久层，客户端 20 秒后重拉时再换成完整线路。
       markResolvedVideoResolutionComplete(merged, false);
@@ -5562,6 +5571,15 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   // 客户端才会出现播放按钮；补源完成后再用完整结果覆盖。
   if (onPartial && isUsableResolvedVideo(publicVideo)) {
     publishPartial(publicVideo, true);
+  }
+  // 公共解析器两条链路都已经落定：后面只可能再有自建补源（非主批次）的快照。
+  // 详情页收到这个信号后就不会再为“等主批次”空等到首屏上限。
+  if (onPublicPhaseSettled) {
+    try {
+      onPublicPhaseSettled({ majorPublished });
+    } catch {
+      // 回调异常不能影响正常解析。
+    }
   }
   const selfHosted = selfHostedVideoTask
     ? await settledWithin(selfHostedVideoTask, selfHostedMergeBudget(env))
@@ -5709,19 +5727,29 @@ const RESOLVE_VIDEO_STALE_PEEK_MS = 1200;
 //
 // 现在的规则：
 //   1. 每发布一份“线路更多”的快照就重新计时（静默窗口）；
-//   2. 只有“主批次”（公共解析器）且线路数 ≥ TARGET_COUNT 时才用较短的
-//      FIRST_SCREEN_SETTLE_MS：主批次基本代表上游的全部线路；
-//   3. 其余（含“自建补源先回 2 条”这种半成品）一律用 FIRST_SCREEN_GRACE_MS：
-//      再给并行链路一点时间补齐，避免首屏只有两个播放源；
-//   4. 无论哪条，整条解析链一旦收尾就立刻返回它（优先完整、已校验的结果）；
-//   5. 最坏也在 FIRST_SCREEN_MAX_WAIT_MS 内答复，剩余线路由后台继续跑并写
+//   2. 还没见过“主批次”（公共解析器）时，一律用 FIRST_SCREEN_MAX_WAIT_MS：
+//      公共解析器实测要 1.9~4.3 秒才返回（单个响应 1.1~1.8MB），而自建补源
+//      （Javtiful）0.3 秒就先回 1~2 条。旧实现给自建快照武装 3000ms 的静默
+//      窗口，于是 3.0 秒就把“1 条自建线路”答复出去，公共批次 3.4 秒才到、
+//      永远赶不上——用户看到的就是“只显示一个播放源 / 自动线路”，点播放又
+//      因为取流接口要现场解析而一直加载。现在把“公共批次是否收尾”作为信号：
+//      只要公共批次还没收尾就一直等（上限 FIRST_SCREEN_MAX_WAIT_MS），
+//      公共批次一收尾（见 onPublicPhaseSettled）立刻改用短静默期返回；
+//   3. “主批次”且线路数 ≥ TARGET_COUNT 时用较短的 FIRST_SCREEN_SETTLE_MS：
+//      主批次基本代表上游的全部线路；
+//   4. 主批次已到但只有 1 条时用 FIRST_SCREEN_GRACE_MS：再给自建补源一点时间
+//      补齐，避免首屏只有一条源；
+//   5. 无论哪条，整条解析链一旦收尾就立刻返回它（优先完整、已校验的结果）；
+//   6. 最坏也在 FIRST_SCREEN_MAX_WAIT_MS 内答复，剩余线路由后台继续跑并写
 //      缓存，客户端跨 20 秒时间桶重拉详情时补齐。
 const RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS = 3000;
 // 主批次（公共解析器）线路数达到这个条数就改用较短的静默窗口，不再等满宽限期。
 const RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT = 2;
 // 详情页首屏等待上限：宁可先给客户端少量线路，也不能让详情页一直转圈。
-// 实测线上冷启动整条链路约 2~4 秒，留出余量即可覆盖绝大多数资源。
-const RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS = 4500;
+// 实测线上公共解析器冷启动要 1.9~4.3 秒（单个响应 1.1~1.8MB），加上
+// FIRST_SCREEN_SETTLE_MS 的收尾静默期最坏约 4.7 秒；留出余量到 5.2 秒，
+// 既能覆盖绝大多数资源，又明显小于客户端约 10 秒的 HTTP 超时。
+const RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS = 5200;
 // “主批次且已有多个线路”的快照到达后的静默窗口：只要这个窗口内不再出现
 // 线路更多的快照，就返回当前快照；期间整条解析链若收尾则优先返回完整结果。
 const RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS = 400;
@@ -6035,7 +6063,7 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
     }
   };
   if (!key) {
-    return resolveVideo(movie, env, fetchImpl, { onPartial });
+    return resolveVideo(movie, env, fetchImpl, { ...options, onPartial });
   }
   // 不用 fetch() 的自动写缓存：如果 GetAV 补源仍在后台且当前只有公开薄
   // 线路，结果只能服务本次请求，不能进入 30 分钟内存缓存或长期 D1。
@@ -6094,7 +6122,12 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
     }
 
     try {
-      const video = await resolveVideo(movie, env, fetchImpl, { onPartial });
+      const video = await resolveVideo(
+        movie,
+        env,
+        fetchImpl,
+        { ...options, onPartial },
+      );
       if (isUsableResolvedVideo(video)) {
         if (resolvedVideoResolutionComplete(video)) {
           // 只有凑齐目标线路数的结果才写长期 D1（30 天）；线路偏少的“已收尾”
@@ -6187,9 +6220,14 @@ async function resolveVideoForResponse(
   // 推迟返回，于是 1 条线路的半成品经常先被答复出去（用户看到“只有一个
   // 播放源”）。这里改成 debounce：
   //   1. 每收到一份“线路更多”的快照就 clearTimeout + 重新计时；
-  //   2. 在“主批次”（公共解析器，meta.major）到达之前，一律用较长的
-  //      FIRST_SCREEN_GRACE_MS；主批次到达后（majorSeen）且线路数 ≥ 目标
-  //      条数时改用 FIRST_SCREEN_SETTLE_MS。
+  //   2. 在“主批次”（公共解析器，meta.major）到达之前，一直等到“公共批次
+  //      收尾”或 FIRST_SCREEN_MAX_WAIT_MS：公共解析器实测 1.9~4.3 秒才返回，
+  //      自建补源 0.3 秒就先回 1~2 条。旧实现给这份自建快照武装
+  //      FIRST_SCREEN_GRACE_MS(3000ms)，于是 3.0 秒就把 1 条线路答复出去，
+  //      公共批次 3.4 秒才到、永远赶不上——这是“只显示一个播放源”的根因。
+  //      主批次到达后（majorSeen）且线路数 ≥ 目标条数时改用
+  //      FIRST_SCREEN_SETTLE_MS；主批次只有 1 条时用 FIRST_SCREEN_GRACE_MS
+  //      再给自建补源一点补齐时间。
   //      为什么不能只看条数：自建补源常常 0.3 秒就回 2 条，公共解析器 1.4~1.8
   //      秒才回 5 条。若“≥2 条就 400 毫秒返回”，首屏只会是那 2 条（用户
   //      “只显示两个播放源”）。
@@ -6203,6 +6241,9 @@ async function resolveVideoForResponse(
   // “主批次”（公共解析器）是否已经发布过。发布过之后，后续的自建补充线路
   // 只值得再等一个短静默期，不必再等满宽限期。
   let majorSeen = false;
+  // 公共解析器两条链路是否已经彻底落定（resolveVideo 的 onPublicPhaseSettled）。
+  // 落定之后不可能再出现主批次快照，首屏不必再为“等主批次”空等。
+  let publicPhaseSettled = false;
   const partialSettled = new Promise((resolve) => {
     partialResolve = resolve;
   });
@@ -6218,12 +6259,19 @@ async function resolveVideoForResponse(
     if (!partialResolve) return;
     if (major === true) majorSeen = true;
     if (partialTimer) clearTimeout(partialTimer);
-    const delay = (
-      majorSeen &&
-      count >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT
-    )
-      ? RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS
-      : RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS;
+    let delay;
+    if (majorSeen) {
+      delay = count >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT
+        ? RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS
+        : RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS;
+    } else if (publicPhaseSettled) {
+      // 公共批次已收尾、主批次却始终没出现：上游确实没有更多线路，
+      // 短静默期后就把已有的真实线路返回，不再空等到首屏上限。
+      delay = RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS;
+    } else {
+      // 公共批次还在飞：这是“只有 1~2 条自建线路”最容易误答的时刻。
+      delay = RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS;
+    }
     partialTimer = setTimeout(() => {
       partialTimer = null;
       const resolve = partialResolve;
@@ -6240,6 +6288,14 @@ async function resolveVideoForResponse(
     onPartial: (video, meta) => {
       partial.video = video;
       armPartialWindow(resolvedVideoSourceCount(video), meta?.major === true);
+    },
+    onPublicPhaseSettled: () => {
+      publicPhaseSettled = true;
+      // 公共批次收尾时若还没见过主批次，说明上游确实没给出更多线路：
+      // 把已经到手的真实线路（自建补源那几条）的静默窗口改成短窗口。
+      if (!majorSeen && partialResolve && partialVideo()) {
+        armPartialWindow(resolvedVideoSourceCount(partial.video), false);
+      }
     },
   });
   const partialVideo = () =>
