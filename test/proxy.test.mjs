@@ -1244,6 +1244,120 @@ test("returns every playable movie for a global search without a ParentId", asyn
   assert.equal(payload.TotalRecordCount, 2);
 });
 
+test("reuses one upstream scan across search pages", async () => {
+  // 全量扫描类的列表每翻一页都重扫上游会明显变慢，并把 Worker 推到
+  // Cloudflare 1102（CPU / 内存超限）。这里锁住“整轮扫描只做一次”的行为。
+  let searchCalls = 0;
+  const movies = Array.from({ length: 40 }, (_, index) => ({
+    id: `page-${index}`,
+    number: `PAGE-${String(index).padStart(3, "0")}`,
+    title: `母 ${index}`,
+    can_play: true,
+    has_cnsub: true,
+  }));
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/v2/search")) {
+      searchCalls += 1;
+    }
+    return new Response(
+      JSON.stringify({ success: 1, data: { movies } }),
+      { headers: { "content-type": "application/json" } },
+    );
+  };
+
+  const firstResponse = await handleProxy(
+    new Request(
+      "https://clone.example/emby/Items?SearchTerm=%E6%AF%8D&Recursive=true&IncludeItemTypes=Movie&Limit=30&StartIndex=0",
+    ),
+    {},
+    {},
+    fetchImpl,
+  );
+  const first = await firstResponse.json();
+  const callsAfterFirstPage = searchCalls;
+  assert.equal(firstResponse.status, 200);
+  assert.equal(callsAfterFirstPage > 0, true);
+  assert.equal(first.Items.length, 30);
+  assert.equal(first.TotalRecordCount, 40);
+
+  const secondResponse = await handleProxy(
+    new Request(
+      "https://clone.example/emby/Items?SearchTerm=%E6%AF%8D&Recursive=true&IncludeItemTypes=Movie&Limit=30&StartIndex=30",
+    ),
+    {},
+    {},
+    fetchImpl,
+  );
+  const second = await secondResponse.json();
+  assert.equal(secondResponse.status, 200);
+  // 第二页没有把上游重扫一遍：翻页只是从同一份扫描结果里切。
+  assert.equal(searchCalls, callsAfterFirstPage);
+  // 切片位置要对得上第一页的续页：两页拼起来正好是 40 条、且互不重叠。
+  const firstIds = first.Items.map((item) => item.Id);
+  const secondIds = second.Items.map((item) => item.Id);
+  assert.equal(secondIds.length, 10);
+  assert.equal(secondIds.some((id) => firstIds.includes(id)), false);
+  assert.equal(new Set([...firstIds, ...secondIds]).size, 40);
+  assert.equal(second.TotalRecordCount, 40);
+});
+
+test("prewarms cached list pages but not cold upstream scans", async () => {
+  // 后台预热会挂住 Worker 实例（wrangler tail 实测 wallTime 8-30 秒），
+  // 冷启动的全量扫描再叠一层预热最容易撞 Cloudflare 1102。
+  // 这里锁住策略：只有命中缓存、很便宜的那次响应才登记后台预热。
+  const movies = Array.from({ length: 40 }, (_, index) => ({
+    id: `warm-${index}`,
+    number: `WARM-${String(index).padStart(3, "0")}`,
+    title: `母 ${index}`,
+    can_play: true,
+    has_cnsub: true,
+  }));
+  const fetchImpl = async (url) => {
+    const text = String(url);
+    if (text.includes("/api/subtitle")) {
+      return new Response(JSON.stringify({ code: 0, data: [] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (text.includes("/api/v/resolve")) {
+      return new Response(JSON.stringify({ success: 1, data: { movie: {} } }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(
+      JSON.stringify({ success: 1, data: { movies } }),
+      { headers: { "content-type": "application/json" } },
+    );
+  };
+
+  const coldTasks = [];
+  const coldResponse = await handleProxy(
+    new Request(
+      "https://clone.example/emby/Items?SearchTerm=%E6%AF%8D&Recursive=true&IncludeItemTypes=Movie&Limit=30&StartIndex=0",
+    ),
+    {},
+    { waitUntil: (task) => coldTasks.push(task) },
+    fetchImpl,
+  );
+  assert.equal(coldResponse.status, 200);
+  // 冷启动要扫满上游，这次响应不该再登记任何后台预热。
+  assert.equal(coldTasks.length, 0);
+
+  const warmTasks = [];
+  const warmResponse = await handleProxy(
+    new Request(
+      "https://clone.example/emby/Items?SearchTerm=%E6%AF%8D&Recursive=true&IncludeItemTypes=Movie&Limit=30&StartIndex=30",
+    ),
+    {},
+    { waitUntil: (task) => warmTasks.push(task) },
+    fetchImpl,
+  );
+  assert.equal(warmResponse.status, 200);
+  // 第二页命中扫描窗口：便宜，允许（且只允许）预热 1 部。
+  assert.equal(warmTasks.length, 1);
+  await Promise.all(warmTasks.map((task) => Promise.resolve(task).catch(() => {})));
+});
+
 test("keeps a ParentId search inside that single library", async () => {
   const filters = [];
   const response = await handleProxy(

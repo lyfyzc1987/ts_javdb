@@ -119,7 +119,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v13";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-06-detail-refresh-backdrop-5";
+const SERVER_BUILD_ID = "2026-10-06-list-scan-window-prewarm-9";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -2848,9 +2848,27 @@ async function fetchWithRetry(
 const MOVIE_CACHE_TTL_MS = 10 * 60 * 1000;
 const RESOLVE_CACHE_TTL_MS = 30 * 60 * 1000;
 const LIST_CACHE_TTL_MS = 60 * 1000;
+// 分类 / 搜索列表页在“共享边缘缓存”里的存活时间，比进程内缓存长得多。
+// 关键词搜索（尤其是标签 / 演员 / 片商）冷启动要全量扫描约 20 页上游，
+// 是最重的一条路径；如果共享缓存也只活 60 秒，那么每个新实例、每分钟都要
+// 重算一次，并发一上来就会撞 Cloudflare 1102（资源超限）。
+// 这里把共享副本留 5 分钟：进程内仍是 60 秒（同一实例的连续请求即刻命中），
+// 换实例 / 换请求时则直接复用共享结果，不再回源重扫。
+const LIST_EDGE_CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_MOVIE_CACHE_ENTRIES = 4000;
 const MAX_RESOLVE_CACHE_ENTRIES = 1000;
 const MAX_LIST_CACHE_ENTRIES = 400;
+// 全量扫描类列表（搜索 / 标签 / 演员 / 自定义排序）的“扫描窗口”：整轮上游扫描
+// 只做一次，把前 LIST_PAGE_WINDOW 条按窗口缓存，客户端翻页时从窗口里切。
+// 背景：列表缓存键里带了 StartIndex，客户端每翻一页都会把上游 40 页重扫一遍
+// （实测每页 1.5-2.1 秒），这是翻页变慢、以及 Worker 撞 Cloudflare 1102
+// （CPU / 内存超限）最主要的来源。
+// 只在“结果与 StartIndex 无关”的全量扫描路径上启用，切片语义与旧实现完全一致。
+const LIST_PAGE_WINDOW = 300;
+const LIST_WINDOW_TTL_MS = 5 * 60 * 1000;
+// 窗口条目约 300 条影片（几百 KB），必须单独限量：若混进 400 条的普通列表缓存，
+// 高并发下会把实例内存打爆（同样是 1102）。
+const MAX_LIST_WINDOW_ENTRIES = 8;
 // Keep a small number of complete segments per Worker instance. HLS players
 // often re-request the same segment with several byte ranges while seeking or
 // resuming; caching the complete body keeps those ranges local instead of
@@ -2946,6 +2964,7 @@ const MOVIE_CACHE = createTtlCache(MOVIE_CACHE_TTL_MS, MAX_MOVIE_CACHE_ENTRIES);
 const RESOLVE_VIDEO_CACHE = createTtlCache(RESOLVE_CACHE_TTL_MS, MAX_RESOLVE_CACHE_ENTRIES);
 const RESOLVE_SUBTITLE_CACHE = createTtlCache(RESOLVE_CACHE_TTL_MS, MAX_RESOLVE_CACHE_ENTRIES);
 const LIST_CACHE = createTtlCache(LIST_CACHE_TTL_MS, MAX_LIST_CACHE_ENTRIES);
+const LIST_WINDOW_CACHE = createTtlCache(LIST_WINDOW_TTL_MS, MAX_LIST_WINDOW_ENTRIES);
 const API_TOKEN_CACHE = createTtlCache(60 * 1000, 500);
 const MEDIA_SEGMENT_BODY_CACHE = createTtlCache(
   MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
@@ -3068,15 +3087,44 @@ async function cachedListPage(cacheKey, ttlSeconds, compute) {
     }
     const page = await compute();
     if (page && Array.isArray(page.movies) && page.movies.length > 0) {
-      await edgeCacheWrite(EDGE_NAMESPACE_LIST, cacheKey, page, ttlSeconds);
+      // 没翻到底的结果（上游抖动，或撞上翻页预算提前收尾）只做短缓存：
+      // 否则一份“少了几百条”的列表会在共享边缘缓存里躺满 5 分钟，
+      // 客户端表现就是“搜索少了资源”。只有确认翻到底的结果才配长缓存。
+      const edgeTtlSeconds = page.truncated
+        ? Math.min(ttlSeconds, LIST_CACHE_TTL_MS / 1000)
+        : ttlSeconds;
+      await edgeCacheWrite(EDGE_NAMESPACE_LIST, cacheKey, page, edgeTtlSeconds);
     }
     return page;
   });
 }
 
+// 全量扫描路径的“窗口复用”：整轮扫描只做一次，翻页时从窗口里切。
+// 只对 needAll（结果与 StartIndex / requiredCount 无关）的路径调用；
+// 那条路径下 requiredCount 只用于切片，所以复用的结果与逐页重扫完全一致。
+// 扫描没到底（上游抖动 / 撞上翻页预算）且窗口不够翻时返回 null，
+// 由调用方退回原来的“按页重扫”，避免给出错位的分页。
+async function windowedListScan(windowKey, startIndex, limit, computeWindow) {
+  const window = await LIST_WINDOW_CACHE.fetch(windowKey, () => computeWindow(LIST_PAGE_WINDOW));
+  if (!window || !Array.isArray(window.movies)) return null;
+  if (window.truncated && startIndex + limit > window.movies.length) return null;
+  return {
+    movies: window.movies.slice(startIndex, startIndex + limit),
+    totalRecordCount: window.totalRecordCount,
+    truncated: window.truncated,
+    libraryEntries: window.libraryEntries,
+  };
+}
+
 // 并发抓取上游分页：原来一页一页顺序请求，首次打开分类/演员页要等很久。
 // 现在按页码小批量并发抓取、再按页码顺序合并，同时保留“够用就提前停止”的快速路径。
 const SOURCE_PAGE_CONCURRENCY = 6;
+// 单次“列表 / 搜索”翻页扫描的墙钟预算（毫秒）。
+// 上游偶发抖动时，单个分页要等满 FETCH_TIMEOUT_MS 再重试一次，最坏能把一次搜索
+// 拖到 20 秒以上，客户端就报 “Connection timeout”。这里给整轮扫描一个绝对截止
+// 时间：预算内没翻完就按“没翻到底”返回已有结果（上层本来就是这样处理部分结果的），
+// 用略少的条数换取“不再超时”。正常一次全量扫描约 2 秒，7 秒预算留了 3 倍余量。
+const LIST_SCAN_DEADLINE_MS = 7000;
 
 async function fetchPagesInParallel(options) {
   const {
@@ -3087,11 +3135,16 @@ async function fetchPagesInParallel(options) {
     fetchPage,
     collect,
     concurrency = SOURCE_PAGE_CONCURRENCY,
+    deadline = 0,
   } = options;
 
   let sourcePage = 1;
   while (sourcePage <= maxPages) {
     if (!needAll && enough()) {
+      return false;
+    }
+    if (deadline && Date.now() >= deadline) {
+      // 预算耗尽：不再开新批次，按“没翻到底”返回，避免拖过客户端超时。
       return false;
     }
     const batch = [];
@@ -3276,6 +3329,7 @@ async function collectSearchRoundMovies(options) {
     upstreamToken,
     needsFullCatalog = false,
     requiredCount = 0,
+    deadline = 0,
     acceptMovie,
   } = options;
 
@@ -3286,6 +3340,7 @@ async function collectSearchRoundMovies(options) {
     maxPages: SEARCH_MAX_SOURCE_PAGES,
     pageSize: SEARCH_SOURCE_PAGE_SIZE,
     needAll: needsFullCatalog,
+    deadline,
     enough: () => exactCode
       ? movies.some((movie) => movieMatchesExactSearch(movie, exactCode))
       : movies.length >= requiredCount,
@@ -3298,6 +3353,7 @@ async function collectSearchRoundMovies(options) {
         limit: SEARCH_SOURCE_PAGE_SIZE,
       },
       token: upstreamToken,
+      deadline,
     }).then(moviesFromPayload),
     collect: (pageMovies) => {
       for (const movie of pageMovies) {
@@ -4186,18 +4242,54 @@ async function getMoviePage(query, env, fetchImpl, token = "", options = {}) {
     needsFullCatalog ? "full" : "fast",
   ].join("|");
 
-  const page = await cachedListPage(cacheKey, LIST_CACHE_TTL_MS / 1000, () => loadMovieCatalogPage({
-    library,
+  // 本次请求的翻页预算：从收到请求算起，超时就返回“已抓到的部分结果”。
+  const scanDeadline = Date.now() + LIST_SCAN_DEADLINE_MS;
+  // 本轮请求是否真的回源扫过上游。全量扫描本身就是最重的一条路径，
+  // 再叠一层后台预热最容易被 Cloudflare 判成资源超限（1102）；
+  // 命中缓存（含扫描窗口）的请求很便宜，才值得顺手预热。
+  let upstreamScanRan = false;
+  const loadPage = (pageStartIndex, pageRequiredCount) => {
+    upstreamScanRan = true;
+    return loadMovieCatalogPage({
+      library,
+      searchTerm,
+      startIndex: pageStartIndex,
+      requiredCount: pageRequiredCount,
+      needsFullCatalog,
+      sortComparators,
+      sortOrder,
+      env,
+      fetchImpl,
+      upstreamToken,
+      deadline: scanDeadline,
+    });
+  };
+  // 全量扫描的结果与 StartIndex 无关：整轮只扫一次，翻页从窗口里切。
+  const scanWindowKey = [
+    "movie-scan-v1",
+    apiOrigin(env),
+    upstreamToken ? "u" : "g",
+    requestedParentId,
+    library.id,
+    library.sourceType,
+    library.sourceFilter,
     searchTerm,
-    startIndex,
-    requiredCount,
-    needsFullCatalog,
-    sortComparators,
     sortOrder,
-    env,
-    fetchImpl,
-    upstreamToken,
-  }));
+    sortBy,
+    needsFullCatalog ? "full" : "fast",
+  ].join("|");
+  const page = await cachedListPage(cacheKey, LIST_EDGE_CACHE_TTL_MS / 1000, async () => {
+    if (needsFullCatalog && startIndex + limit <= LIST_PAGE_WINDOW) {
+      const windowed = await windowedListScan(
+        scanWindowKey,
+        startIndex,
+        limit,
+        (windowSize) => loadPage(0, windowSize),
+      );
+      if (windowed) return windowed;
+    }
+    return loadPage(startIndex, requiredCount);
+  });
 
   const result = {
     Items: page.movies.map((movie) => mapMovie(
@@ -4209,7 +4301,7 @@ async function getMoviePage(query, env, fetchImpl, token = "", options = {}) {
     TotalRecordCount: page.totalRecordCount,
     StartIndex: startIndex,
   };
-  return attachPrewarmMovies(result, page.movies);
+  return attachPrewarmMovies(result, upstreamScanRan ? [] : page.movies);
 }
 
 // 抓取分类/搜索结果（不依赖具体客户端地址，所以可以整块缓存复用）。
@@ -4226,6 +4318,7 @@ async function loadMovieCatalogPage(options) {
     env,
     fetchImpl,
     upstreamToken,
+    deadline = 0,
   } = options;
 
   const exactCode = exactSearchCode(searchTerm);
@@ -4258,6 +4351,7 @@ async function loadMovieCatalogPage(options) {
       upstreamToken,
       needsFullCatalog,
       requiredCount,
+      deadline,
       acceptMovie: (movie) => library.matches(movie),
     });
     if (
@@ -4275,6 +4369,7 @@ async function loadMovieCatalogPage(options) {
         upstreamToken,
         needsFullCatalog,
         requiredCount,
+        deadline,
         acceptMovie: (movie) => library.matches(movie),
       });
     }
@@ -4283,6 +4378,7 @@ async function loadMovieCatalogPage(options) {
       maxPages: HOME_MAX_SOURCE_PAGES,
       pageSize: HOME_SOURCE_PAGE_SIZE,
       needAll: needsFullCatalog,
+      deadline,
       enough: () => matchingMovies.length >= requiredCount,
       fetchPage: (page) => javdbRequest("/v1/movies/latest", env, fetchImpl, {
         query: {
@@ -4292,6 +4388,7 @@ async function loadMovieCatalogPage(options) {
           limit: HOME_SOURCE_PAGE_SIZE,
         },
         token: upstreamToken,
+        deadline,
       }).then(moviesFromPayload),
       collect,
     });
@@ -4310,6 +4407,8 @@ async function loadMovieCatalogPage(options) {
       : sourceExhausted
         ? matchingMovies.length
         : matchingMovies.length + 1,
+    // 只有翻到底的结果才允许写进共享边缘缓存的长 TTL 档位（见 cachedListPage）。
+    truncated: !sourceExhausted,
   };
 }
 // ================= 演员（Person）相关 =================
@@ -4449,6 +4548,9 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
   const needsFullCatalog =
     Boolean(options.exactTotal) || !isNaturalCatalogOrder(sortComparators, sortOrder);
   const upstreamToken = await apiToken(token, env);
+  // 本次请求的翻页预算：关键词搜索（含标签 / 演员 / 片商）冷启动要全量扫描，
+  // 上游抖动时容易拖过客户端超时，这里统一给一个墙钟上限。
+  const scanDeadline = Date.now() + LIST_SCAN_DEADLINE_MS;
 
   const cacheKey = [
     `${cacheKind}-page-v1`,
@@ -4463,7 +4565,10 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
     needsFullCatalog ? "full" : "fast",
   ].join("|");
 
-  const page = await cachedListPage(cacheKey, LIST_CACHE_TTL_MS / 1000, async () => {
+  // 本轮请求是否真的回源扫过上游（见 getMoviePage 里的同名字段）。
+  let upstreamScanRan = false;
+  const buildPage = async (pageStartIndex, pageRequiredCount) => {
+    upstreamScanRan = true;
     const matches = [];
     const seen = new Set();
     const libraryByKey = new Map();
@@ -4488,7 +4593,8 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
         upstreamToken,
         needAll: true,
         alreadyCount: 0,
-        requiredCount,
+        requiredCount: pageRequiredCount,
+        deadline: scanDeadline,
       })));
       scans.forEach((scan, index) => {
         merge(libraryList[index], scan.movies);
@@ -4498,7 +4604,7 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
       });
     } else {
       for (const library of libraryList) {
-        if (matches.length >= requiredCount) break;
+        if (matches.length >= pageRequiredCount) break;
         const scan = await scanLibraryMovies(library, {
           searchTerm,
           env,
@@ -4506,7 +4612,8 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
           upstreamToken,
           needAll: false,
           alreadyCount: matches.length,
-          requiredCount,
+          requiredCount: pageRequiredCount,
+          deadline: scanDeadline,
         });
         merge(library, scan.movies);
         if (!scan.exhausted) {
@@ -4518,13 +4625,46 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
     const orderedMovies = needsFullCatalog
       ? sortMoviesForClient(matches, sortComparators, sortOrder)
       : matches;
+    const pageMovies = orderedMovies.slice(pageStartIndex, pageRequiredCount);
+    // 只带上这一页真正用到的“影片 -> 分类”映射：完整映射可能有上万条，
+    // 会把这个缓存条目撑大好几倍（边缘缓存与实例内存都吃不消）。
+    const pageKeys = new Set(
+      pageMovies.map((movie) => String(movie.id ?? movie.number ?? "")),
+    );
     return {
-      movies: orderedMovies.slice(startIndex, requiredCount),
+      movies: pageMovies,
       // 已把相关分类都翻到底时用真实数量；否则略多报，让客户端能继续往下翻页
       totalRecordCount: fullyScanned ? matches.length : matches.length + 1,
       // 用数组形式保存，方便写进边缘缓存（Map 没法 JSON 序列化）
-      libraryEntries: [...libraryByKey],
+      libraryEntries: [...libraryByKey].filter(([key]) => pageKeys.has(key)),
+      // 同上：没翻到底的结果不进长缓存，避免“少资源”的结果被固化 5 分钟。
+      truncated: !fullyScanned,
     };
+  };
+
+  // 全量扫描的结果与 StartIndex 无关：整轮只扫一次，翻页从窗口里切。
+  const scanWindowKey = [
+    `${cacheKind}-scan-v1`,
+    apiOrigin(env),
+    upstreamToken ? "u" : "g",
+    searchTerm,
+    singleLibrary ? singleLibrary.id : "all",
+    sortOrder,
+    sortBy,
+    needsFullCatalog ? "full" : "fast",
+  ].join("|");
+
+  const page = await cachedListPage(cacheKey, LIST_EDGE_CACHE_TTL_MS / 1000, async () => {
+    if (needsFullCatalog && startIndex + limit <= LIST_PAGE_WINDOW) {
+      const windowed = await windowedListScan(
+        scanWindowKey,
+        startIndex,
+        limit,
+        (windowSize) => buildPage(0, windowSize),
+      );
+      if (windowed) return windowed;
+    }
+    return buildPage(startIndex, requiredCount);
   });
 
   const libraryByKey = page.libraryEntries
@@ -4542,7 +4682,7 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
     TotalRecordCount: page.totalRecordCount,
     StartIndex: startIndex,
   };
-  return attachPrewarmMovies(result, page.movies);
+  return attachPrewarmMovies(result, upstreamScanRan ? [] : page.movies);
 }
 
 // 点击“类别 / 标签 / 片商 / 系列”后的作品列表：把 Id 还原出的名字当关键词搜。
@@ -4604,6 +4744,7 @@ async function scanLibraryMovies(library, options) {
     needAll,
     alreadyCount,
     requiredCount,
+    deadline = 0,
   } = options;
   const movies = [];
   const seen = new Set();
@@ -4624,6 +4765,7 @@ async function scanLibraryMovies(library, options) {
       upstreamToken,
       needsFullCatalog: needAll,
       requiredCount: Math.max(0, requiredCount - alreadyCount),
+      deadline,
       acceptMovie: (movie) => library.matches(movie),
     });
     if (
@@ -4641,6 +4783,7 @@ async function scanLibraryMovies(library, options) {
         upstreamToken,
         needsFullCatalog: needAll,
         requiredCount: Math.max(0, requiredCount - alreadyCount),
+        deadline,
         acceptMovie: (movie) => library.matches(movie),
       });
     }
@@ -4649,6 +4792,7 @@ async function scanLibraryMovies(library, options) {
       maxPages: HOME_MAX_SOURCE_PAGES,
       pageSize: HOME_SOURCE_PAGE_SIZE,
       needAll,
+      deadline,
       enough: () => alreadyCount + movies.length >= requiredCount,
       fetchPage: (page) => javdbRequest("/v1/movies/latest", env, fetchImpl, {
         query: {
@@ -4658,6 +4802,7 @@ async function scanLibraryMovies(library, options) {
           limit: HOME_SOURCE_PAGE_SIZE,
         },
         token: upstreamToken,
+        deadline,
       }).then(moviesFromPayload),
       collect: (pageMovies) => {
         for (const movie of pageMovies) {
@@ -6447,7 +6592,18 @@ const ITEM_DETAIL_SUBTITLE_WAIT_MS = 1500;
 // 避免客户端第一次点击播放拿到没有字幕轨的 MediaSource。
 const PLAYBACK_INFO_SUBTITLE_WAIT_MS = 1500;
 
-const SEARCH_PREWARM_LIMIT = 3;
+// 后台预热（prewarm）的规模与预算。
+// 每次“列表 / 搜索”响应返回后都会用 ctx.waitUntil 在后台解析播放源 + 字幕，
+// 但解析本身最坏要 8-16 秒（解析器合并预算 + 自建补源 + 校验）。wrangler tail
+// 实测：客户端 400-600 毫秒就拿到响应，同一个 invocation 的 wallTime 却是
+// 9.6s / 11.7s / 15.5s，甚至顶到 Cloudflare 的 30 秒 waitUntil 上限
+// （30258 / 30366 毫秒）。这些被挂住的实例会占满整个 colo，邻近请求就直接
+// 503 / 1102（Worker exceeded resource limits）。
+// 因此：每次只预热 1 部（原来 3 部），并给整批预热一个 6 秒墙钟预算，
+// 超时就让 waitUntil 提前结束。预热本身只是“让下次点播放快一点”的优化，
+// 放弃它不影响播放源的正确性（真正点播放时还会正常解析并写缓存）。
+const SEARCH_PREWARM_LIMIT = 1;
+const SEARCH_PREWARM_BUDGET_MS = 6000;
 
 // 把原始影片对象挂在结果上但保持不可枚举，JSON 响应不会泄漏内部字段。
 // 搜索后续可以用真实番号预热，而不是拿 Emby Item ID 去解析。
@@ -6490,7 +6646,9 @@ function prewarmResolve(movie, env, fetchImpl, ctx = null) {
   ]);
   // Worker 响应返回后后台任务可能被直接杀掉:有 ctx.waitUntil 就登记上,
   // 让预解析真正跑完,下次点播放时字幕能直接命中缓存。
-  keepAlive(task, ctx);
+  // 这里登记的是“带预算的包装”：超过 SEARCH_PREWARM_BUDGET_MS 就结束
+  // waitUntil，避免上游抖动时把实例挂到 Cloudflare 的 30 秒上限。
+  keepAlive(withTimeout(task, SEARCH_PREWARM_BUDGET_MS).catch(() => {}), ctx);
 }
 
 // 把后台任务登记到响应生命周期上:Worker 返回响应后可能被立刻回收,
@@ -9857,6 +10015,7 @@ export function resetEmbyCachesForTests() {
   RESOLVE_VIDEO_CACHE.clear();
   RESOLVE_SUBTITLE_CACHE.clear();
   LIST_CACHE.clear();
+  LIST_WINDOW_CACHE.clear();
   API_TOKEN_CACHE.clear();
   MEDIA_SEGMENT_BODY_CACHE.clear();
   MEDIA_SEGMENT_PREFIX_CACHE.clear();
