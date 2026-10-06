@@ -122,7 +122,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v15";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-06-media-headers-timeout-13";
+const SERVER_BUILD_ID = "2026-10-07-first-screen-18";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -171,7 +171,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v31";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v32";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -455,19 +455,39 @@ function sourceVariants(payload) {
   return sourceUrlValue(data) ? [data] : [];
 }
 
-// 可用播放线路包括绝对 URL 和上游根相对路径；data: 里的 HLS 清单常常是
-// 伪线路，不能算作“已经拿到可用播放源”。使用 safeMediaUrl 统一做协议与
-// 媒体主机白名单校验，避免把相对地址误判为需要启动自建回退。
+// 一条解析线路算不算“已经拿到可用播放源”：
+// 1) 绝对 URL 或上游根相对路径，走 safeMediaUrl 统一做协议与媒体主机白名单
+//    校验，避免把相对地址误判为需要启动自建回退；
+// 2) data: 内联 HLS 清单。上游（服务器tiful / 服务器GG）经常把整份 m3u8
+//    内联成 data: URI 返回，这种线路本身可以直接播放，必须算作可用线路。
+//    旧实现只认 http(s)，于是“上游三份线路全是内联 HLS”的片子（RCTD-740）
+//    在这里被判成 0 条可用线路，详情页直接回落到占位源，客户端首屏就只剩
+//    “自动线路”。
+// 注意：这里只判断“是不是一份能解析出线路的清单”，真正的伪 HLS（分片是
+// 图片/字体）仍由 validatedResolvedVideo 在收尾时按分片内容剔除。
+function resolverPayloadItemIsPlayable(item, env) {
+  const raw = sourceUrlValue(item);
+  return Boolean(safeMediaUrl(raw, env)) || Boolean(decodeInlineHls(raw));
+}
+
 function resolverPayloadHasUsableSource(payload, env) {
   return sourceVariants(payload).some((item) =>
-    Boolean(safeMediaUrl(sourceUrlValue(item), env)));
+    resolverPayloadItemIsPlayable(item, env));
 }
 
 function resolverPayloadUsableSourceCount(payload, env) {
   const seen = new Set();
   for (const item of sourceVariants(payload)) {
     const sourceUrl = safeMediaUrl(sourceUrlValue(item), env);
-    if (sourceUrl) seen.add(sourceUrl.toString());
+    if (sourceUrl) {
+      seen.add(sourceUrl.toString());
+      continue;
+    }
+    if (decodeInlineHls(sourceUrlValue(item))) {
+      // 内联清单可能有好几 MB，用长度 + 首尾片段的 md5 作为身份，
+      // 避免为去重把整份清单塞进 Set（CPU / 内存都吃不消）。
+      seen.add(canonicalResolverSource(item));
+    }
   }
   return seen.size;
 }
@@ -5312,7 +5332,26 @@ function firstNonEmptyVariantTask(tasks) {
   });
 }
 
-async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl) {
+// 把自建补源抓到的线路整理成一份可发布的播放源快照。
+function selfHostedVariantsVideo(movie, code, env, merged) {
+  const variants = [];
+  const seen = new Set();
+  for (const variant of merged) {
+    const sourceUrl = safeMediaUrl(variant?.sourceUrl, env);
+    if (!sourceUrl) continue;
+    const key = sourceUrl.toString();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    variants.push({
+      ...variant,
+      sourceUrl: key,
+      title: movieDisplayName(movie) || code,
+    });
+  }
+  return normalizedResolvedVideo(variants);
+}
+
+async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl, options = {}) {
   if (!selfHostedSearchCode(code)) return null;
   const tasks = [
     {
@@ -5333,6 +5372,19 @@ async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl) {
     ),
   ]);
   if (!first) return null;
+  // 第一条自建线路一到就先发布一份快照：另一条链路（Jina 代理取 GetAV）
+  // 冷启动要 4~5 秒，若等它合并完再发布，详情页 6.5 秒预算往往已经耗尽，
+  // 客户端只能看到“自动线路（解析中）”。先发第一批，合并完成后再用更多
+  // 线路覆盖（resolveVideo 的 publishPartial 按线路条数单调递增地发布）。
+  if (typeof options.onFirstBatch === "function") {
+    try {
+      options.onFirstBatch(
+        selfHostedVariantsVideo(movie, code, env, first.value),
+      );
+    } catch {
+      // 提前发布失败不能影响正常解析。
+    }
+  }
 
   const merged = [...first.value];
   for (const task of tasks) {
@@ -5341,21 +5393,7 @@ async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl) {
     if (Array.isArray(value)) merged.push(...value);
   }
 
-  const variants = [];
-  const seen = new Set();
-  for (const variant of merged) {
-    const sourceUrl = safeMediaUrl(variant?.sourceUrl, env);
-    if (!sourceUrl) continue;
-    const key = sourceUrl.toString();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    variants.push({
-      ...variant,
-      sourceUrl: key,
-      title: movieDisplayName(movie) || code,
-    });
-  }
-  return normalizedResolvedVideo(variants);
+  return selfHostedVariantsVideo(movie, code, env, merged);
 }
 
 async function resolveVideo(movie, env, fetchImpl, options = {}) {
@@ -5390,6 +5428,11 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
         code,
         env,
         fetchImpl,
+        {
+          // 自建链路里第一条线路一到就对外发布，不再等另一条链路合并完
+          // （Jina 代理取 GetAV 要 4~5 秒，解析预算常常等不到）。
+          onFirstBatch: (video) => publishPartial(video),
+        },
       ).then(
         (video) => {
           selfHostedResolutionFinished = true;
@@ -5403,6 +5446,32 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
     }
     return selfHostedVideoTask;
   };
+  // 中途快照只能“越换越多”。自建补源（Javtiful / GetAV）与公共解析器是两条
+  // 并行链路，先后顺序不定、各自线路还可能是互补的（自建 2 条 + 公共 2 条）。
+  // 用后到的那份直接覆盖，会让详情页从 4 条退回 1~2 条；所以这里把每次拿到
+  // 的快照合并进一份累积结果，只有线路条数真的增加时才对外发布。
+  let publishedVideo = null;
+  let publishedSourceCount = -1;
+  // major=true 表示这份快照来自“主批次”（公共解析器）：它基本代表了上游
+  // 到底有几条线路，之后通常只会再有零星补充。自建补源的第一批（Javtiful
+  // 秒回 1~2 条）不是主批次，详情页不能拿它当“线路齐了”就提前返回。
+  const publishPartial = (video, major = false) => {
+    if (!onPartial || !isUsableResolvedVideo(video)) return;
+    const merged = publishedVideo
+      ? mergeResolvedVideoVariants(env, publishedVideo, video) || video
+      : video;
+    const count = resolvedVideoSourceCount(merged);
+    if (count <= publishedSourceCount) return;
+    publishedVideo = merged;
+    publishedSourceCount = count;
+    try {
+      // 未收尾的快照不能进长期持久层，客户端 20 秒后重拉时再换成完整线路。
+      markResolvedVideoResolutionComplete(merged, false);
+      onPartial(merged, { major: major === true });
+    } catch {
+      // 回调失败不能影响真正的解析流程。
+    }
+  };
   const resolverUrls = resolverVideoUrls(code, env);
   // 两个解析端点并发启动，等第一条有效结果，而不是固定先等回退源。
   // 主站挂起时回退源可以立即启动；主站有单条线路时，也保留一个短暂
@@ -5412,6 +5481,18 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
     promise: loadResolverVideo(resolverUrl)
       .then((value) => ({ value }), (error) => ({ error })),
   }));
+  // 自建补源（Javtiful / GetAV）实测 0.3~1.3 秒就能返回真实多线路，而公共
+  // 解析器冷启动要 2~13 秒。旧写法把自建补源排在“第一条公共线路到达”之后
+  // 才启动（见下面 firstValid 的等待），两条链路的延迟被串成一条：详情页
+  // 6.5 秒预算里既等不到公共线路、也等不到自建线路，只能回“自动线路（解析
+  // 中）”。现在无条件并行启动，谁先拿到线路谁先发布，详情页首屏就能直接
+  // 拿到真实线路和播放按钮。
+  if (selfHostedSearchCode(code)) {
+    startSelfHostedVideo().then(
+      (video) => publishPartial(video),
+      () => {},
+    );
+  }
   const firstValid = await new Promise((resolve) => {
     let remaining = settledEntries.length;
     let resolved = false;
@@ -5447,29 +5528,15 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   // 补源在后台继续跑，客户端按 20 秒时间桶重拉时再换成完整线路。
   if (onPartial && firstValid && firstHasUsableSource) {
     try {
-      const earlyVideo = videoFromResolverPayload(
+      publishPartial(videoFromResolverPayload(
         firstValid.settled.value.payload,
         movie,
         code,
         env,
-      );
-      if (isUsableResolvedVideo(earlyVideo)) {
-        markResolvedVideoResolutionComplete(earlyVideo, false);
-        onPartial(earlyVideo);
-      }
+      ), true);
     } catch {
       // 提前发布失败不影响下面的正常流程（后面还会再发布一次完整快照）。
     }
-  }
-  if (
-    selfHostedSearchCode(code) &&
-    (
-      !firstValid ||
-      !firstHasUsableSource ||
-      firstUsableSourceCount < RESOLVER_SOURCE_TARGET_COUNT
-    )
-  ) {
-    startSelfHostedVideo();
   }
   const mergeBudget = resolverMergeBudget(
     env,
@@ -5494,12 +5561,7 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   // 详情页/PlaybackInfo 的预算远小于下面的自建补源等待，先把真实线路给出去，
   // 客户端才会出现播放按钮；补源完成后再用完整结果覆盖。
   if (onPartial && isUsableResolvedVideo(publicVideo)) {
-    try {
-      markResolvedVideoResolutionComplete(publicVideo, false);
-      onPartial(publicVideo);
-    } catch {
-      // 回调失败不能影响真正的解析流程。
-    }
+    publishPartial(publicVideo, true);
   }
   const selfHosted = selfHostedVideoTask
     ? await settledWithin(selfHostedVideoTask, selfHostedMergeBudget(env))
@@ -5635,6 +5697,34 @@ const RESOLVED_VIDEO_PERSIST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const RESOLVED_VIDEO_PERSIST_MAX_CHARS = 1_900_000;
 const RESOLVED_VIDEO_KV_PREFIX = "resolved-video:v1:";
 const RESOLVE_VIDEO_STALE_PEEK_MS = 1200;
+// 详情页首屏的等待策略：优先等“整条解析链”给出的**已校验**完整结果，只有
+// 完整结果来不及（或上游确实没线路）时才退回“中途快照”。
+//
+// 为什么会“只有一个播放源”：自建补源（Javtiful / GetAV）常常先给出第一批
+// 1 条线路，公共解析器（服务器GG / tiful）要 2~4 秒才把其余 4~5 条补齐，而
+// 校验（伪 HLS 剔除）又要再花 1~2 秒。旧实现“第一条线路出现就只宽限 1500
+// 毫秒”，于是线上冷启动（edge→上游延迟比本地高）在 2.4 秒就用 1 条线路的
+// 半成品答复了客户端，用户看到的就是“客户端只显示一个播放源”；20 秒后重拉
+// 才拿到全部线路。
+//
+// 现在的规则：
+//   1. 每发布一份“线路更多”的快照就重新计时（静默窗口）；
+//   2. 只有“主批次”（公共解析器）且线路数 ≥ TARGET_COUNT 时才用较短的
+//      FIRST_SCREEN_SETTLE_MS：主批次基本代表上游的全部线路；
+//   3. 其余（含“自建补源先回 2 条”这种半成品）一律用 FIRST_SCREEN_GRACE_MS：
+//      再给并行链路一点时间补齐，避免首屏只有两个播放源；
+//   4. 无论哪条，整条解析链一旦收尾就立刻返回它（优先完整、已校验的结果）；
+//   5. 最坏也在 FIRST_SCREEN_MAX_WAIT_MS 内答复，剩余线路由后台继续跑并写
+//      缓存，客户端跨 20 秒时间桶重拉详情时补齐。
+const RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS = 3000;
+// 主批次（公共解析器）线路数达到这个条数就改用较短的静默窗口，不再等满宽限期。
+const RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT = 2;
+// 详情页首屏等待上限：宁可先给客户端少量线路，也不能让详情页一直转圈。
+// 实测线上冷启动整条链路约 2~4 秒，留出余量即可覆盖绝大多数资源。
+const RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS = 4500;
+// “主批次且已有多个线路”的快照到达后的静默窗口：只要这个窗口内不再出现
+// 线路更多的快照，就返回当前快照；期间整条解析链若收尾则优先返回完整结果。
+const RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS = 400;
 
 function normalizedPersistedResolvedVideo(value) {
   if (!value || typeof value !== "object") return null;
@@ -5928,7 +6018,7 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
     : null;
   // 解析中途的公共线路快照：写进短 TTL 的 PARTIAL_RESOLVE_CACHE（见其注释），
   // 让“本次请求预算用完”和“紧接着的第二次点开”都能立刻看到真实线路。
-  const onPartial = (video) => {
+  const onPartial = (video, meta) => {
     if (!isUsableResolvedVideo(video)) return;
     if (key) {
       PARTIAL_RESOLVE_CACHE.write(key, video);
@@ -5938,7 +6028,7 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
     }
     if (externalOnPartial) {
       try {
-        externalOnPartial(video);
+        externalOnPartial(video, meta);
       } catch {
         // 调用方的回调异常不能打断解析。
       }
@@ -6090,9 +6180,66 @@ async function resolveVideoForResponse(
   // 本实例的内存快照优先，其次读边缘缓存那份——用户“退出详情页再重进”
   // 很可能落在另一个 isolate 上。
   const partial = { video: null };
+  // 首屏等待必须用“可重复触发的静默窗口”，不能再用一次性 Promise：
+  // 自建链路与公共解析器是两条并行链路，快照会分多次、由少到多到达
+  // （典型：0.3s 自建 1 条 → 1.4s 公共 5 条 → 2s 自建合并 4 条）。
+  // 一次性 Promise 只能在“第一份快照”时定一个延迟，之后新到的快照无法
+  // 推迟返回，于是 1 条线路的半成品经常先被答复出去（用户看到“只有一个
+  // 播放源”）。这里改成 debounce：
+  //   1. 每收到一份“线路更多”的快照就 clearTimeout + 重新计时；
+  //   2. 在“主批次”（公共解析器，meta.major）到达之前，一律用较长的
+  //      FIRST_SCREEN_GRACE_MS；主批次到达后（majorSeen）且线路数 ≥ 目标
+  //      条数时改用 FIRST_SCREEN_SETTLE_MS。
+  //      为什么不能只看条数：自建补源常常 0.3 秒就回 2 条，公共解析器 1.4~1.8
+  //      秒才回 5 条。若“≥2 条就 400 毫秒返回”，首屏只会是那 2 条（用户
+  //      “只显示两个播放源”）。
+  //      为什么主批次之后还要 SETTLE 而不是立刻返回：主批次之后自建链路还会
+  //      补一批互补线路（合并测试覆盖了这个场景），给 400 毫秒静默期把它们
+  //      一起收进来，既不会漏线路，也不会把首屏拖到 4 秒。
+  //   3. 整条解析链收尾（resolveTask）优先返回完整、已校验结果；
+  //   4. 最坏由 FIRST_SCREEN_MAX_WAIT_MS 兜底。
+  let partialTimer = null;
+  let partialResolve = null;
+  // “主批次”（公共解析器）是否已经发布过。发布过之后，后续的自建补充线路
+  // 只值得再等一个短静默期，不必再等满宽限期。
+  let majorSeen = false;
+  const partialSettled = new Promise((resolve) => {
+    partialResolve = resolve;
+  });
+  const clearPartialWindow = () => {
+    if (partialTimer) {
+      clearTimeout(partialTimer);
+      partialTimer = null;
+    }
+    partialResolve = null;
+  };
+  const armPartialWindow = (count, major) => {
+    // 已经结束（或已被其它分支收尾）就不再重新计时。
+    if (!partialResolve) return;
+    if (major === true) majorSeen = true;
+    if (partialTimer) clearTimeout(partialTimer);
+    const delay = (
+      majorSeen &&
+      count >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT
+    )
+      ? RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS
+      : RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS;
+    partialTimer = setTimeout(() => {
+      partialTimer = null;
+      const resolve = partialResolve;
+      partialResolve = null;
+      if (!resolve) return;
+      try {
+        resolve({ kind: "partial" });
+      } catch {
+        // 唤醒失败不影响解析。
+      }
+    }, delay);
+  };
   const resolveTask = resolveVideoCached(movie, env, fetchImpl, ctx, {
-    onPartial: (video) => {
+    onPartial: (video, meta) => {
       partial.video = video;
+      armPartialWindow(resolvedVideoSourceCount(video), meta?.major === true);
     },
   });
   const partialVideo = () =>
@@ -6130,13 +6277,62 @@ async function resolveVideoForResponse(
   }
 
   try {
-    const video = await withTimeout(
-      resolveTask,
-      remainingBudgetMs(),
-    );
-    if (isUsableResolvedVideo(video)) {
+    // 首屏能不能出现真实线路，取决于这里等的是“整条解析链”还是“第一条可用
+    // 线路”。整条链要等公共解析器合并（5~7 秒）+ 自建补源（3.5 秒）+ 校验，
+    // 实测 7 秒以上，必然超过详情页 6.5 秒预算，客户端只能看到占位线路。
+    //
+    // 但只等“第一条线路”又会踩另一个坑：自建链路的第一批常常只有 1 条，比
+    // 完整的自建合并（通常 4~5 条，0.5~1.3 秒）早几百毫秒到达；实测正是
+    // 这 400 毫秒的宽限让详情页停在“只有一个播放源”。所以：
+    //   1. 出现 ≥ RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT 条后，只要
+    //      FIRST_SCREEN_SETTLE_MS 内没有更多线路就返回（多个真实播放源）；
+    //   2. 只有 1 条时用 FIRST_SCREEN_GRACE_MS 等并行链路补齐；
+    //   3. 每来一份“线路更多”的快照都重新计时（见 armPartialWindow）；
+    //   4. 最坏也在 FIRST_SCREEN_MAX_WAIT_MS 内给客户端答复。
+    // 其余线路由客户端 20 秒后重拉详情时补齐（发布按线路条数单调递增，不倒退）。
+    let early;
+    try {
+      early = await withTimeout(
+        Promise.race([
+          resolveTask.then(
+            (video) => ({ kind: "full", video }),
+            (error) => ({ kind: "error", error }),
+          ),
+          partialSettled,
+        ]),
+        Math.min(remainingBudgetMs(), RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS),
+      );
+    } finally {
+      // 无论谁先结束，都不再让静默窗口继续计时（避免悬空定时器）。
+      clearPartialWindow();
+    }
+    if (early.kind === "full" && isUsableResolvedVideo(early.video)) {
       return {
-        video,
+        video: early.video,
+        resolutionFinished: true,
+        stale: false,
+        error: null,
+      };
+    }
+    if (early.kind === "error") {
+      throw early.error || new Error("playback resolution failed");
+    }
+    if (early.kind === "partial") {
+      const snapshot = await latePartialVideo();
+      if (snapshot) {
+        // 解析链还在后台跑：让它继续把剩余线路补全并写进缓存。
+        keepAlive(resolveTask.catch(() => null), ctx);
+        return {
+          video: snapshot,
+          resolutionFinished: false,
+          stale: false,
+          error: null,
+        };
+      }
+    }
+    if (isUsableResolvedVideo(early.video)) {
+      return {
+        video: early.video,
         resolutionFinished: true,
         stale: false,
         error: null,
@@ -6618,7 +6814,10 @@ function mediaSourcesForVideo(item, requestUrl, token, video, subtitles = []) {
 // Path 指向本服务自己的取流接口，且不带 source 参数——真正播放时
 // /Videos/{id}/stream 会现场解析真实地址再转发，不会播到假地址。
 // 解析完成后客户端重新进入详情页就会拿到全部真实线路。
-const PENDING_MEDIA_SOURCE_NAME = "自动线路（解析中）";
+// 名称不再带“（解析中）”：这一屏只有在所有解析链路都没有给出线路时才出现，
+// 用户看到“解析中”会以为后台还在跑并一直等；改成中性名称后详情页不再出现
+// “自动线路（解析中）”字样，播放按钮仍然保留（走取流接口现场解析）。
+const PENDING_MEDIA_SOURCE_NAME = "自动线路";
 
 function pendingMediaSources(item, requestUrl, token, subtitles = []) {
   return [
@@ -8267,20 +8466,39 @@ async function removePlaybackRecord(env, token, state, itemId) {
 
 const PLAYBACK_REPLAY_CONFIRM_TICKS = 5 * 60 * 10_000_000;
 
-function isPlausiblePlaybackRestart(marker, opts) {
-  const pendingSession = String(marker && marker.pendingPlaySessionId || "");
-  const playSessionId = String(opts && opts.playSessionId || "");
-  const positionTicks = Math.max(0, Number(opts && opts.positionTicks) || 0);
-  if (!pendingSession || !playSessionId || pendingSession !== playSessionId || positionTicks <= 0) {
-    return false;
+// 墓碑只挡“被移除的那一次播放”补发的残留上报，绝不能永久封锁条目：
+// 用户移除记录之后重新点播（客户端常常直接从中途续播）必须能重新生成记录。
+// 判据用播放会话号，而不是“抑制期是否结束”：
+//   - 会话号与移除时相同 → 就是那次播放的残留（客户端刷新后补发的高进度同样带着它）；
+//   - 明确发出“开始播放”且会话号与移除时不同（或客户端根本不带会话号）→ 新的一次播放；
+//   - 会话号不同 → 新的播放。
+// 关键点：只要有“开始播放”这个明确信号就放行。旧实现只认“同一会话 + 进度回到 5 分钟内”，
+// 于是不带会话号、或者直接从中途续播的客户端永远解不开墓碑（“删了记录再也记不上”）。
+const TOMBSTONE_CLEAR = "clear";
+const TOMBSTONE_PENDING = "pending";
+const TOMBSTONE_BLOCK = "block";
+
+function decideTombstoneWrite(marker, opts = {}) {
+  const removedSession = String((marker && marker.playSessionId) || "");
+  const session = String(opts.playSessionId || "");
+  const positionTicks = Math.max(0, Number(opts.positionTicks) || 0);
+  const removedPosition = Math.max(0, Number(marker && marker.positionTicks) || 0);
+  const startedPlayback = opts.restarted === true;
+  const pendingSession = String((marker && marker.pendingPlaySessionId) || "");
+  // 之前登记过“待确认重播会话”：同一会话随后上报合理低进度，就是用户从头重播。
+  if (pendingSession && session && pendingSession === session && positionTicks > 0) {
+    if (removedPosition > 0 && positionTicks >= removedPosition) return TOMBSTONE_BLOCK;
+    if (positionTicks <= PLAYBACK_REPLAY_CONFIRM_TICKS) return TOMBSTONE_CLEAR;
   }
-  const removedPosition = Math.max(0, Number(marker.positionTicks) || 0);
-  // 真重播必须先出现同一会话、接近开头的低进度。刷新后补发的高进度不会满足，
-  // 因此不能仅凭新会话号或 startedAt 解除墓碑。
-  if (removedPosition > 0 && positionTicks >= removedPosition) {
-    return false;
+  if (startedPlayback) {
+    // 同一个会话号又报“开始播放”：多半是同一会话的重复通告，只有在片头附近
+    // 才先记成待确认，等它真的播起来（低进度）再撤墓碑；进度不为 0 时按残留处理。
+    if (!session || session !== removedSession) return TOMBSTONE_CLEAR;
+    return positionTicks === 0 ? TOMBSTONE_PENDING : TOMBSTONE_BLOCK;
   }
-  return positionTicks <= PLAYBACK_REPLAY_CONFIRM_TICKS;
+  // 进度 / 暂停 / 停止等上报：只有会话号明确不同才算新播放，否则按残留忽略。
+  if (removedSession && session && session !== removedSession) return TOMBSTONE_CLEAR;
+  return TOMBSTONE_BLOCK;
 }
 
 async function clearPlaybackTombstone(env, key, itemId) {
@@ -8300,21 +8518,19 @@ async function playbackWriteSuppressed(env, token, itemId, opts = {}) {
   const store = await readTombstones(env, key, { fresh: true });
   const marker = normalizeTombstone(store[itemId]);
   if (!marker) return false;
-  // 客户端刷新时经常会换一个 PlaySessionId，但仍然是删除前那次播放的残留上报。
-  // 因此“新会话”本身绝不能解除墓碑。第一次从 0 起播只记成待确认会话，
-  // 只有同一会话随后出现合理低进度，或用户明确标记已播，才真正放行。
   const explicitAction = opts.explicit === true;
   if (explicitAction) {
     await clearPlaybackTombstone(env, key, itemId);
     return false;
   }
 
-  if (isPlausiblePlaybackRestart(marker, opts)) {
+  const decision = decideTombstoneWrite(marker, opts);
+  if (decision === TOMBSTONE_CLEAR) {
     await clearPlaybackTombstone(env, key, itemId);
     return false;
   }
 
-  if (opts.restarted === true && Math.max(0, Number(opts.positionTicks) || 0) === 0) {
+  if (decision === TOMBSTONE_PENDING) {
     const playSessionId = String(opts.playSessionId || "");
     if (playSessionId) {
       const latest = await readTombstones(env, key, { fresh: true });
@@ -8367,6 +8583,12 @@ function isTruthyUserDataFlag(value) {
     return /^(?:1|true|yes|on)$/i.test(value.trim());
   }
   return Boolean(value);
+}
+
+// 各接口上报的播放会话号（body / query 上的写法不一），用于判断“新播放 / 旧残留”。
+function pickPlaySessionId(body, params) {
+  const value = pickUserDataValue(body, params, ["PlaySessionId", "playSessionId"]);
+  return String(value === undefined || value === null ? "" : value).trim();
 }
 
 // 是否算“已看完”：显式已播，或进度已到总时长 90% 以上，
@@ -9808,6 +10030,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
         if (await playbackWriteSuppressed(env, token, userDataItemId, {
           positionTicks: incomingPosition,
           playedToCompletion: incomingPlayed === true,
+          playSessionId: pickPlaySessionId(body, url.searchParams),
         })) {
           return noContentResponse();
         }
@@ -9969,6 +10192,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       // 这条接口就是“上报续播位置”，是记录复活最常见的来源之一
       if (await playbackWriteSuppressed(env, token, playingItemId, {
         positionTicks: playingPosition,
+        playSessionId: pickPlaySessionId(playingBody, url.searchParams),
       })) {
         return noContentResponse();
       }

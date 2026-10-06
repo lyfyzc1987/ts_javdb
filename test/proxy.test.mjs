@@ -1013,6 +1013,93 @@ test("allows a strict zero-progress restart to clear the deleted tombstone", asy
   assert.equal((await readBack.json()).PlaybackPositionTicks, 5_000_000);
 });
 
+test("rebuilds a removed record when playback resumes from the middle", async () => {
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-before-delete",
+    PositionTicks: 120_000_000,
+  }));
+  await callLocalEmby(embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"));
+
+  // 用户重新点播：客户端直接从中途续播（会话号与删除时那次不同）。
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-after-delete",
+    PositionTicks: 600_000_000,
+  }));
+
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 600_000_000);
+});
+
+test("rebuilds a removed record when the restart omits PlaySessionId", async () => {
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-before-delete",
+    PositionTicks: 120_000_000,
+  }));
+  await callLocalEmby(embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"));
+
+  // 老客户端根本不带会话号：只要明确“开始播放”，就必须能重新记上进度。
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PositionTicks: 300_000_000,
+  }));
+
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 300_000_000);
+});
+
+test("rebuilds a removed record when playback restarts from zero and keeps playing", async () => {
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-before-delete",
+    PositionTicks: 120_000_000,
+  }));
+  await callLocalEmby(embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"));
+
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-restart",
+    PositionTicks: 0,
+  }));
+  // 十分钟后的进度上报必须记得上（旧实现只认 5 分钟内的低进度，这里会被永久挡掉）。
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing/Progress", {
+    ItemId: "42",
+    PlaySessionId: "session-restart",
+    PositionTicks: 6_000_000_000,
+  }));
+
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 6_000_000_000);
+});
+
+test("still ignores a late progress report that carries no session id", async () => {
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-before-delete",
+    PositionTicks: 120_000_000,
+  }));
+  await callLocalEmby(embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"));
+
+  // 没有“开始播放”这个明确信号时，缺会话号的进度上报仍按残留处理。
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing/Progress", {
+    ItemId: "42",
+    PositionTicks: 120_000_000,
+  }));
+
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
+});
+
 test("maps JavDB movies into an Emby item list", async () => {
   const response = await handleProxy(
     new Request("https://clone.example/Items?ParentId=bbjavdb-root&Limit=10"),
@@ -1531,7 +1618,7 @@ test("returns a retryable detail response while cold resolution continues", asyn
   // 现场解析真实地址，不会播到假地址。
   assert.equal(firstPayload.MediaSourceCount, 1);
   assert.equal(firstPayload.MediaSources.length, 1);
-  assert.equal(firstPayload.MediaSources[0].Name, "自动线路（解析中）");
+  assert.equal(firstPayload.MediaSources[0].Name, "自动线路");
   // 占位线路的 Path 必须指向本服务的取流接口且不带 source 参数，
   // 否则客户端会去播一个伪造的上游地址。
   assert.match(firstPayload.MediaSources[0].Path, /\/Videos\/42\/stream\.mp4\?/);
@@ -1573,7 +1660,7 @@ test("returns a retryable detail response while cold resolution continues", asyn
     expectedItemEtag(secondPayload, { refreshSources: true }),
   );
   assert.equal(
-    [...db.rows.keys()].some((key) => key.includes("sources-v31|RCTD-740")),
+    [...db.rows.keys()].some((key) => key.includes("sources-v32|RCTD-740")),
     true,
   );
 });
@@ -1768,7 +1855,7 @@ test("returns a placeholder playback session while PlaybackInfo resolution conti
   assert.equal(first.headers.get("x-emby-retryable"), null);
   assert.ok(firstPayload.PlaySessionId);
   assert.equal(firstPayload.MediaSources.length, 1);
-  assert.equal(firstPayload.MediaSources[0].Name, "自动线路（解析中）");
+  assert.equal(firstPayload.MediaSources[0].Name, "自动线路");
 
   const deleted = await callLocalEmby(
     embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"),
@@ -1862,7 +1949,7 @@ test("keeps a playable on-demand placeholder instead of PlayAccess=None when res
   // 必须给一条按需占位线路（Path 指向本服务取流接口，播放时现场解析）。
   assert.equal(detailPayload.PlayAccess, "Full");
   assert.equal(detailPayload.MediaSources.length, 1);
-  assert.equal(detailPayload.MediaSources[0].Name, "自动线路（解析中）");
+  assert.equal(detailPayload.MediaSources[0].Name, "自动线路");
   assert.equal(detailPayload.MediaSourceCount, 1);
   assert.equal(
     detailPayload.Etag,
@@ -1880,7 +1967,7 @@ test("keeps a playable on-demand placeholder instead of PlayAccess=None when res
   // 必须创建播放会话并下发同一条占位线路，否则用户看到播放按钮却怎么也播不了。
   assert.ok(playbackPayload.PlaySessionId);
   assert.equal(playbackPayload.MediaSources.length, 1);
-  assert.equal(playbackPayload.MediaSources[0].Name, "自动线路（解析中）");
+  assert.equal(playbackPayload.MediaSources[0].Name, "自动线路");
 });
 
 test("buckets the pending detail ETag so clients refresh within 20 seconds", async () => {
@@ -1899,7 +1986,7 @@ test("buckets the pending detail ETag so clients refresh within 20 seconds", asy
     const firstPayload = await first.json();
     assert.equal(first.status, 200);
     assert.equal(firstPayload.MediaSources.length, 1);
-    assert.equal(firstPayload.MediaSources[0].Name, "自动线路（解析中）");
+    assert.equal(firstPayload.MediaSources[0].Name, "自动线路");
 
     // 同一个 20 秒桶内 ETag 稳定，但“解析中”绝不回 304：客户端把整份 DTO
     // 存在本地库里，304 会让它继续用没有播放按钮的旧副本。
@@ -2863,7 +2950,7 @@ test("drops .image pseudo-HLS sources when the body is a real PNG", async () => 
     false,
   );
   assert.equal(payload.MediaSources.length, 1);
-  assert.equal(payload.MediaSources[0].Name, "自动线路（解析中）");
+  assert.equal(payload.MediaSources[0].Name, "自动线路");
 });
 
 test("drops remote HLS sources whose segment body is real font data", async () => {
@@ -2936,7 +3023,7 @@ test("drops remote HLS sources whose segment body is real font data", async () =
     false,
   );
   assert.equal(payload.MediaSources.length, 1);
-  assert.equal(payload.MediaSources[0].Name, "自动线路（解析中）");
+  assert.equal(payload.MediaSources[0].Name, "自动线路");
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
   assert.equal(calls.includes(segmentUrl), true);
 });
@@ -3230,7 +3317,7 @@ test("drops AES-128 HLS sources when the decryption key is not 16 bytes", async 
     false,
   );
   assert.equal(payload.MediaSources.length, 1);
-  assert.equal(payload.MediaSources[0].Name, "自动线路（解析中）");
+  assert.equal(payload.MediaSources[0].Name, "自动线路");
   assert.equal(calls.includes(segmentUrl), false);
 });
 
@@ -3433,7 +3520,7 @@ test("drops resolver sources marked metadata_invalid_reference", async () => {
     false,
   );
   assert.equal(payload.MediaSources.length, 1);
-  assert.equal(payload.MediaSources[0].Name, "自动线路（解析中）");
+  assert.equal(payload.MediaSources[0].Name, "自动线路");
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
 });
 
@@ -4054,6 +4141,397 @@ test("publishes early public lines instead of a pending placeholder when a slow 
     ),
     false,
   );
+});
+
+test("shows the first self-hosted line on the detail screen while both resolver links are still slow", async () => {
+  const db = createPlaybackD1();
+  const detailUrl = "https://javtiful.com/zh/video/99999/RCTD-740";
+  const fullHdUrl = "https://fast-stream.jav.si/rctd-740/javtiful-1080.mp4";
+  const hdUrl = "https://fast-stream.jav.si/rctd-740/javtiful-720.mp4";
+  const env = {
+    PLAYBACK_DB: db,
+    // 详情页预算压到 1.2 秒：公共解析器（2.5 秒）和另一条自建链路 GetAV
+    // （3 秒）都来不及，唯一能在预算内出现的真实线路只能来自自建补源的
+    // 第一批结果（Javtiful 秒回）。旧实现要等两条自建链路合并完才发布，
+    // 于是预算内什么都拿不到，客户端只能看到“自动线路（解析中）”。
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 1200,
+  };
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: { id: 42, number: "RCTD-740", title: "RCTD-740 First screen" },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes("/api/v/resolve?code=RCTD-740")) {
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl: "https://fast-stream.jav.si/rctd-740/slow-public.mp4",
+              sourceType: "video/mp4",
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+        return new Response(`<a href="${detailUrl}">RCTD-740 Test</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: "RCTD-740 Test",
+            playerSources: [
+              { src: fullHdUrl, type: "video/mp4", size: 1080 },
+              { src: hdUrl, type: "video/mp4", size: 720 },
+            ],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === "https://fast-stream.jav.si/rctd-740/slow-public.mp4") {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  // 关键点：首屏直接是真实线路，不再有“自动线路（解析中）”的占位源。
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ),
+    [fullHdUrl, hdUrl],
+  );
+});
+
+test("keeps self-hosted and public snapshots together so the detail screen never loses lines", async () => {
+  const detailUrl = "https://javtiful.com/zh/video/99998/RCTD-740";
+  const javtifulUrls = [
+    "https://fast-stream.jav.si/rctd-740/javtiful-1080.mp4",
+    "https://fast-stream.jav.si/rctd-740/javtiful-720.mp4",
+  ];
+  const publicUrls = [
+    "https://fast-stream.jav.si/rctd-740/public-1080.mp4",
+    "https://fast-stream.jav.si/rctd-740/public-720.mp4",
+  ];
+  const env = {
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 1500,
+  };
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: { id: 42, number: "RCTD-740", title: "RCTD-740 Merge" },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes("/api/v/resolve?code=RCTD-740")) {
+        return new Response(
+          JSON.stringify({
+            variants: publicUrls.map((sourceUrl, index) => ({
+              variant: index === 0 ? "original" : "backup",
+              sourceUrl,
+              sourceType: "video/mp4",
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+        return new Response(`<a href="${detailUrl}">RCTD-740 Test</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: "RCTD-740 Test",
+            playerSources: [
+              { src: javtifulUrls[0], type: "video/mp4", size: 1080 },
+              { src: javtifulUrls[1], type: "video/mp4", size: 720 },
+            ],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if ([...javtifulUrls, ...publicUrls].includes(target)) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  // 两条链路各 2 条互补线路：合并后的首屏快照必须保留全部 4 条，不能因为
+  // “后到的那份线路更少”就退回 2 条。
+  assert.equal(payload.MediaSourceCount, 4);
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ).sort(),
+    [...javtifulUrls, ...publicUrls].sort(),
+  );
+});
+
+test("does not answer the first screen with a single line while more lines are still arriving", async () => {
+  // 线上真实时序：自建补源（Javtiful）0.3 秒先回 1~2 条，公共解析器 1.4~1.8 秒
+  // 才回 5 条。旧实现“第一份快照起只宽限一次”，于是 1~2 条的半成品先被答复，
+  // 用户看到“只有一个播放源”，20 秒后重进才发现其实有 7 条。
+  // 这里断言：首屏必须等静默窗口，拿到合并后的全部 7 条线路。
+  const detailUrl = "https://javtiful.com/zh/video/99997/RCTD-740";
+  const javtifulUrls = [
+    "https://fast-stream.jav.si/rctd-740/self-1080.mp4",
+    "https://fast-stream.jav.si/rctd-740/self-720.mp4",
+  ];
+  const publicUrls = [
+    "https://fast-stream.jav.si/rctd-740/pub-original.mp4",
+    "https://fast-stream.jav.si/rctd-740/pub-reducing.mp4",
+    "https://fast-stream.jav.si/rctd-740/pub-original-2.mp4",
+    "https://fast-stream.jav.si/rctd-740/pub-mosaic.mp4",
+    "https://fast-stream.jav.si/rctd-740/pub-mosaic-gg.mp4",
+  ];
+  const allUrls = [...javtifulUrls, ...publicUrls];
+  const env = {
+    // 预算够长：首屏应该由静默窗口决定，而不是被预算截断。
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 6500,
+  };
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: { id: 42, number: "RCTD-740", title: "RCTD-740 Window" },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes("/api/v/resolve?code=RCTD-740")) {
+        // 公共解析器：慢，但一次给 5 条。
+        await new Promise((resolve) => setTimeout(resolve, 1800));
+        return new Response(
+          JSON.stringify({
+            variants: publicUrls.map((sourceUrl, index) => ({
+              variant: index === 0 ? "original" : "backup",
+              sourceUrl,
+              sourceType: "video/mp4",
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+        return new Response(`<a href="${detailUrl}">RCTD-740 Test</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        // 自建补源：秒回 2 条。
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: "RCTD-740 Test",
+            playerSources: [
+              { src: javtifulUrls[0], type: "video/mp4", size: 1080 },
+              { src: javtifulUrls[1], type: "video/mp4", size: 720 },
+            ],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (allUrls.includes(target)) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
+  // 关键断言：首屏是 7 条，不是自建链路先到的那 2 条。
+  assert.equal(payload.MediaSourceCount, allUrls.length);
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ).sort(),
+    [...allUrls].sort(),
+  );
+});
+
+test("keeps inline HLS lines on the first screen when every upstream line is a data URL", async () => {
+  const inlineSources = [0, 1, 2].map((index) =>
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent([
+      "#EXTM3U",
+      "#EXT-X-TARGETDURATION:10",
+      "#EXTINF:10,",
+      `https://media.example/rctd-740/segment-${index}.ts`,
+      "#EXT-X-ENDLIST",
+      "",
+    ].join("\n"))}`
+  );
+  const env = {
+    // 首屏预算压到 1.2 秒：完整解析链（含分片校验）来不及收尾，唯一能在
+    // 预算内出现的线路只能来自“公共解析器第一批快照”。上游三份线路全是
+    // data: 内联 HLS（RCTD-740 在真实上游的形态）；旧实现把内联清单一律
+    // 判成不可用，resolverPayloadUsableSourceCount 归零，详情页只能回落到
+    // “自动线路”占位源，客户端首屏就没有任何播放线路。
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 1200,
+  };
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: { id: 42, number: "RCTD-740", title: "RCTD-740 Inline" },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes("/api/v/resolve?code=RCTD-740")) {
+        return new Response(
+          JSON.stringify({
+            variants: inlineSources.map((sourceUrl, index) => ({
+              variant: index === 0 ? "javgg_original" : `javgg_backup_${index}`,
+              sourceUrl,
+              sourceType: "application/vnd.apple.mpegurl",
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.startsWith("https://javtiful.com")) {
+        return new Response("<html><body></body></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  // 内联 HLS 也算可用线路：首屏必须是全部三条真实线路，而不是占位源。
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
+  assert.equal(payload.MediaSourceCount, 3);
+  for (const source of payload.MediaSources) {
+    assert.equal(source.Container, "m3u8");
+    assert.match(source.DirectStreamUrl, /\/Videos\/42\/stream\.m3u8/);
+    assert.doesNotMatch(source.DirectStreamUrl, /source=/);
+  }
 });
 
 test("does not persist a thin result after the supplement finishes below target", async () => {
