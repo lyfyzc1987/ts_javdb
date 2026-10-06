@@ -294,10 +294,11 @@ function expectedItemEtag(payload, options = {}) {
     }))
     : [];
   const stableDto = {
-    version: "item-dto-v13",
-    // 播放源仍在后台解析时，生产代码会把 20 秒时间桶拼进指纹，这里同步复现。
-    ...(options.pendingSources === true
-      ? { PendingSourcesBucket: Math.floor(Date.now() / (20 * 1000)) }
+    version: "item-dto-v15",
+    // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
+    // 生产代码见 itemEtag，这里同步复现。
+    ...(options.pendingSources === true || options.refreshSources === true
+      ? { SourcesRefreshBucket: Math.floor(Date.now() / (20 * 1000)) }
       : {}),
     Id: payload?.Id || "",
     Name: payload?.Name || "",
@@ -1567,7 +1568,10 @@ test("returns a retryable detail response while cold resolution continues", asyn
     new Set(secondPayload.MediaSources.map((source) => source.Name)).size,
     secondPayload.MediaSources.length,
   );
-  assert.equal(secondPayload.Etag, expectedItemEtag(secondPayload));
+  assert.equal(
+    secondPayload.Etag,
+    expectedItemEtag(secondPayload, { refreshSources: true }),
+  );
   assert.equal(
     [...db.rows.keys()].some((key) => key.includes("sources-v31|RCTD-740")),
     true,
@@ -1797,7 +1801,7 @@ test("returns a placeholder playback session while PlaybackInfo resolution conti
   assert.equal(secondPayload.MediaSources.length, 4);
 });
 
-test("returns an authoritative empty result after source resolution completes", async () => {
+test("keeps a playable on-demand placeholder instead of PlayAccess=None when resolution completes empty", async () => {
   const fetchImpl = async (url) => {
     const target = String(url);
     if (target.includes("/v4/movies/42")) {
@@ -1853,8 +1857,17 @@ test("returns an authoritative empty result after source resolution completes", 
   );
   const detailPayload = await detail.json();
   assert.equal(detail.status, 200);
-  assert.equal(detailPayload.PlayAccess, "None");
-  assert.deepEqual(detailPayload.MediaSources, []);
+  // 关键：上游“解析完成但没有可用线路”时，绝不能回 PlayAccess=None + 空源。
+  // 那会被 Emby 客户端判为条目不可用，从而清掉本地播放记录/进度条/播放按钮。
+  // 必须给一条按需占位线路（Path 指向本服务取流接口，播放时现场解析）。
+  assert.equal(detailPayload.PlayAccess, "Full");
+  assert.equal(detailPayload.MediaSources.length, 1);
+  assert.equal(detailPayload.MediaSources[0].Name, "自动线路（解析中）");
+  assert.equal(detailPayload.MediaSourceCount, 1);
+  assert.equal(
+    detailPayload.Etag,
+    expectedItemEtag(detailPayload, { pendingSources: true }),
+  );
 
   const playback = await handleProxy(
     new Request("https://clone.example/Items/42/PlaybackInfo", { method: "POST" }),
@@ -1864,8 +1877,10 @@ test("returns an authoritative empty result after source resolution completes", 
   );
   const playbackPayload = await playback.json();
   assert.equal(playback.status, 200);
-  assert.equal(playbackPayload.PlaySessionId, "");
-  assert.deepEqual(playbackPayload.MediaSources, []);
+  // 必须创建播放会话并下发同一条占位线路，否则用户看到播放按钮却怎么也播不了。
+  assert.ok(playbackPayload.PlaySessionId);
+  assert.equal(playbackPayload.MediaSources.length, 1);
+  assert.equal(playbackPayload.MediaSources[0].Name, "自动线路（解析中）");
 });
 
 test("buckets the pending detail ETag so clients refresh within 20 seconds", async () => {
@@ -2839,7 +2854,16 @@ test("drops .image pseudo-HLS sources when the body is a real PNG", async () => 
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 0);
+  // 伪线路必须被丢弃（不能下发 data: 假清单），但也不能回空列表：那会被 Emby
+  // 客户端判为播放失败并清掉播放记录。改为下发一条按需占位线路。
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Path || "").startsWith("data:")
+    ),
+    false,
+  );
+  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources[0].Name, "自动线路（解析中）");
 });
 
 test("drops remote HLS sources whose segment body is real font data", async () => {
@@ -2906,7 +2930,13 @@ test("drops remote HLS sources whose segment body is real font data", async () =
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 0);
+  // 字体伪装的分片必须被丢弃，但空列表会让客户端清掉播放记录，改为占位线路。
+  assert.equal(
+    payload.MediaSources.some((source) => source.Path === sourceUrl),
+    false,
+  );
+  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources[0].Name, "自动线路（解析中）");
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
   assert.equal(calls.includes(segmentUrl), true);
 });
@@ -3195,7 +3225,12 @@ test("drops AES-128 HLS sources when the decryption key is not 16 bytes", async 
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 0);
+  assert.equal(
+    payload.MediaSources.some((source) => source.Path === sourceUrl),
+    false,
+  );
+  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources[0].Name, "自动线路（解析中）");
   assert.equal(calls.includes(segmentUrl), false);
 });
 
@@ -3391,7 +3426,14 @@ test("drops resolver sources marked metadata_invalid_reference", async () => {
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.deepEqual(payload.MediaSources, []);
+  // 无效线路必须被丢弃，但空列表会被客户端判为播放失败并清掉播放记录，
+  // 改为下发一条按需占位线路（Path 指向本服务取流接口，播放时现场解析）。
+  assert.equal(
+    payload.MediaSources.some((source) => source.Path === sourceUrl),
+    false,
+  );
+  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources[0].Name, "自动线路（解析中）");
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
 });
 
@@ -3876,6 +3918,141 @@ test("does not persist a thin GetAV result while supplement is pending", async (
       new URL(source.Path).searchParams.get("source")
     ),
     [...publicUrls, ...getavUrls],
+  );
+});
+
+test("publishes early public lines instead of a pending placeholder when a slow resolver still merges", async () => {
+  const db = createPlaybackD1();
+  const env = {
+    PLAYBACK_DB: db,
+    // 详情页预算故意压到很小：模拟线上“公共线路已经到手，但另一条解析链路
+    // 还在合并（RESOLVER_SECONDARY_MERGE_MS / RESOLVER_THIN_MERGE_MS）”的时刻。
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 600,
+    RESOLVER_MERGE_BUDGET_MS: 5000,
+    SELF_HOSTED_MERGE_BUDGET_MS: 40,
+    // 让主解析器走一条慢路径，公开回退解析器仍然很快。
+    JAVSTRM_RESOLVE_PATH: "/api/v/alt-resolve",
+  };
+  const publicUrls = [
+    "https://fast-stream.jav.si/rctd-740/public-4k.mp4",
+    "https://fast-stream.jav.si/rctd-740/public-1080.mp4",
+  ];
+  const slowUrls = [
+    "https://fast-stream.jav.si/rctd-740/slow-720.mp4",
+    "https://fast-stream.jav.si/rctd-740/slow-480.mp4",
+  ];
+  let slowResolveStarted = false;
+  const fetchImpl = async (url, init = {}) => {
+    const target = String(url);
+    if (target.includes("/v4/movies/42")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: {
+            movie: {
+              id: 42,
+              number: "RCTD-740",
+              title: "RCTD-740 Early partial",
+            },
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("/api/v/alt-resolve?code=RCTD-740")) {
+      slowResolveStarted = true;
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      return new Response(
+        JSON.stringify({
+          variants: slowUrls.map((sourceUrl, index) => ({
+            variant: index === 0 ? "original" : "backup",
+            sourceUrl,
+            sourceType: "video/mp4",
+          })),
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("/api/v/resolve?code=RCTD-740")) {
+      return new Response(
+        JSON.stringify({
+          variants: publicUrls.map((sourceUrl, index) => ({
+            variant: index === 0 ? "original" : "backup",
+            sourceUrl,
+            sourceType: "video/mp4",
+          })),
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+      return new Response(
+        "<html><title>RCTD-740 Test | GetAV</title></html>",
+        { headers: { "content-type": "text/html" } },
+      );
+    }
+    if (publicUrls.includes(target)) {
+      assert.equal(init.headers.get("range"), "bytes=0-511");
+      return new Response(new Uint8Array([0, 0, 0, 32]), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp4",
+        },
+      });
+    }
+    assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+    return new Response(
+      JSON.stringify({ code: 0, data: [] }),
+      { headers: { "content-type": "application/json" } },
+    );
+  };
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    fetchImpl,
+  );
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(
+    slowResolveStarted,
+    true,
+    "慢解析器应该已经被启动，否则这个用例没有覆盖到合并窗口",
+  );
+  // 关键点：预算耗尽时下发的是“已经解析出来的真实公共线路”，不再是
+  // “自动线路（解析中）”的占位源——这正是详情页一直只有一个解析中
+  // 播放源、点播放一直转圈的直接原因。
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
+  assert.equal(payload.MediaSourceCount, 2);
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ),
+    publicUrls,
+  );
+  assert.equal(
+    payload.Etag,
+    expectedItemEtag(payload, { refreshSources: true }),
+  );
+  // 半成品快照不能进长期持久层（否则完整线路会被线路更少的快照顶掉）。
+  assert.equal(
+    [...db.rows.keys()].some((key) =>
+      key.startsWith("video-persist-v1\u0000")
+    ),
+    false,
   );
 });
 
@@ -4654,7 +4831,10 @@ test("returns a stable detail ETag and honors conditional detail requests", asyn
     {},
     fetchImpl,
   );
-  assert.equal(unchanged.status, 304);
+  // 详情 DTO 带 20 秒刷新桶，永远不再回 304：Emby 客户端把整份 DTO 存在本地
+  // 数据库里，304 会让它继续显示“上一次部署时缓存的旧详情页”（用户反馈）。
+  // 同一个 20 秒桶内 ETag 依然稳定，客户端不会因为无意义字段反复刷新。
+  assert.equal(unchanged.status, 200);
   assert.equal(unchanged.headers.get("etag"), etag);
 
   resetEmbyCachesForTests();
@@ -5848,7 +6028,16 @@ test("exposes upstream preview images as Emby backdrop art", async () => {
   assert.equal(detail.status, 200);
   // 客户端凭这些 tag 才知道“艺术图”区块有几张图。
   // 第一张固定是资源封面，后面才是预览剧照。
-  assert.deepEqual(payload.BackdropImageTags, ["0", "1", "2"]);
+  // 详情 DTO 的 tag 末尾带 20 秒时间桶后缀（<下标>-<桶>），客户端重进详情页时
+  // 会发现 tag 变了并重新取图；列表 DTO 不带，避免首页滚动时反复下载封面。
+  assert.deepEqual(
+    payload.BackdropImageTags.map((tag) => String(tag).split("-")[0]),
+    ["0", "1", "2"],
+  );
+  assert.equal(
+    payload.BackdropImageTags.every((tag) => /^\d+-\d+$/.test(tag)),
+    true,
+  );
 
   let coverBackdropUrl;
   const coverImage = await handleProxy(
@@ -6109,6 +6298,89 @@ test("refreshes a stale media URL and accepts SenPlayer stream path variants", a
   ]);
   assert.deepEqual(freshRanges, ["bytes=0-511", "bytes=0-3"]);
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), videoBytes);
+});
+
+test("fails over to the next line when an upstream never returns response headers", async () => {
+  const videoBytes = new Uint8Array([0, 0, 0, 32]);
+  const okSource = "https://fast-stream.jav.si/video/ok.mp4";
+  const hangSource = "https://fast-stream.jav.si/video/hang.mp4";
+  const calls = [];
+  const startedAt = Date.now();
+  const response = await handleProxy(
+    new Request(
+      "https://clone.example/emby/Videos/42/42/stream.mp4?api_key=bbjavdb-guest&mediaSourceId=42-2",
+      { headers: { range: "bytes=0-3" } },
+    ),
+    // 把“等上游响应头”的超时压到 120ms，测试才能快速跑完；
+    // 生产默认值是 MEDIA_UPSTREAM_HEADERS_TIMEOUT_MS。
+    { MEDIA_UPSTREAM_HEADERS_TIMEOUT_MS: "120" },
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "TEST-001" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [
+              { variant: "original", sourceUrl: okSource, sourceType: "video/mp4" },
+              { variant: "second", sourceUrl: hangSource, sourceType: "video/mp4" },
+            ],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.startsWith("https://javtiful.com") || target.includes("getav.net")) {
+        return new Response("not found", { status: 404 });
+      }
+      if (target === hangSource) {
+        // 线路校验用的探测请求正常返回，真正的播放请求则一直不回响应头
+        // （用户遇到的“点播放一直加载中”）。
+        if (init.headers?.get?.("range") === "bytes=0-511") {
+          return new Response(videoBytes, {
+            status: 206,
+            headers: {
+              "content-range": "bytes 0-3/4",
+              "content-type": "video/mp4",
+            },
+          });
+        }
+        // 真实 fetch 会在超时后中止（reject）；stub 必须照做，
+        // 否则测试会一直挂住，也就测不出“会不会换线”。
+        return new Promise((_, reject) => {
+          const signal = init.signal;
+          if (!signal) return;
+          const abort = () => reject(signal.reason ?? new Error("aborted"));
+          if (signal.aborted) abort();
+          else signal.addEventListener("abort", abort, { once: true });
+        });
+      }
+      assert.equal(target, okSource);
+      return new Response(videoBytes, {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp4",
+        },
+      });
+    },
+  );
+
+  assert.equal(response.status, 206);
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), videoBytes);
+  assert.ok(calls.includes(hangSource), "hang line should be tried first");
+  assert.ok(
+    Date.now() - startedAt < 5000,
+    "playback must fail over instead of hanging on the stalled upstream",
+  );
 });
 
 test("accepts SenPlayer source aliases and sends media hotlink headers", async () => {

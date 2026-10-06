@@ -116,10 +116,13 @@ const MAX_HLS_REWRITE_DEPTH = 8;
 const HLS_PLAYLIST_SCAN_MAX_CHARS = 64 * 1024;
 const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // DTO 结构变化时提升版本，客户端会把它当成新的实体版本并刷新旧详情页缓存。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v13";
+// v15：无源时不再返回 PlayAccess=None + 空 MediaSources（那会让客户端把
+// 条目判为不可用并清掉本地播放记录/进度条/播放按钮），改成按需占位源。
+// 结构变化必须提升版本，客户端才会把本地库里那份旧 DTO 当成新实体重新拉取。
+const ITEM_DTO_ETAG_VERSION = "item-dto-v15";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-06-list-scan-window-prewarm-9";
+const SERVER_BUILD_ID = "2026-10-06-media-headers-timeout-13";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -147,6 +150,19 @@ const REMOTE_HLS_VARIANT_CONCURRENCY = 2;
 const REMOTE_HLS_PROBE_BUDGET = 4;
 const REMOTE_HLS_PROBE_DEPTH = 2;
 const REMOTE_MEDIA_PROBE_BYTES = 512;
+// 上游媒体 CDN（尤其直链 / HLS 分片）会偶发“TCP 已经连上，但迟迟不回响应头”。
+// 旧实现直接 await fetchImpl(...)，没有任何超时：Worker 会一直挂在那里，客户端
+// 看到的就是“点了播放一直加载中”，最后自己弹 Connection timeout。
+// 这里给“拿到响应头”这一步单独设一个超时：超时就当成该线路不可用（合成 504），
+// 交给上层立刻换下一条线路。响应头一到达就清掉定时器，真正的响应体流式传输
+// 不受影响，不会把一个大文件的正常播放中途掐断。
+const MEDIA_UPSTREAM_HEADERS_TIMEOUT_MS = 6000;
+// 合成超时响应用的标记头：带上它表示“是我们主动放弃的”，
+// 上层据此跳过 5xx 立即重试，避免又多等一个超时周期。
+const MEDIA_UPSTREAM_TIMEOUT_HEADER = "x-catemby-upstream-timeout";
+// 一次播放请求在“拿到上游响应头”之前允许消耗的总时间。多线路时逐条换线，
+// 但总时间必须有界，否则线路全部挂起时客户端早就自己超时了。
+const STREAM_HEADERS_BUDGET_MS = 20000;
 const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   401,
   403,
@@ -1757,17 +1773,57 @@ async function fetchMediaUpstreamResponse(
   );
   const needsEmbeddedTsNormalization =
     mediaSegmentNeedsEmbeddedTsNormalization(sourceUrl);
-  const fetchUpstream = (requestHeaders = headers) => fetchImpl(sourceUrl, {
-    method: request.method,
-    headers: requestHeaders,
-    redirect: "follow",
+  const headersTimeoutMs = positiveEnvMilliseconds(
+    env,
+    "MEDIA_UPSTREAM_HEADERS_TIMEOUT_MS",
+    MEDIA_UPSTREAM_HEADERS_TIMEOUT_MS,
+  );
+  const headersDeadline = Number(options.headersDeadline) > 0
+    ? Number(options.headersDeadline)
+    : 0;
+  const upstreamTimeoutResponse = () => new Response(null, {
+    status: 504,
+    statusText: "Gateway Timeout",
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      [MEDIA_UPSTREAM_TIMEOUT_HEADER]: "1",
+    },
   });
+  const fetchUpstream = async (requestHeaders = headers) => {
+    const budgetMs = headersDeadline > 0
+      ? Math.min(headersTimeoutMs, headersDeadline - Date.now())
+      : headersTimeoutMs;
+    if (budgetMs <= 0) {
+      // 本次播放请求的“响应头预算”已经用完：不要再发起注定超时的请求，
+      // 直接告诉上层这条线路不可用，让它换线或尽快回错误。
+      return upstreamTimeoutResponse();
+    }
+    try {
+      return await fetchWithTimeout(
+        fetchImpl,
+        sourceUrl,
+        {
+          method: request.method,
+          headers: requestHeaders,
+          redirect: "follow",
+        },
+        budgetMs,
+      );
+    } catch {
+      // 连接被中断、DNS 失败、上游不回响应头 —— 统一按“这条线路不可用”处理。
+      return upstreamTimeoutResponse();
+    }
+  };
   // 上游 CDN 偶发 5xx 时，直接把它转发给播放器会让客户端弹
   // “Playback failed: Could not fetch …”。这里对媒体请求做一次立即重试，
   // 只有连续两次都 5xx 才交给播放器处理。
   const fetchUpstreamWithRetry = async (requestHeaders = headers) => {
     const first = await fetchUpstream(requestHeaders);
-    if (first.status >= 500 && first.status < 600) {
+    if (
+      first.status >= 500 &&
+      first.status < 600 &&
+      !first.headers.get(MEDIA_UPSTREAM_TIMEOUT_HEADER)
+    ) {
       try {
         first.body?.cancel?.();
       } catch {}
@@ -2736,7 +2792,11 @@ const FETCH_TIMEOUT_MS = 10000;
 const FETCH_MAX_ATTEMPTS = 2;
 // Emby 客户端常见的 HTTP 超时在 10 秒左右。详情页与 PlaybackInfo 共用同一个
 // 绝对截止时间，元数据、播放源和字幕不能再各自累计等待。
-const ITEM_REQUEST_DEADLINE_MS = 8200;
+// 实测回退解析端冷启动要 6~21 秒（主解析器若被停用更是完全不可用），旧值
+// 8200 会把“刚好差一点点就返回真实线路”的那批请求提前截断成占位源。放宽到
+// 9000，仍明显小于客户端约 10 秒的超时；真正超时的请求会由 resolveVideo 的
+// onPartial 早发布拿到已经解析出的线路，不会退回空源。
+const ITEM_REQUEST_DEADLINE_MS = 9000;
 const ITEM_METADATA_BUDGET_MS = 4200;
 // 播放源解析接口是第三方现场抓取：响应头有时很快，但 700KB 左右的 JSON
 // 会慢慢挤牙膏。整个请求（包括响应体读取）必须控制在客户端等待预算内，
@@ -2762,7 +2822,10 @@ const SELF_HOSTED_SECONDARY_MERGE_MS = 5000;
 const SELF_HOSTED_THIN_MERGE_MS = 6000;
 // 公开解析器已经返回少量线路时，只给它一个较短的补源窗口；超时或失败仍保留
 // 已经验证通过的公开线路，不能为了追求更多清晰度拖满 PlaybackInfo 预算。
-const SELF_HOSTED_SUPPLEMENT_WAIT_MS = 6000;
+// 详情页/PlaybackInfo 的预算远小于这条补源链的耗时；公共线路已经先发布出去
+// （见 resolveVideo 的 onPartial），所以这里只留一个较短的补源窗口，让“完整
+// 结果”更快落地到缓存，用户第二次点开就能命中全部线路。
+const SELF_HOSTED_SUPPLEMENT_WAIT_MS = 3500;
 const RESOLVER_SOURCE_TARGET_COUNT = 4;
 const SELF_HOSTED_PAGE_TIMEOUT_MS = 9000;
 const SELF_HOSTED_PAGE_USER_AGENT = "Mozilla/5.0";
@@ -2857,6 +2920,15 @@ const LIST_CACHE_TTL_MS = 60 * 1000;
 const LIST_EDGE_CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_MOVIE_CACHE_ENTRIES = 4000;
 const MAX_RESOLVE_CACHE_ENTRIES = 1000;
+// 解析过程中的“部分结果”缓存：公共解析器已经拿到的线路会先落到这里。
+// 详情页 / PlaybackInfo 的解析预算（3s / 12s）远小于自建补源（Javtiful /
+// GetAV）的耗时，如果非要等补源结束才对外可见，客户端就只能一直看到
+// “自动线路（解析中）”的占位源——用户反馈的“点开资源永远在解析中、
+// 点播放一直加载中”就是这个原因。
+// TTL 故意很短：完整结果（含补源）落地到 RESOLVE_VIDEO_CACHE 后，
+// 这份中途快照就没有意义了；万一后台补源被 Worker 回收打断，也只会
+// 影响 20 秒，不会让“只有两条源”的结果污染 30 分钟缓存。
+const PARTIAL_RESOLVE_TTL_MS = 20 * 1000;
 const MAX_LIST_CACHE_ENTRIES = 400;
 // 全量扫描类列表（搜索 / 标签 / 演员 / 自定义排序）的“扫描窗口”：整轮上游扫描
 // 只做一次，把前 LIST_PAGE_WINDOW 条按窗口缓存，客户端翻页时从窗口里切。
@@ -2962,6 +3034,11 @@ function createTtlCache(ttlMs, maxEntries) {
 
 const MOVIE_CACHE = createTtlCache(MOVIE_CACHE_TTL_MS, MAX_MOVIE_CACHE_ENTRIES);
 const RESOLVE_VIDEO_CACHE = createTtlCache(RESOLVE_CACHE_TTL_MS, MAX_RESOLVE_CACHE_ENTRIES);
+// 只存“解析到一半”的公共线路快照，见 PARTIAL_RESOLVE_TTL_MS 的注释。
+const PARTIAL_RESOLVE_CACHE = createTtlCache(
+  PARTIAL_RESOLVE_TTL_MS,
+  MAX_RESOLVE_CACHE_ENTRIES,
+);
 const RESOLVE_SUBTITLE_CACHE = createTtlCache(RESOLVE_CACHE_TTL_MS, MAX_RESOLVE_CACHE_ENTRIES);
 const LIST_CACHE = createTtlCache(LIST_CACHE_TTL_MS, MAX_LIST_CACHE_ENTRIES);
 const LIST_WINDOW_CACHE = createTtlCache(LIST_WINDOW_TTL_MS, MAX_LIST_WINDOW_ENTRIES);
@@ -2985,6 +3062,9 @@ let edgeCacheOrigin = "";
 
 const EDGE_NAMESPACE_MOVIE = "movie";
 const EDGE_NAMESPACE_VIDEO = "video";
+// 解析中途的“公共线路快照”单独用一个命名空间：它和 EDGE_NAMESPACE_VIDEO 里
+// 的“完整结果”绝不能混，否则别的 isolate 会把半成品当成最终结果而不去补源。
+const EDGE_NAMESPACE_VIDEO_PARTIAL = "video-partial";
 const EDGE_NAMESPACE_SUBTITLE = "subtitle";
 const EDGE_NAMESPACE_LIST = "list";
 
@@ -3742,7 +3822,29 @@ function movieBackdropImages(movie) {
 
 // pendingSources=true 表示“播放源还在后台解析”，此时把 20 秒的时间桶拼进
 // ETag 的指纹里，客户端最多 20 秒就能看到一次版本变化并重拉详情。
+// 详情 DTO 的“艺术图版本”：把 20 秒时间桶拼进每张艺术图的 tag。Emby 客户端
+// 用 tag 拼图片请求地址（/Items/{id}/Images/Backdrop/{i}?tag=…），tag 不变时
+// 永远命中本地缓存。用户要求“退出详情页 20 秒后再进来要重新加载艺术图”，
+// 所以详情 DTO 里把 tag 按同一个时间桶换掉。
+// 只作用于详情 DTO：列表/首页 DTO 不拼，否则滚动列表时封面会被反复下载。
+// 主封面（Primary）也不拼：它几乎不变，重新下载只增加流量没有收益。
+function refreshDetailBackdropTags(item) {
+  if (!item || !Array.isArray(item.BackdropImageTags) || !item.BackdropImageTags.length) {
+    return;
+  }
+  const bucket = Math.floor(Date.now() / PENDING_SOURCES_ETAG_BUCKET_MS);
+  item.BackdropImageTags = item.BackdropImageTags.map((tag) => `${tag}-${bucket}`);
+}
+
 function itemEtag(item, options = {}) {
+  // refreshSources=true 时把“20 秒时间桶”计入指纹：
+  // - 解析还没完成（占位源）：客户端必须尽快重拉，否则一直停在“解析中”；
+  // - 解析已完成：用户要求“退出详情页 20 秒后再进来要重新加载全部视频源、
+  //   字幕和艺术图”。Emby 客户端会把整份 DTO 存在本地库里，指纹不变就只
+  //   会拿到 304，于是永远显示上一次部署时缓存的旧详情页。
+  //   带上时间桶后，跨桶的请求必然指纹不同 → 服务端回 200 + 最新 DTO。
+  const refreshSources = options.refreshSources === true ||
+    options.pendingSources === true;
   const userData = item?.UserData || {};
   const sources = Array.isArray(item?.MediaSources)
     ? item.MediaSources.map((source) => ({
@@ -3756,11 +3858,9 @@ function itemEtag(item, options = {}) {
     : [];
   const stableDto = {
     version: ITEM_DTO_ETAG_VERSION,
-    // 只在“解析中”时才带这个字段：解析完成的 DTO 指纹保持与旧版一致，
-    // 客户端不会因为多了一个无意义字段而反复刷新。
-    ...(options.pendingSources === true
+    ...(refreshSources
       ? {
-        PendingSourcesBucket: Math.floor(
+        SourcesRefreshBucket: Math.floor(
           Date.now() / PENDING_SOURCES_ETAG_BUCKET_MS,
         ),
       }
@@ -3800,7 +3900,8 @@ function requestHasMatchingEtag(request, etag) {
 
 function itemJsonResponse(item, request, options = {}) {
   const pendingSources = options.pendingSources === true;
-  const etag = itemEtag(item, { pendingSources });
+  const refreshSources = pendingSources || options.refreshSources === true;
+  const etag = itemEtag(item, { refreshSources });
   item.Etag = etag;
   const headers = {
     etag,
@@ -3808,10 +3909,10 @@ function itemJsonResponse(item, request, options = {}) {
     expires: "0",
     pragma: "no-cache",
   };
-  // 播放源还没解析完时绝不回 304：Emby 客户端把整份 DTO 存在本地库里，
-  // 304 会让它继续用“没有播放源、没有播放按钮”的旧副本。
+  // refreshSources 时绝不回 304：Emby 客户端把整份 DTO 存在本地库里，
+  // 304 会让它继续用“没有播放源、没有播放按钮”或“上一次部署时的旧详情页”。
   // 始终回 200 + 变化的 ETag，客户端才会在重新进入详情页时替换成最新内容。
-  if (!pendingSources && requestHasMatchingEtag(request, etag)) {
+  if (!refreshSources && requestHasMatchingEtag(request, etag)) {
     return new Response(null, {
       status: 304,
       headers: {
@@ -5257,7 +5358,11 @@ async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl) {
   return normalizedResolvedVideo(variants);
 }
 
-async function resolveVideo(movie, env, fetchImpl) {
+async function resolveVideo(movie, env, fetchImpl, options = {}) {
+  // onPartial：公共解析器（服务器 GG / tiful 等）的线路一拿到就先回调一次。
+  // 自建补源（Javtiful / GetAV）最坏要 9 秒，客户端根本等不到，必须让调用方
+  // 先把这部分真实线路发出去，而不是回一条“解析中”的占位源。
+  const onPartial = typeof options.onPartial === "function" ? options.onPartial : null;
   const code = movieNumber(movie) || movie.id || movie.title;
   if (!code) {
     return null;
@@ -5333,6 +5438,29 @@ async function resolveVideo(movie, env, fetchImpl) {
     firstValid?.settled?.value?.payload &&
     resolverPayloadHasUsableSource(firstValid.settled.value.payload, env),
   );
+  // 首条有效结果里已经有真实 http(s) 线路时，立刻先发布一次快照。
+  // 另一条解析链路可能还要等 RESOLVER_SECONDARY_MERGE_MS / RESOLVER_THIN_MERGE_MS
+  // （5~7 秒）才合并完，而详情页的解析预算只有 3 秒：等到合并完成再发布，预算
+  // 早就耗尽，客户端只能看到一条“自动线路（解析中）”的占位源，点播放又因为
+  // 取流接口要现场重解析而一直转圈。提前发布后，详情页/PlaybackInfo/取流接口
+  // 预算耗尽时都能拿到这批真实线路（标记为“未完成”，不写长期缓存），
+  // 补源在后台继续跑，客户端按 20 秒时间桶重拉时再换成完整线路。
+  if (onPartial && firstValid && firstHasUsableSource) {
+    try {
+      const earlyVideo = videoFromResolverPayload(
+        firstValid.settled.value.payload,
+        movie,
+        code,
+        env,
+      );
+      if (isUsableResolvedVideo(earlyVideo)) {
+        markResolvedVideoResolutionComplete(earlyVideo, false);
+        onPartial(earlyVideo);
+      }
+    } catch {
+      // 提前发布失败不影响下面的正常流程（后面还会再发布一次完整快照）。
+    }
+  }
   if (
     selfHostedSearchCode(code) &&
     (
@@ -5349,33 +5477,46 @@ async function resolveVideo(movie, env, fetchImpl) {
       ? RESOLVER_SECONDARY_MERGE_MS
       : RESOLVER_THIN_MERGE_MS,
   );
-  const [otherResolvers, selfHosted] = await Promise.all([
-    Promise.all(
-      settledEntries.map((entry) =>
-        firstValid?.name === entry.name
-          ? Promise.resolve(firstValid.settled)
-          : settledWithin(entry.promise, mergeBudget)
-      ),
+  const otherResolvers = await Promise.all(
+    settledEntries.map((entry) =>
+      firstValid?.name === entry.name
+        ? Promise.resolve(firstValid.settled)
+        : settledWithin(entry.promise, mergeBudget)
     ),
-    selfHostedVideoTask
-      ? settledWithin(selfHostedVideoTask, selfHostedMergeBudget(env))
-      : Promise.resolve(null),
-  ]);
+  );
   const payloads = otherResolvers
     .map((item) => item?.value?.payload)
     .filter(Boolean);
   const publicVideo = payloads.length
     ? videoFromResolverPayloads(payloads, movie, code, env)
     : null;
+  // 公共线路先对外发布一次（标记为“未完成”，禁止写入长期缓存）。
+  // 详情页/PlaybackInfo 的预算远小于下面的自建补源等待，先把真实线路给出去，
+  // 客户端才会出现播放按钮；补源完成后再用完整结果覆盖。
+  if (onPartial && isUsableResolvedVideo(publicVideo)) {
+    try {
+      markResolvedVideoResolutionComplete(publicVideo, false);
+      onPartial(publicVideo);
+    } catch {
+      // 回调失败不能影响真正的解析流程。
+    }
+  }
+  const selfHosted = selfHostedVideoTask
+    ? await settledWithin(selfHostedVideoTask, selfHostedMergeBudget(env))
+    : null;
   const merged = mergeResolvedVideoVariants(env, publicVideo, selfHosted);
   const validated = await finalizeVideo(merged);
   if (validated) {
-    // 一旦启动了自建补源，最终结果必须达到目标线路数才允许长期缓存。
-    // “补源任务已经结束”本身不等于成功，否则只补到 2 条也会污染 D1。
+    // “本次解析已经收尾”才算完成：
+    // - 没启动自建补源（公共线路本来就够了），或
+    // - 自建补源任务真的跑完了（拿到了它全部能拿到的东西）
+    // 补源只是没在预算内等到（selfHostedResolutionFinished 仍为 false）时不算完，
+    // 交给后台继续跑。旧规则“必须凑到 4 条”会把“上游本来就只有 2 条”的片子
+    // 永远判为未完成，于是永远不写缓存 → 每次点开都在现场重解析 → 客户端永远
+    // 停在“自动线路（解析中）”。
     markResolvedVideoResolutionComplete(
       validated,
-      !selfHostedVideoTask ||
-        resolvedVideoSourceCount(validated) >= RESOLVER_SOURCE_TARGET_COUNT,
+      !selfHostedVideoTask || selfHostedResolutionFinished,
     );
     return validated;
   }
@@ -5486,7 +5627,12 @@ function resolvedVideoResolutionComplete(video) {
 const EDGE_NAMESPACE_VIDEO_PERSIST = "video-persist-v1";
 const EDGE_NAMESPACE_VIDEO_PERSIST_MIRROR = "video-persist-mirror-v1";
 const RESOLVED_VIDEO_PERSIST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const RESOLVED_VIDEO_PERSIST_MAX_CHARS = 900_000;
+// 上游解析器会把每条线路的 HLS 清单内联进 JSON，单个番号的完整播放源经常
+// 有 1~1.8MB。旧上限 900KB 恰好把“线路最多的那些结果”全部挡在长期持久层
+// 之外：它们只能活 30 分钟的边缘缓存，过期后又要重新经历一次 10~20 秒的
+// 冷启动解析（用户看到的就是“放过的片子过一阵再点开又变成解析中”）。
+// D1 单行/单字符串上限是 2,000,000 字节，这里放到 1.9MB，留出转义余量。
+const RESOLVED_VIDEO_PERSIST_MAX_CHARS = 1_900_000;
 const RESOLVED_VIDEO_KV_PREFIX = "resolved-video:v1:";
 const RESOLVE_VIDEO_STALE_PEEK_MS = 1200;
 
@@ -5661,6 +5807,52 @@ async function settleCacheWrite(task, ctx) {
   await guarded;
 }
 
+// 只读“解析中途的公共线路快照”，不做任何网络校验：预算耗尽时必须立刻返回，
+// 不能反过来被校验拖住。TTL 只有 20 秒，过期就当没有。
+//
+// 先读本实例内存，再读边缘缓存：内存快照只活在当前 isolate，用户“退出详情页
+// 再重新点开”很容易落到另一个 isolate（或另一个 PoP），只读内存就会又退回
+// “自动线路（解析中）”。边缘缓存那份由 persistPartialVideo 写入。
+async function peekPartialResolvedVideo(movie, env) {
+  const key = resolvedVideoCacheKey(movie, env);
+  if (!key) return null;
+  const memory = PARTIAL_RESOLVE_CACHE.read(key);
+  if (isUsableResolvedVideo(memory)) return memory;
+  try {
+    const shared = await edgeCacheRead(EDGE_NAMESPACE_VIDEO_PARTIAL, key);
+    if (isUsableResolvedVideo(shared)) {
+      // 命中边缘后回填内存，同一实例的后续请求不必再查一次缓存。
+      PARTIAL_RESOLVE_CACHE.write(key, shared);
+      return shared;
+    }
+  } catch {
+    // 边缘缓存读失败就按“暂时没有快照”处理，不能拖住响应。
+  }
+  return null;
+}
+
+// 把“解析到一半”的公共线路快照写到边缘缓存，让跨 isolate / 跨 PoP 的后续
+// 请求也能立刻看到真实线路。
+// 刻意只写边缘、不写 D1：长期持久层（video-persist-v1）的键里不含
+// Worker/Pages 标记，两端共用同一个 D1 时会互相覆盖。
+async function persistPartialVideo(env, key, video) {
+  if (!key || !isUsableResolvedVideo(video)) return;
+  await edgeCacheWrite(
+    EDGE_NAMESPACE_VIDEO_PARTIAL,
+    key,
+    video,
+    PARTIAL_RESOLVE_TTL_MS / 1000,
+  );
+}
+
+// 完整结果落地后丢弃半成品快照（内存 + 边缘），避免后续请求预算耗尽时
+// 用线路更少的旧快照覆盖已经拿到的完整线路。
+function forgetPartialResolvedVideo(key) {
+  if (!key) return;
+  PARTIAL_RESOLVE_CACHE.forget(key);
+  forgetEdgeCache(EDGE_NAMESPACE_VIDEO_PARTIAL, key);
+}
+
 async function peekCachedResolvedVideo(movie, env, fetchImpl, ctx = null) {
   const key = resolvedVideoCacheKey(movie, env);
   if (!key) return null;
@@ -5729,10 +5921,31 @@ async function peekCachedResolvedVideo(movie, env, fetchImpl, ctx = null) {
   return null;
 }
 
-async function resolveVideoCached(movie, env, fetchImpl, ctx = null) {
+async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {}) {
   const key = resolvedVideoCacheKey(movie, env);
+  const externalOnPartial = typeof options.onPartial === "function"
+    ? options.onPartial
+    : null;
+  // 解析中途的公共线路快照：写进短 TTL 的 PARTIAL_RESOLVE_CACHE（见其注释），
+  // 让“本次请求预算用完”和“紧接着的第二次点开”都能立刻看到真实线路。
+  const onPartial = (video) => {
+    if (!isUsableResolvedVideo(video)) return;
+    if (key) {
+      PARTIAL_RESOLVE_CACHE.write(key, video);
+      // 同时写一份到边缘缓存：内存那份只活在当前 isolate，用户重进详情页
+      // 往往落到别的实例，只靠内存就会又退回占位源。
+      settleCacheWrite(persistPartialVideo(env, key, video), ctx);
+    }
+    if (externalOnPartial) {
+      try {
+        externalOnPartial(video);
+      } catch {
+        // 调用方的回调异常不能打断解析。
+      }
+    }
+  };
   if (!key) {
-    return resolveVideo(movie, env, fetchImpl);
+    return resolveVideo(movie, env, fetchImpl, { onPartial });
   }
   // 不用 fetch() 的自动写缓存：如果 GetAV 补源仍在后台且当前只有公开薄
   // 线路，结果只能服务本次请求，不能进入 30 分钟内存缓存或长期 D1。
@@ -5791,9 +6004,14 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null) {
     }
 
     try {
-      const video = await resolveVideo(movie, env, fetchImpl);
+      const video = await resolveVideo(movie, env, fetchImpl, { onPartial });
       if (isUsableResolvedVideo(video)) {
         if (resolvedVideoResolutionComplete(video)) {
+          // 只有凑齐目标线路数的结果才写长期 D1（30 天）；线路偏少的“已收尾”
+          // 结果仍然进内存 + 边缘缓存（30 分钟），避免上游本来就只有两条时
+          // 每次点开都重新现场解析。
+          const durable = resolvedVideoSourceCount(video) >=
+            RESOLVER_SOURCE_TARGET_COUNT;
           await settleCacheWrite(
             Promise.all([
               edgeCacheWrite(
@@ -5802,11 +6020,16 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null) {
                 video,
                 RESOLVE_CACHE_TTL_MS / 1000,
               ),
-              writePersistedResolvedVideo(env, key, video),
+              durable
+                ? writePersistedResolvedVideo(env, key, video)
+                : Promise.resolve(),
             ]),
             ctx,
           );
           RESOLVE_VIDEO_CACHE.write(key, video);
+          // 完整结果已经落地：把“解析中途快照”清掉，避免后续请求预算耗尽时
+          // 又拿这批线路更少的半成品覆盖完整结果。
+          forgetPartialResolvedVideo(key);
         }
         return video;
       }
@@ -5860,7 +6083,22 @@ async function resolveVideoForResponse(
     0,
     totalBudgetMs - (Date.now() - startedAt),
   );
-  const resolveTask = resolveVideoCached(movie, env, fetchImpl, ctx);
+  // 解析中途发布的“公共线路快照”（resolveVideo 在拿到首条真实线路时就会
+  // 先发一次，不等回退端合并、更不等自建补源）。详情页/PlaybackInfo 的预算
+  // 通常用不到补源结束，预算耗尽时直接把它发出去：客户端至少能看到真实线路
+  // 和播放按钮，而不是一条“自动线路（解析中）”的占位源。
+  // 本实例的内存快照优先，其次读边缘缓存那份——用户“退出详情页再重进”
+  // 很可能落在另一个 isolate 上。
+  const partial = { video: null };
+  const resolveTask = resolveVideoCached(movie, env, fetchImpl, ctx, {
+    onPartial: (video) => {
+      partial.video = video;
+    },
+  });
+  const partialVideo = () =>
+    isUsableResolvedVideo(partial.video) ? partial.video : null;
+  const latePartialVideo = async () =>
+    partialVideo() || (await peekPartialResolvedVideo(movie, env));
   const firstPeekBudgetMs = Math.min(
     RESOLVE_VIDEO_STALE_PEEK_MS,
     remainingBudgetMs(),
@@ -5884,7 +6122,7 @@ async function resolveVideoForResponse(
   if (remainingBudgetMs() <= 0) {
     keepAlive(resolveTask.catch(() => null), ctx);
     return {
-      video: null,
+      video: await latePartialVideo(),
       resolutionFinished: false,
       stale: false,
       error: null,
@@ -5908,6 +6146,17 @@ async function resolveVideoForResponse(
     // 响应预算用完不代表解析失败:后台继续跑完并写入缓存,
     // 下一次请求(客户端重试/刷新)就能直接命中结果。
     keepAlive(resolveTask.catch(() => null), ctx);
+    // 已经解析出的公共线路优先于“占位源”：这就是“点开资源一直显示
+    // 自动线路（解析中）”的直接修复点。
+    const partialNow = await latePartialVideo();
+    if (partialNow) {
+      return {
+        video: partialNow,
+        resolutionFinished: false,
+        stale: false,
+        error: null,
+      };
+    }
     const fallbackBudgetMs = Math.min(
       RESOLVE_VIDEO_STALE_PEEK_MS,
       remainingBudgetMs(),
@@ -5987,6 +6236,7 @@ async function forgetResolveVideoCache(movie, env) {
   }
   RESOLVE_VIDEO_CACHE.forget(key);
   forgetEdgeCache(EDGE_NAMESPACE_VIDEO, key);
+  forgetPartialResolvedVideo(key);
   await forgetPersistedResolvedVideo(env, key);
 }
 
@@ -6578,13 +6828,28 @@ function virtualFolder(library) {
 // 因此详情页只等一个很短的窗口：命中内存/边缘/持久层旧源时能立刻返回完整
 // 线路；冷缓存则先返回元数据（PlayAccess 仍为 Full，保留进度条与播放按钮），
 // 真正的解析交给后台继续跑完并写进缓存，用户在 PlaybackInfo 阶段拿到线路。
-const ITEM_DETAIL_RESOLVE_BUDGET_MS = 3000;
-// PlaybackInfo 是用户“点了播放”之后的请求，客户端对它的超时更宽容，给足
-// 时间让冷启动解析（约 10 秒）跑完，避免点播放后立刻弹“Playback failed”。
-const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 12000;
+// 冷启动时公共线路约 1~3 秒才发布，回退解析端冷启动实测 6~21 秒，旧值
+// 3000/4500 常常“刚超一点点”，结果只能回一条占位源。6.5 秒对 9 秒的请求
+// 截止时间（扣除元数据预算）仍有安全余量；超时也会优先返回 onPartial 已经
+// 发布的公共线路快照，最坏才是占位源。
+const ITEM_DETAIL_RESOLVE_BUDGET_MS = 6500;
+// /Videos/{id}/stream 现场解析播放源的硬预算。客户端点播放后如果长时间收不到
+// 任何字节，就会弹 “Connection timeout, try again later”。旧实现无预算地
+// await 整条解析链（最坏 10 秒以上），还会在第一次失败后再清缓存重解析一次
+// （耗时直接翻倍）。这里给它一个有界预算，超时就立刻回错误，同时后台把结果
+// 写进缓存——客户端重试的那一次就能直接命中。
+const STREAM_RESOLVE_BUDGET_MS = 9000;
+// 重试一轮（清掉可能失效的直链后重新解析）时额外允许的时间上限。
+const STREAM_RESOLVE_RETRY_BUDGET_MS = 6000;
+// PlaybackInfo 是用户“点了播放”之后的请求，客户端对它的容忍度比详情页更高。
+// 旧值 12 秒是在“等自建补源收尾”（实测 12~16 秒），结果客户端先超时弹
+// “Connection timeout”，详情页又退回占位源。现在公共线路一发布（onPartial）
+// 就提前返回，这里只是兜底上限，给回退端冷启动留出更多时间。
+const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 8000;
 // PlaybackInfo 单独放宽整个请求的截止时间，否则会被详情页共用的 8.2 秒
-// 截止时间提前截断，导致冷启动时反复 503。
-const PLAYBACK_INFO_REQUEST_DEADLINE_MS = 15000;
+// 截止时间提前截断，导致冷启动时反复 503。补源已交给后台任务，不需要 15 秒。
+// 但仍须小于客户端约 10 秒的 HTTP 超时，否则客户端会先判失败并清掉播放记录。
+const PLAYBACK_INFO_REQUEST_DEADLINE_MS = 9000;
 // 详情页也只等一个很小的字幕窗口：播放源就绪后立刻返回会让首次打开详情
 // 缺省字幕轨；冷启动字幕仍由后台任务继续完成。
 const ITEM_DETAIL_SUBTITLE_WAIT_MS = 1500;
@@ -6751,7 +7016,6 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   // 完整解析），字幕完全不参与这份预算。
   let video = null;
   let subtitles = [];
-  let resolutionFinished = false;
   // 播放源与字幕彻底分开：
   // 旧写法把两者塞进同一个 Promise.all 再整体超时，字幕稍慢（冷启动约 1.5s）
   // 就会连已经解析好的播放源一起丢掉，只回退成 1 条占位源，
@@ -6776,7 +7040,6 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     ),
   );
   video = videoResolution.video;
-  resolutionFinished = videoResolution.resolutionFinished;
   const subtitleWaitMs = Math.min(
     ITEM_DETAIL_SUBTITLE_WAIT_MS,
     remainingRequestMs(requestDeadline, ITEM_DETAIL_SUBTITLE_WAIT_MS),
@@ -6794,32 +7057,29 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
 
   if (!video) {
-    if (!resolutionFinished || videoResolution.error) {
-      // 解析还在后台继续，或上游临时失败。绝不能返回 503 / PlayAccess=None：
-      // Emby 客户端会把整次详情请求判为失败，于是把已经缓存的播放记录、
-      // 进度条和播放按钮一起清掉（用户已多次遇到）。
-      // 但也不能只回空 MediaSources：客户端在 MediaSources 为空时会把播放
-      // 按钮整个藏掉（用户反馈的“详情页有时没有按钮”）。所以这里给一条
-      // “按需线路”占位——它的 Path 指向本服务自己的取流接口，真正播放时
-      // 现场解析真实地址，不会播到假地址；同时用 pendingSources 让 ETag
-      // 带 20 秒时间桶，客户端最迟 20 秒后重进详情页就会刷新出全部真实线路。
-      const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
-      item.MediaSources = sources;
-      item.MediaStreams = sources[0].MediaStreams;
-      item.MediaSourceCount = sources.length;
-      item.Container = sources[0].Container;
-      item.Path = sources[0].Path;
-      item.HasSubtitles = subtitles.length > 0;
-      return itemJsonResponse(item, request, { pendingSources: true });
-    }
-    // 解析已完成但确实没有可播放源：明确标成不可播放，避免客户端去请求播放。
-    // 这是权威的“无源”结果，不是解析超时，因此可以安全覆盖旧状态。
-    item.PlayAccess = "None";
-    item.MediaSources = [];
-    item.MediaStreams = [];
-    item.MediaSourceCount = 0;
-    item.HasSubtitles = false;
-    return itemJsonResponse(item, request);
+    // 不论是「解析还在后台继续」「上游临时失败」还是「解析已经跑完但这一轮
+    // 确实没有拿到可用线路」，这里都绝不能返回 503 / PlayAccess=None /
+    // 空 MediaSources：
+    //   - PlayAccess=None + 空 MediaSources 会被 Emby 客户端判为“该条目不可
+    //     用”，于是把本地已经缓存的播放记录、进度条和播放按钮一起清掉
+    //     （用户反复反馈的“部署后播放记录丢失 / 详情页没有播放按钮”）。
+    //   - MediaSources 为空时客户端会把播放按钮整个藏掉（“详情页有时没有
+    //     按钮”）。
+    // 统一改回与“解析中”完全一致的按需线路：Path 指向本服务自己的取流接口
+    // 且不带 source 参数，真正播放时 /Videos/{id}/stream 会现场解析真实地址
+    // 再转发；PlayAccess 保持 Full；ETag 带 20 秒时间桶（pendingSources），
+    // 客户端最迟 20 秒后重进详情页就会重新拉取，上游恢复或新片源上线时能自动
+    // 变成真实线路，也不会再清空本地播放记录。
+    const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
+    item.MediaSources = sources;
+    item.MediaStreams = sources[0].MediaStreams;
+    item.MediaSourceCount = sources.length;
+    item.Container = sources[0].Container;
+    item.Path = sources[0].Path;
+    item.HasSubtitles = subtitles.length > 0;
+    // 艺术图同样按 20 秒时间桶换 tag，客户端重进详情页时会重新取图。
+    refreshDetailBackdropTags(item);
+    return itemJsonResponse(item, request, { pendingSources: true });
   }
   const mediaSources = mediaSourcesForVideo(
     item,
@@ -6835,7 +7095,10 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   item.MediaSourceCount = mediaSources.length;
   item.Container = source.Container;
   item.HasSubtitles = subtitles.length > 0;
-  return itemJsonResponse(item, request);
+  // 详情页每 20 秒允许客户端刷新一次：解析完成后重新进入能拿到最新线路、
+  // 字幕轨和艺术图，而不是客户端本地库里那份上一次部署时的旧 DTO。
+  refreshDetailBackdropTags(item);
+  return itemJsonResponse(item, request, { refreshSources: true });
 }
 
 function itemQuery(items, startIndex = 0) {
@@ -7667,7 +7930,23 @@ async function playbackStateKey(env, token) {
   // SESSION 里可能存着升级前写的“无部署标记”key。把它映射到本部署的同名
   // 分桶（随后由收养逻辑把旧数据整份复制过来）；绝不能直接换成 token 分桶，
   // 那等于把用户已有的观看记录丢掉。
-  if (key === PLAYBACK_STATE_KEY || key.startsWith(`${PLAYBACK_STATE_KEY}:`)) {
+  //
+  // ⚠️ 这里的判定顺序曾经写反了：先判断“key 是否以 PLAYBACK_STATE_KEY 开头”，
+  // 而 `playback-state-v1:pages:u:<hash>` 也满足这个条件，于是又被拼了一次
+  // 部署标记，得到 `playback-state-v1:pages:pages:u:<hash>`。
+  // 客户端此后读写的永远是一个空分桶，用户看到的就是“部署新代码后播放记录
+  // 全部消失”。必须先收敛“重复拼出来的标记”，再给“确实没有标记的旧 key”补标记。
+  const tag = playbackDeployTag(env);
+  if (tag) {
+    // playback-state-v1:pages:pages:u:<hash> → playback-state-v1:pages:u:<hash>
+    const doubled = `${keyPrefix}:${tag}`;
+    while (key.startsWith(`${doubled}:`) || key === doubled) {
+      key = keyPrefix + key.slice(doubled.length);
+    }
+  }
+  if (key.startsWith(`${keyPrefix}:`) || key === keyPrefix) {
+    // 已经是本部署的分桶，原样保留。
+  } else if (key === PLAYBACK_STATE_KEY || key.startsWith(`${PLAYBACK_STATE_KEY}:`)) {
     key = `${keyPrefix}${key.slice(PLAYBACK_STATE_KEY.length)}`;
   }
   if (!key.startsWith(`${keyPrefix}:`) && key !== keyPrefix) {
@@ -8565,6 +8844,14 @@ async function streamResponse(id, request, env, fetchImpl, token, ctx = null) {
 
     const triedSources = new Set();
     let lastStatus = 404;
+    // “拿到上游响应头”的总预算：多线路逐条换线时共用，避免所有线路都挂起时
+    // 请求无限延长。重试一轮前会重置。
+    let streamHeadersDeadline = Date.now() +
+      positiveEnvMilliseconds(
+        env,
+        "STREAM_HEADERS_BUDGET_MS",
+        STREAM_HEADERS_BUDGET_MS,
+      );
     const tryVideo = async (video) => {
       const candidates = [video, ...(video?.alternates || [])].filter(Boolean);
       for (const candidate of candidates) {
@@ -8607,7 +8894,7 @@ async function streamResponse(id, request, env, fetchImpl, token, ctx = null) {
           sourceUrl.toString(),
           env,
           fetchImpl,
-          { hlsManifest },
+          { hlsManifest, headersDeadline: streamHeadersDeadline },
         );
         if (
           !upstream.ok &&
@@ -8652,12 +8939,61 @@ async function streamResponse(id, request, env, fetchImpl, token, ctx = null) {
     }
 
     const movieForStream = await getMovieCached(id, env, fetchImpl, token);
-    const resolvedVideo = await resolveVideoCached(
+    const streamPartial = { video: null };
+    let streamPartialSignal = null;
+    const streamPartialReady = new Promise((resolve) => {
+      streamPartialSignal = resolve;
+    });
+    const streamResolveTask = resolveVideoCached(
       movieForStream,
       env,
       fetchImpl,
       ctx,
+      {
+        onPartial: (video) => {
+          streamPartial.video = video;
+          if (streamPartialSignal) {
+            try {
+              streamPartialSignal();
+            } catch {
+              // 唤醒失败不影响解析。
+            }
+          }
+        },
+      },
     );
+    let resolvedVideo = null;
+    // 与 resolveVideoForResponse 同样“不等自建补源收尾”：公共线路一到就用它
+    // 起播，避免客户端点播放后长时间收不到任何字节而弹
+    // “Connection timeout, try again later”。补源在后台继续跑并写缓存。
+    const streamEarly = await withTimeout(
+      Promise.race([
+        streamResolveTask.then(
+          (video) => ({ kind: "done", video }),
+          () => ({ kind: "unfinished" }),
+        ),
+        streamPartialReady.then(
+          () => new Promise((resolve) => {
+            setTimeout(() => resolve({ kind: "partial" }), 300);
+          }),
+        ),
+      ]),
+      positiveEnvMilliseconds(
+        env,
+        "STREAM_RESOLVE_BUDGET_MS",
+        STREAM_RESOLVE_BUDGET_MS,
+      ),
+    ).catch(() => null);
+    if (streamEarly && streamEarly.kind === "done") {
+      resolvedVideo = streamEarly.video;
+    } else {
+      // 快照已到但补源没收尾，或预算彻底用尽：后台继续跑完并写缓存。
+      // 本次先用已经解析出的线路试播（有就立即播放），客户端重试时命中缓存。
+      keepAlive(streamResolveTask.catch(() => null), ctx);
+      resolvedVideo = isUsableResolvedVideo(streamPartial.video)
+        ? streamPartial.video
+        : await peekPartialResolvedVideo(movieForStream, env);
+    }
     const response = await tryVideo(selectedPlaybackVideo(resolvedVideo, id, requestUrl));
     if (response) {
       return response;
@@ -8667,12 +9003,27 @@ async function streamResponse(id, request, env, fetchImpl, token, ctx = null) {
     if (resolvedVideo) {
       await forgetResolveVideoCache(movieForStream, env);
       triedSources.clear();
-      const retriedVideo = await resolveVideoCached(
-        movieForStream,
-        env,
-        fetchImpl,
-        ctx,
-      );
+      // 这是“上一次拿到的直链已经失效/上游不回响应头”的补救机会：
+      // 重新给一份换线预算，让重新解析出来的线路有机会真的连上。
+      streamHeadersDeadline = Date.now() +
+        positiveEnvMilliseconds(
+          env,
+          "STREAM_HEADERS_BUDGET_MS",
+          STREAM_HEADERS_BUDGET_MS,
+        );
+      let retriedVideo = null;
+      try {
+        retriedVideo = await withTimeout(
+          resolveVideoCached(movieForStream, env, fetchImpl, ctx),
+          positiveEnvMilliseconds(
+            env,
+            "STREAM_RESOLVE_RETRY_BUDGET_MS",
+            STREAM_RESOLVE_RETRY_BUDGET_MS,
+          ),
+        );
+      } catch {
+        retriedVideo = null;
+      }
       const retriedResponse = await tryVideo(selectedPlaybackVideo(retriedVideo, id, requestUrl));
       if (retriedResponse) {
         return retriedResponse;
@@ -9855,31 +10206,24 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       }
 
       if (!video) {
-        if (!videoResolution.resolutionFinished || videoResolution.error) {
-          // 详情页已经下发了一条“按需线路”占位（避免客户端藏掉播放按钮），
-          // 这里必须给出同一条线路和 PlaySessionId：如果继续回 503，用户
-          // 明明看到播放按钮，一点却弹 “Connection timeout, try again later”。
-          // 占位线路的 Path 不带 source 参数，播放时由取流接口现场解析，
-          // 所以生成播放会话是安全的，不会出现“拿空列表播放”的情况。
-          const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
-          const playSessionId = crypto.randomUUID();
-          rememberPlaySession(
-            await playbackStateKey(env, playbackToken),
-            item.Id,
-            playSessionId,
-          );
-          return jsonResponse({
-            PlaySessionId: playSessionId,
-            ItemId: item.Id,
-            MediaSources: sources,
-            MediaSourceCount: sources.length,
-          });
-        }
-        // 解析已完成且上游明确没有可播放源。这是稳定结果，不创建播放会话。
+        // 与详情页保持一致：无论是「还在后台解析」「刚才是超时/上游失败」还是
+        // 「解析已经跑完但这一轮没有可用线路」，都返回同一条按需占位线路 +
+        // 播放会话。绝不能回空 MediaSources：Emby 客户端会把它判为播放失败，
+        // 弹 “Connection timeout, try again later”，并把本地播放记录/进度条
+        // 一起清掉。占位线路的 Path 不带 source 参数，播放时由 /Videos/{id}/stream
+        // 现场解析真实地址并转发，所以生成播放会话是安全的。
+        const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
+        const playSessionId = crypto.randomUUID();
+        rememberPlaySession(
+          await playbackStateKey(env, playbackToken),
+          item.Id,
+          playSessionId,
+        );
         return jsonResponse({
-          PlaySessionId: "",
+          PlaySessionId: playSessionId,
           ItemId: item.Id,
-          MediaSources: [],
+          MediaSources: sources,
+          MediaSourceCount: sources.length,
         });
       }
       const mediaSources = mediaSourcesForVideo(
@@ -10013,6 +10357,7 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
 export function resetEmbyCachesForTests() {
   MOVIE_CACHE.clear();
   RESOLVE_VIDEO_CACHE.clear();
+  PARTIAL_RESOLVE_CACHE.clear();
   RESOLVE_SUBTITLE_CACHE.clear();
   LIST_CACHE.clear();
   LIST_WINDOW_CACHE.clear();
