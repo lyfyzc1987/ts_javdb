@@ -281,7 +281,7 @@ function createGatedMultiSourceResolve() {
   };
 }
 
-function expectedItemEtag(payload) {
+function expectedItemEtag(payload, options = {}) {
   const userData = payload?.UserData || {};
   const sources = Array.isArray(payload?.MediaSources)
     ? payload.MediaSources.map((source) => ({
@@ -294,7 +294,11 @@ function expectedItemEtag(payload) {
     }))
     : [];
   const stableDto = {
-    version: "item-dto-v12",
+    version: "item-dto-v13",
+    // 播放源仍在后台解析时，生产代码会把 20 秒时间桶拼进指纹，这里同步复现。
+    ...(options.pendingSources === true
+      ? { PendingSourcesBucket: Math.floor(Date.now() / (20 * 1000)) }
+      : {}),
     Id: payload?.Id || "",
     Name: payload?.Name || "",
     OriginalTitle: payload?.OriginalTitle || "",
@@ -1407,10 +1411,24 @@ test("returns a retryable detail response while cold resolution continues", asyn
   assert.equal(first.headers.get("x-emby-retryable"), null);
   assert.equal(firstPayload.Id, "42");
   assert.equal(firstPayload.PlayAccess, "Full");
-  assert.equal(firstPayload.MediaSourceCount, 0);
-  assert.deepEqual(firstPayload.MediaSources, []);
+  // 解析未完成时下发一条“按需线路”占位：客户端只在 MediaSources 非空时
+  // 才显示播放按钮（空列表会被整个藏掉），这条占位源播放时由取流接口
+  // 现场解析真实地址，不会播到假地址。
+  assert.equal(firstPayload.MediaSourceCount, 1);
+  assert.equal(firstPayload.MediaSources.length, 1);
+  assert.equal(firstPayload.MediaSources[0].Name, "自动线路（解析中）");
+  // 占位线路的 Path 必须指向本服务的取流接口且不带 source 参数，
+  // 否则客户端会去播一个伪造的上游地址。
+  assert.match(firstPayload.MediaSources[0].Path, /\/Videos\/42\/stream\.mp4\?/);
+  assert.equal(
+    new URL(firstPayload.MediaSources[0].Path).searchParams.has("source"),
+    false,
+  );
   assert.equal(typeof firstPayload.UserData, "object");
-  assert.equal(firstPayload.Etag, expectedItemEtag(firstPayload));
+  assert.equal(
+    firstPayload.Etag,
+    expectedItemEtag(firstPayload, { pendingSources: true }),
+  );
   assert.equal(
     [...db.rows.keys()].some((key) => key.startsWith("video-persist-v1\u0000")),
     false,
@@ -1609,7 +1627,7 @@ test("keeps an oversized inline HLS line without scanning the whole manifest", a
   assert.ok(segmentProbes <= 4);
 });
 
-test("does not create a playback session when PlaybackInfo must be retried", async () => {
+test("returns a placeholder playback session while PlaybackInfo resolution continues", async () => {
   const db = createPlaybackD1();
   const fixture = createGatedMultiSourceResolve();
   const env = {
@@ -1624,11 +1642,15 @@ test("does not create a playback session when PlaybackInfo must be retried", asy
     fixture.fetchImpl,
   );
   const firstPayload = await first.json();
-  assert.equal(first.status, 503);
-  assert.equal(first.headers.get("retry-after"), "1");
-  assert.equal(first.headers.get("x-emby-retryable"), "1");
-  assert.equal(firstPayload.ErrorCode, "ServiceUnavailable");
-  assert.equal("PlaySessionId" in firstPayload, false);
+  // 详情页已经给了“按需线路”占位，PlaybackInfo 继续回 503 会让用户在
+  // 有点击按钮的情况下看到 “Connection timeout, try again later”。
+  // 所以这里返回同一条占位线路 + 一个真实 PlaySessionId。
+  assert.equal(first.status, 200);
+  assert.equal(first.headers.get("retry-after"), null);
+  assert.equal(first.headers.get("x-emby-retryable"), null);
+  assert.ok(firstPayload.PlaySessionId);
+  assert.equal(firstPayload.MediaSources.length, 1);
+  assert.equal(firstPayload.MediaSources[0].Name, "自动线路（解析中）");
 
   const deleted = await callLocalEmby(
     embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"),
@@ -1640,7 +1662,9 @@ test("does not create a playback session when PlaybackInfo must be retried", asy
     .bind("tombstone", "playback-state-v1:removed-v2")
     .first();
   const tombstone = JSON.parse(tombstoneRow.value);
-  assert.equal(tombstone["42"].playSessionId, "");
+  // 移除记录时会记下当前正在使用的播放会话（这里是刚下发的占位会话），
+  // 之后同一会话的残留进度上报会被墓碑挡掉。
+  assert.equal(tombstone["42"].playSessionId, firstPayload.PlaySessionId);
 
   await fixture.resolverStarted;
   fixture.releaseResolver();
@@ -1728,6 +1752,189 @@ test("returns an authoritative empty result after source resolution completes", 
   assert.equal(playback.status, 200);
   assert.equal(playbackPayload.PlaySessionId, "");
   assert.deepEqual(playbackPayload.MediaSources, []);
+});
+
+test("buckets the pending detail ETag so clients refresh within 20 seconds", async () => {
+  const fixture = createGatedMultiSourceResolve();
+  const env = { ITEM_DETAIL_RESOLVE_BUDGET_MS: 40 };
+  const realNow = Date.now;
+  const base = realNow.call(Date);
+  try {
+    Date.now = () => base;
+    const first = await handleProxy(
+      new Request("https://clone.example/Items/42"),
+      env,
+      {},
+      fixture.fetchImpl,
+    );
+    const firstPayload = await first.json();
+    assert.equal(first.status, 200);
+    assert.equal(firstPayload.MediaSources.length, 1);
+    assert.equal(firstPayload.MediaSources[0].Name, "自动线路（解析中）");
+
+    // 同一个 20 秒桶内 ETag 稳定，但“解析中”绝不回 304：客户端把整份 DTO
+    // 存在本地库里，304 会让它继续用没有播放按钮的旧副本。
+    const sameBucket = await handleProxy(
+      new Request("https://clone.example/Items/42", {
+        headers: { "if-none-match": firstPayload.Etag },
+      }),
+      env,
+      {},
+      fixture.fetchImpl,
+    );
+    assert.equal(sameBucket.status, 200);
+    assert.equal((await sameBucket.json()).Etag, firstPayload.Etag);
+
+    // 跨过 20 秒桶后 ETag 必须变化，客户端重新进详情页才会刷新。
+    Date.now = () => base + 20 * 1000;
+    const later = await handleProxy(
+      new Request("https://clone.example/Items/42", {
+        headers: { "if-none-match": firstPayload.Etag },
+      }),
+      env,
+      {},
+      fixture.fetchImpl,
+    );
+    assert.equal(later.status, 200);
+    assert.notEqual((await later.json()).Etag, firstPayload.Etag);
+  } finally {
+    Date.now = realNow;
+    fixture.releaseResolver();
+  }
+});
+
+test("keeps Worker and Pages playback records separate on one shared D1", async () => {
+  const db = createPlaybackD1();
+  const workerEnv = { PLAYBACK_DB: db, PLAYBACK_DEPLOY_TAG: "worker" };
+  const pagesEnv = { PLAYBACK_DB: db, PLAYBACK_DEPLOY_TAG: "pages" };
+
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-worker",
+    PositionTicks: 60_000_000,
+  }), workerEnv);
+
+  const workerRead = await callLocalEmby(
+    new Request("https://clone.example/emby/Items/42/UserData"),
+    workerEnv,
+  );
+  assert.equal((await workerRead.json()).PlaybackPositionTicks, 60_000_000);
+  assert.equal(
+    db.rows.has("playback\u0000playback-state-v1:worker"),
+    true,
+  );
+
+  // Pages 绑定同一个 D1，但分桶带自己的部署标记，读不到 Worker 的记录。
+  resetEmbyCachesForTests();
+  const pagesRead = await callLocalEmby(
+    new Request("https://clone.example/emby/Items/42/UserData"),
+    pagesEnv,
+  );
+  assert.equal((await pagesRead.json()).PlaybackPositionTicks, 0);
+  // 只读取不会凭空建分桶，更不能把 Worker 的记录搬到 Pages 名下。
+  assert.equal(
+    db.rows.has("playback\u0000playback-state-v1:worker"),
+    true,
+  );
+
+  // 反过来也一样：Pages 写入的记录不会出现在 Worker 上。
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "77",
+    PlaySessionId: "session-pages",
+    PositionTicks: 30_000_000,
+  }), pagesEnv);
+  resetEmbyCachesForTests();
+  const workerAfter = await callLocalEmby(
+    new Request("https://clone.example/emby/Items/77/UserData"),
+    workerEnv,
+  );
+  assert.equal((await workerAfter.json()).PlaybackPositionTicks, 0);
+});
+
+test("adopts the legacy shared bucket once so deletions stay deleted", async () => {
+  const db = createPlaybackD1();
+  // 旧版本没有部署标记，Worker 与 Pages 共用这个分桶。
+  db.rows.set(
+    "playback\u0000playback-state-v1",
+    JSON.stringify({
+      "42": {
+        itemId: "42",
+        positionTicks: 120_000_000,
+        played: false,
+        playCount: 0,
+        lastPlayedDate: "",
+      },
+    }),
+  );
+  const env = { PLAYBACK_DB: db, PLAYBACK_DEPLOY_TAG: "worker" };
+
+  // 升级后第一次读取：把旧分桶整份收养过来，用户不会看到记录凭空消失。
+  const adopted = await callLocalEmby(
+    new Request("https://clone.example/emby/Items/42/UserData"),
+    env,
+  );
+  assert.equal((await adopted.json()).PlaybackPositionTicks, 120_000_000);
+
+  await callLocalEmby(
+    embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"),
+    env,
+  );
+  const afterDelete = await callLocalEmby(
+    new Request("https://clone.example/emby/Items/42/UserData"),
+    env,
+  );
+  assert.equal((await afterDelete.json()).PlaybackPositionTicks, 0);
+
+  // 换一个全新实例（内存全空）：收养标记已经落在 D1 里，旧分桶不能再被
+  // 重新收养，否则用户刚删掉的记录又会被历史数据灌回来。
+  resetEmbyCachesForTests();
+  const fresh = await callLocalEmby(
+    new Request("https://clone.example/emby/Items/42/UserData"),
+    env,
+  );
+  assert.equal((await fresh.json()).PlaybackPositionTicks, 0);
+});
+
+test("moves a legacy session stateKey into the tagged bucket without losing records", async () => {
+  const db = createPlaybackD1();
+  const env = { PLAYBACK_DB: db, PLAYBACK_DEPLOY_TAG: "worker" };
+  const username = "legacy-session-user";
+  const usernameHash = createHash("md5").update(username).digest("hex");
+  const legacyKey = `playback-state-v1:u:${usernameHash}`;
+  const token = "legacy-session-token";
+  const tokenHash = createHash("md5").update(token).digest("hex");
+
+  // 升级前的 SESSION 记录直接把无标记 key 存进了 stateKey。
+  db.rows.set(
+    `session-user\u0000session-user:v1:${tokenHash}`,
+    JSON.stringify({ at: Date.now(), username, trusted: true, stateKey: legacyKey }),
+  );
+  db.rows.set(
+    `playback\u0000${legacyKey}`,
+    JSON.stringify({
+      "42": {
+        itemId: "42",
+        positionTicks: 900_000_000,
+        played: false,
+        lastPlayedDate: "2026-10-05T10:00:00.000Z",
+      },
+    }),
+  );
+
+  const readBack = await callLocalEmby(
+    new Request("https://clone.example/emby/Items/42/UserData", {
+      headers: { "X-MediaBrowser-Token": token },
+    }),
+    env,
+  );
+  assert.equal(readBack.status, 200);
+  // 记录不能因为换了分桶 key 就消失。
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 900_000_000);
+  // 之后读写都落在带部署标记的分桶上。
+  assert.equal(
+    db.rows.has(`playback\u0000playback-state-v1:worker:u:${usernameHash}`),
+    true,
+  );
 });
 
 test("forwards Emby access tokens to JavDB catalog requests", async () => {
@@ -5525,8 +5732,29 @@ test("exposes upstream preview images as Emby backdrop art", async () => {
   );
   const payload = await detail.json();
   assert.equal(detail.status, 200);
-  // 客户端凭这两个 tag 才知道“艺术图”区块有几张图。
-  assert.deepEqual(payload.BackdropImageTags, ["0", "1"]);
+  // 客户端凭这些 tag 才知道“艺术图”区块有几张图。
+  // 第一张固定是资源封面，后面才是预览剧照。
+  assert.deepEqual(payload.BackdropImageTags, ["0", "1", "2"]);
+
+  let coverBackdropUrl;
+  const coverImage = await handleProxy(
+    new Request("https://clone.example/Items/42/Images/Backdrop/0"),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return movieResponse();
+      }
+      coverBackdropUrl = target;
+      return new Response(encryptedImageBytes, {
+        headers: { "content-type": "binary/octet-stream" },
+      });
+    },
+  );
+  assert.equal(coverImage.status, 200);
+  // 艺术图第一张改成资源封面。
+  assert.equal(coverBackdropUrl, "https://jdforrepam.com/covers/test.jpg");
 
   let backdropUrl;
   const image = await handleProxy(
@@ -5545,8 +5773,8 @@ test("exposes upstream preview images as Emby backdrop art", async () => {
     },
   );
   assert.equal(image.status, 200);
-  // 艺术图取上游预览剧照的大图，而不是封面。
-  assert.equal(backdropUrl, "https://jdforrepam.com/samples/test_l_1.jpg");
+  // 封面占掉第一位后，下标 1 起才是上游预览剧照的大图。
+  assert.equal(backdropUrl, "https://jdforrepam.com/samples/test_l_0.jpg");
   assert.equal(image.headers.get("content-type"), "image/jpeg");
   assert.deepEqual(new Uint8Array(await image.arrayBuffer()), imageBytes);
 });

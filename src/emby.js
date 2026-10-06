@@ -116,10 +116,16 @@ const MAX_HLS_REWRITE_DEPTH = 8;
 const HLS_PLAYLIST_SCAN_MAX_CHARS = 64 * 1024;
 const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // DTO 结构变化时提升版本，客户端会把它当成新的实体版本并刷新旧详情页缓存。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v12";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v13";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-06-search-playable-4";
+const SERVER_BUILD_ID = "2026-10-06-detail-refresh-backdrop-5";
+// 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
+// ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
+// Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
+// 有了这个桶，用户退出详情页 ~20 秒后再进来，客户端一定会重新拉一份
+// （此时后台解析通常已经完成，播放按钮和全部线路都会出现）。
+const PENDING_SOURCES_ETAG_BUCKET_MS = 20 * 1000;
 const REMOTE_HLS_PROBE_TIMEOUT_MS = 3500;
 // 整个“播放源可用性校验”的总预算。校验是逐条线路探测上游分片，慢 CDN 上
 // 单条就可能超过 3 秒；如果让所有线路都校验完再返回，冷启动详情/PlaybackInfo
@@ -162,7 +168,7 @@ const HOME_MAX_SOURCE_PAGES = 40;
 const SEARCH_SOURCE_PAGE_SIZE = 50;
 // 上游在第 20 页（limit=50 时）会返回空页，循环会自然结束；给一个宽松上界即可。
 const SEARCH_MAX_SOURCE_PAGES = 40;
-// 详情页“艺术图（Backdrop）”最多暴露多少张上游预览剧照。
+// 详情页“艺术图（Backdrop）”最多暴露多少张图（含固定排在第一位的资源封面）。
 const BACKDROP_IMAGE_LIMIT = 20;
 const IMAGE_CONTENT_TYPES = new Map([
   [".avif", "image/avif"],
@@ -3652,18 +3658,23 @@ function movieTaglines(movie) {
 // 有剧照才返回，没剧照就不给 BackdropImageTags，避免客户端显示空白区块。
 // 注意：只有 /v4/movies/{id} 详情接口会返回真实图片地址；
 // /v2/search 的列表项只带 has_preview_images 标记，preview_images 是空数组。
+// 第一张固定用资源封面（用户要求“艺术图第一张改成资源封面”），后面才是预览剧照。
 function movieBackdropImages(movie) {
   const raw = movie?.preview_images;
-  if (!Array.isArray(raw)) {
+  if (!Array.isArray(raw) || raw.length === 0) {
     return [];
   }
   const urls = [];
+  const cover = String(movie?.cover_url || movie?.thumb_url || "").trim();
+  if (cover) {
+    urls.push(cover);
+  }
   for (const entry of raw) {
     const value = typeof entry === "string"
       ? entry
       : entry?.large_url || entry?.thumb_url || entry?.url || "";
     const url = String(value || "").trim();
-    if (url) {
+    if (url && !urls.includes(url)) {
       urls.push(url);
     }
     if (urls.length >= BACKDROP_IMAGE_LIMIT) {
@@ -3673,7 +3684,9 @@ function movieBackdropImages(movie) {
   return urls;
 }
 
-function itemEtag(item) {
+// pendingSources=true 表示“播放源还在后台解析”，此时把 20 秒的时间桶拼进
+// ETag 的指纹里，客户端最多 20 秒就能看到一次版本变化并重拉详情。
+function itemEtag(item, options = {}) {
   const userData = item?.UserData || {};
   const sources = Array.isArray(item?.MediaSources)
     ? item.MediaSources.map((source) => ({
@@ -3687,6 +3700,15 @@ function itemEtag(item) {
     : [];
   const stableDto = {
     version: ITEM_DTO_ETAG_VERSION,
+    // 只在“解析中”时才带这个字段：解析完成的 DTO 指纹保持与旧版一致，
+    // 客户端不会因为多了一个无意义字段而反复刷新。
+    ...(options.pendingSources === true
+      ? {
+        PendingSourcesBucket: Math.floor(
+          Date.now() / PENDING_SOURCES_ETAG_BUCKET_MS,
+        ),
+      }
+      : {}),
     Id: item?.Id || "",
     Name: item?.Name || "",
     OriginalTitle: item?.OriginalTitle || "",
@@ -3720,8 +3742,9 @@ function requestHasMatchingEtag(request, etag) {
   );
 }
 
-function itemJsonResponse(item, request) {
-  const etag = itemEtag(item);
+function itemJsonResponse(item, request, options = {}) {
+  const pendingSources = options.pendingSources === true;
+  const etag = itemEtag(item, { pendingSources });
   item.Etag = etag;
   const headers = {
     etag,
@@ -3729,7 +3752,10 @@ function itemJsonResponse(item, request) {
     expires: "0",
     pragma: "no-cache",
   };
-  if (requestHasMatchingEtag(request, etag)) {
+  // 播放源还没解析完时绝不回 304：Emby 客户端把整份 DTO 存在本地库里，
+  // 304 会让它继续用“没有播放源、没有播放按钮”的旧副本。
+  // 始终回 200 + 变化的 ETag，客户端才会在重新进入详情页时替换成最新内容。
+  if (!pendingSources && requestHasMatchingEtag(request, etag)) {
     return new Response(null, {
       status: 304,
       headers: {
@@ -6191,6 +6217,27 @@ function mediaSourcesForVideo(item, requestUrl, token, video, subtitles = []) {
     ));
 }
 
+// 播放源还在后台解析时用的“按需线路”。
+// Emby 客户端在 MediaSources 为空时会把播放按钮整个藏掉（用户看到的
+// “详情页没有按钮”），所以这里给一条真实可用的线路兜底：
+// Path 指向本服务自己的取流接口，且不带 source 参数——真正播放时
+// /Videos/{id}/stream 会现场解析真实地址再转发，不会播到假地址。
+// 解析完成后客户端重新进入详情页就会拿到全部真实线路。
+const PENDING_MEDIA_SOURCE_NAME = "自动线路（解析中）";
+
+function pendingMediaSources(item, requestUrl, token, subtitles = []) {
+  return [
+    mediaSource(
+      item,
+      requestUrl,
+      token,
+      { sourceName: PENDING_MEDIA_SOURCE_NAME },
+      subtitles,
+      item.Id,
+    ),
+  ];
+}
+
 function authenticationResponse(request, env, user, token) {
   const sessionId = crypto.randomUUID();
   return jsonResponse({
@@ -6590,17 +6637,22 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
 
   if (!video) {
     if (!resolutionFinished || videoResolution.error) {
-      // 解析还在后台继续，或上游临时失败。绝不能用 503 / PlayAccess=None /
-      // 空 MediaSources 当作最终结果返回：Emby 客户端会把整次详情请求判为失败，
-      // 于是把已经缓存的播放记录、进度条和播放按钮一起清掉（用户已多次遇到）。
-      // 这里照常返回元数据（mapMovie 默认 PlayAccess=Full、UserData 里带进度），
-      // 详情页立刻可用且不报错；真正的线路由后台解析写进缓存，用户点播放时
-      // 由 /PlaybackInfo 命中缓存返回。只有“解析已完成且确实没有任何线路”才
-      // 标成不可播放（见下面的分支）。
-      item.MediaSources = [];
-      item.MediaSourceCount = 0;
+      // 解析还在后台继续，或上游临时失败。绝不能返回 503 / PlayAccess=None：
+      // Emby 客户端会把整次详情请求判为失败，于是把已经缓存的播放记录、
+      // 进度条和播放按钮一起清掉（用户已多次遇到）。
+      // 但也不能只回空 MediaSources：客户端在 MediaSources 为空时会把播放
+      // 按钮整个藏掉（用户反馈的“详情页有时没有按钮”）。所以这里给一条
+      // “按需线路”占位——它的 Path 指向本服务自己的取流接口，真正播放时
+      // 现场解析真实地址，不会播到假地址；同时用 pendingSources 让 ETag
+      // 带 20 秒时间桶，客户端最迟 20 秒后重进详情页就会刷新出全部真实线路。
+      const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
+      item.MediaSources = sources;
+      item.MediaStreams = sources[0].MediaStreams;
+      item.MediaSourceCount = sources.length;
+      item.Container = sources[0].Container;
+      item.Path = sources[0].Path;
       item.HasSubtitles = subtitles.length > 0;
-      return itemJsonResponse(item, request);
+      return itemJsonResponse(item, request, { pendingSources: true });
     }
     // 解析已完成但确实没有可播放源：明确标成不可播放，避免客户端去请求播放。
     // 这是权威的“无源”结果，不是解析超时，因此可以安全覆盖旧状态。
@@ -6667,6 +6719,22 @@ function noContentResponse() {
   });
 }
 const PLAYBACK_STATE_KEY = "playback-state-v1";
+
+// Worker 与 Pages 是两个独立部署，却绑定同一个 D1/KV。用户要求“两边观看记录
+// 不要互通”，所以每个部署在自己的配置里给一个 PLAYBACK_DEPLOY_TAG，
+// 由它拼进播放记录的存储 key（进度状态、删除墓碑、播放会话都跟着走）。
+// 带标记的分桶互不读写；token -> 用户名 的映射仍然共用，那只是身份信息，
+// 不是观看记录本身。
+function playbackDeployTag(env) {
+  const raw = String((env && env.PLAYBACK_DEPLOY_TAG) || "").trim().toLowerCase();
+  return /^[a-z0-9_-]{1,16}$/.test(raw) ? raw : "";
+}
+
+function playbackKeyPrefix(env) {
+  const tag = playbackDeployTag(env);
+  return tag ? `${PLAYBACK_STATE_KEY}:${tag}` : PLAYBACK_STATE_KEY;
+}
+
 const PLAYBACK_MAX_RESUME_ITEMS = 30;
 // 进度距片尾不足 2 分钟也视为“已看完”：部分客户端在结尾前几秒/一两分钟退出时
 // 不会上报 PlayedToCompletion，若仍按“没看完”处理会残留进度条并出现在“继续播放”里。
@@ -7054,7 +7122,7 @@ async function soleUsernamePlaybackKey(env) {
       .prepare(
         "SELECT key FROM playback_json WHERE namespace = ? AND key LIKE ? LIMIT 2",
       )
-      .bind(EDGE_NAMESPACE_PLAYBACK, `${PLAYBACK_STATE_KEY}:u:%`)
+      .bind(EDGE_NAMESPACE_PLAYBACK, `${playbackKeyPrefix(env)}:u:%`)
       .all();
     const list = Array.isArray(rows?.results) ? rows.results : [];
     if (list.length === 1 && list[0] && typeof list[0].key === "string") {
@@ -7137,7 +7205,11 @@ async function scanPlaybackBuckets(env) {
     .prepare(
       "SELECT key, value FROM playback_json WHERE namespace = ? AND key LIKE ? LIMIT ?",
     )
-    .bind(EDGE_NAMESPACE_PLAYBACK, `${PLAYBACK_STATE_KEY}%`, PLAYBACK_MIGRATION_MAX_BUCKET_ROWS)
+    .bind(
+      EDGE_NAMESPACE_PLAYBACK,
+      `${playbackKeyPrefix(env)}%`,
+      PLAYBACK_MIGRATION_MAX_BUCKET_ROWS,
+    )
     .all();
   const list = Array.isArray(rows?.results) ? rows.results : [];
   const buckets = new Map();
@@ -7219,9 +7291,10 @@ async function migrateLegacyPlaybackBuckets(env, username, token, destinationKey
   }
   const buckets = await scanPlaybackBuckets(env);
   const sourceKeys = [];
+  const keyPrefix = playbackKeyPrefix(env);
   for (const key of buckets.keys()) {
     if (key === destinationKey) continue;
-    const suffix = key.slice(PLAYBACK_STATE_KEY.length);
+    const suffix = key.slice(keyPrefix.length);
     // 别的账号的用户名分桶绝不合并。
     if (suffix.startsWith(":u:")) continue;
     if (TOKEN_BUCKET_SUFFIX_RE.test(suffix)) {
@@ -7289,7 +7362,7 @@ async function migrateLegacyPlaybackBuckets(env, username, token, destinationKey
 // 不给每个请求都加一次全表扫描。
 async function ensureLegacyPlaybackMigration(env, token, username, key) {
   if (!username || !token || !key) return;
-  if (!key.startsWith(`${PLAYBACK_STATE_KEY}:u:`)) return;
+  if (!key.startsWith(`${playbackKeyPrefix(env)}:u:`)) return;
   if (!playbackDb(env)) return;
   const guard = `${key}|${playbackTokenPart(token)}`;
   if (MEMORY_PLAYBACK_MIGRATION_GUARDS.has(guard)) return;
@@ -7318,10 +7391,86 @@ async function ensureLegacyPlaybackMigration(env, token, username, key) {
   }
 }
 
+// —— 升级前“共享分桶”的一次性收养 ——
+// 旧版本的 key 里没有部署标记，Worker 与 Pages 因此共用同一份播放记录。
+// 现在两边各用带标记的分桶后，旧分桶在新分桶里是看不到的。用户对“记录消失”
+// 非常敏感，所以每个部署在首次为某个账号建桶时，把旧的无标记分桶整份复制
+// 一次（连同删除墓碑），之后各写各的、互不影响。
+// 用 SESSION 表里的标记保证“只收养一次”：否则用户把记录删空后（分桶变空），
+// 旧分桶的数据会被重新灌回来——正是“删除记录后又出现”的老问题。
+const MEMORY_LEGACY_ADOPT_GUARDS = new Set();
+
+function legacyAdoptMarkerKey(env, key) {
+  const tag = playbackDeployTag(env) || "shared";
+  return `${SESSION_USER_KEY_PREFIX}${PLAYBACK_MIGRATION_MARKER_PREFIX}adopt:${
+    md5(`${tag}|${key}`)
+  }`;
+}
+
+// 去掉部署标记后得到的旧 key（两者指向同一批历史数据）。
+function legacyUntaggedPlaybackKey(env, key) {
+  const prefix = playbackKeyPrefix(env);
+  if (!key.startsWith(prefix)) return "";
+  const legacy = PLAYBACK_STATE_KEY + key.slice(prefix.length);
+  return legacy === key ? "" : legacy;
+}
+
+async function adoptLegacyPlaybackBucket(env, key) {
+  const legacyKey = legacyUntaggedPlaybackKey(env, key);
+  if (!legacyKey) return;
+  const marker = legacyAdoptMarkerKey(env, key);
+  if (MEMORY_LEGACY_ADOPT_GUARDS.has(marker)) return;
+  try {
+    if (await durableJsonRead(env, EDGE_NAMESPACE_SESSION, marker)) {
+      MEMORY_LEGACY_ADOPT_GUARDS.add(marker);
+      return;
+    }
+    const existing = await durableJsonRead(env, EDGE_NAMESPACE_PLAYBACK, key);
+    const hasOwn = existing && typeof existing === "object" &&
+      Object.keys(existing).length > 0;
+    const legacy = hasOwn
+      ? undefined
+      : await durableJsonRead(env, EDGE_NAMESPACE_PLAYBACK, legacyKey);
+    const hasLegacy = legacy && typeof legacy === "object" &&
+      Object.keys(legacy).length > 0;
+    if (hasLegacy) {
+      // 先搬墓碑再灌进度：删除过的条目必须先立好墓碑，否则会被历史数据带回来。
+      const legacyTombstones = await durableJsonRead(
+        env,
+        EDGE_NAMESPACE_TOMBSTONE,
+        legacyKey + PLAYBACK_TOMBSTONE_SUFFIX,
+      ).catch(() => null);
+      if (legacyTombstones && typeof legacyTombstones === "object") {
+        const own = await readTombstones(env, key, { fresh: true }).catch(() => ({}));
+        await writeTombstones(env, key, { ...legacyTombstones, ...own });
+      }
+      await writePlaybackStateByKey(env, key, legacy);
+      console.log(JSON.stringify({
+        message: "Adopted legacy playback bucket",
+        tag: playbackDeployTag(env),
+        key,
+      }));
+    }
+    await durableJsonWrite(env, EDGE_NAMESPACE_SESSION, marker, {
+      at: Date.now(),
+      adopted: Boolean(hasLegacy),
+    });
+    MEMORY_LEGACY_ADOPT_GUARDS.add(marker);
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Legacy playback bucket adoption failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
+
 async function playbackStateKey(env, token) {
   const scope = String(token || "").trim();
+  const keyPrefix = playbackKeyPrefix(env);
   if (!scope || scope === guestToken(env)) {
-    return PLAYBACK_STATE_KEY;
+    // 访客分桶也要收养：旧版本 Worker 与 Pages 共用的就是这个无标记分桶。
+    await adoptLegacyPlaybackBucket(env, keyPrefix);
+    return keyPrefix;
   }
   const cached = MEMORY_PLAYBACK_KEYS.get(scope);
   if (cached && Date.now() - cached.at < PLAYBACK_KEY_CACHE_MS) {
@@ -7334,11 +7483,11 @@ async function playbackStateKey(env, token) {
     // 恢复出来的映射直接记的是分桶 key（原始用户名已不可考）。
     key = record.stateKey;
   } else if (username) {
-    key = `${PLAYBACK_STATE_KEY}:u:${md5(username)}`;
+    key = `${keyPrefix}:u:${md5(username)}`;
   }
   if (!key) {
     // 先看这个 token 自己有没有历史分桶；有就照旧用，绝不抢占别的账号。
-    const tokenScopedKey = `${PLAYBACK_STATE_KEY}:${playbackTokenPart(scope)}`;
+    const tokenScopedKey = `${keyPrefix}:${playbackTokenPart(scope)}`;
     const ownValue = await durableJsonRead(env, EDGE_NAMESPACE_PLAYBACK, tokenScopedKey)
       .catch(() => undefined);
     if (ownValue && typeof ownValue === "object" && Object.keys(ownValue).length > 0) {
@@ -7355,9 +7504,19 @@ async function playbackStateKey(env, token) {
     }
   }
   if (!key) {
-    key = `${PLAYBACK_STATE_KEY}:${playbackTokenPart(scope)}`;
+    key = `${keyPrefix}:${playbackTokenPart(scope)}`;
   }
-  if (username || key.startsWith(`${PLAYBACK_STATE_KEY}:u:`)) {
+  // SESSION 里可能存着升级前写的“无部署标记”key。把它映射到本部署的同名
+  // 分桶（随后由收养逻辑把旧数据整份复制过来）；绝不能直接换成 token 分桶，
+  // 那等于把用户已有的观看记录丢掉。
+  if (key === PLAYBACK_STATE_KEY || key.startsWith(`${PLAYBACK_STATE_KEY}:`)) {
+    key = `${keyPrefix}${key.slice(PLAYBACK_STATE_KEY.length)}`;
+  }
+  if (!key.startsWith(`${keyPrefix}:`) && key !== keyPrefix) {
+    key = `${keyPrefix}:${playbackTokenPart(scope)}`;
+  }
+  await adoptLegacyPlaybackBucket(env, key);
+  if (username || key.startsWith(`${keyPrefix}:u:`)) {
     await ensureLegacyPlaybackMigration(env, scope, username, key);
     MEMORY_PLAYBACK_KEYS.set(scope, { key, at: Date.now() });
     if (MEMORY_PLAYBACK_KEYS.size > MAX_MEMORY_PLAYBACK_STATES) {
@@ -9539,11 +9698,24 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
 
       if (!video) {
         if (!videoResolution.resolutionFinished || videoResolution.error) {
-          // 没有真实源时不能生成 PlaySessionId。否则客户端会认为播放信息已经
-          // 就绪，随后拿空列表播放并超时；详情页也可能因此丢掉旧源和进度。
-          return temporaryPlaybackResponse(
-            "Playback sources are still resolving; retry the request",
+          // 详情页已经下发了一条“按需线路”占位（避免客户端藏掉播放按钮），
+          // 这里必须给出同一条线路和 PlaySessionId：如果继续回 503，用户
+          // 明明看到播放按钮，一点却弹 “Connection timeout, try again later”。
+          // 占位线路的 Path 不带 source 参数，播放时由取流接口现场解析，
+          // 所以生成播放会话是安全的，不会出现“拿空列表播放”的情况。
+          const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
+          const playSessionId = crypto.randomUUID();
+          rememberPlaySession(
+            await playbackStateKey(env, playbackToken),
+            item.Id,
+            playSessionId,
           );
+          return jsonResponse({
+            PlaySessionId: playSessionId,
+            ItemId: item.Id,
+            MediaSources: sources,
+            MediaSourceCount: sources.length,
+          });
         }
         // 解析已完成且上游明确没有可播放源。这是稳定结果，不创建播放会话。
         return jsonResponse({
@@ -9696,4 +9868,5 @@ export function resetEmbyCachesForTests() {
   MEMORY_PLAYBACK_KEYS.clear();
   MEMORY_PLAYBACK_TOMBSTONES.clear();
   MEMORY_PLAY_SESSIONS.clear();
+  MEMORY_LEGACY_ADOPT_GUARDS.clear();
 }
