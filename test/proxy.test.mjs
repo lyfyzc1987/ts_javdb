@@ -294,7 +294,7 @@ function expectedItemEtag(payload, options = {}) {
     }))
     : [];
   const stableDto = {
-    version: "item-dto-v15",
+    version: "item-dto-v16",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -1660,7 +1660,7 @@ test("returns a retryable detail response while cold resolution continues", asyn
     expectedItemEtag(secondPayload, { refreshSources: true }),
   );
   assert.equal(
-    [...db.rows.keys()].some((key) => key.includes("sources-v33|RCTD-740")),
+    [...db.rows.keys()].some((key) => key.includes("sources-v34|RCTD-740")),
     true,
   );
 });
@@ -1968,6 +1968,107 @@ test("keeps a playable on-demand placeholder instead of PlayAccess=None when res
   assert.ok(playbackPayload.PlaySessionId);
   assert.equal(playbackPayload.MediaSources.length, 1);
   assert.equal(playbackPayload.MediaSources[0].Name, "自动线路");
+});
+
+test("strips parsing-state text from every media source response boundary", async () => {
+  const sourceUrls = [
+    "https://fast-stream.jav.si/12345/original.mp4",
+    "https://fast-stream.jav.si/12345/backup.mp4",
+  ];
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    if (target.includes("/v4/movies/42")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: {
+            movie: {
+              id: 42,
+              number: "12345",
+              title: "Source label sanitization",
+            },
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (
+      target.includes("/api/v/resolve?code=12345") ||
+      target.includes("/api/resolve?code=12345")
+    ) {
+      return new Response(
+        JSON.stringify({
+          variants: [
+            {
+              variant: "original",
+              label: "自动线路（解析中）",
+              sourceUrl: sourceUrls[0],
+              sourceType: "video/mp4",
+              quality: 1080,
+            },
+            {
+              variant: "backup",
+              label: "线路 2（解析中）",
+              sourceUrl: sourceUrls[1],
+              sourceType: "video/mp4",
+              quality: 720,
+            },
+          ],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (sourceUrls.includes(target)) {
+      return new Response(new Uint8Array([0, 0, 0, 32]), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp4",
+        },
+      });
+    }
+    assert.match(target, /\/api\/subtitle\?name=12345/);
+    return new Response(
+      JSON.stringify({ code: 0, data: [] }),
+      { headers: { "content-type": "application/json" } },
+    );
+  };
+  const env = {
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 1000,
+    PLAYBACK_INFO_RESOLVE_BUDGET_MS: 1000,
+    RESOLVER_MERGE_BUDGET_MS: 20,
+  };
+
+  const detail = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    fetchImpl,
+  );
+  const detailPayload = await detail.json();
+  assert.equal(detail.status, 200);
+  assert.deepEqual(
+    detailPayload.MediaSources.map((source) => source.Name),
+    ["自动线路", "线路 2"],
+  );
+  assert.doesNotMatch(JSON.stringify(detailPayload), /解析中/);
+
+  resetEmbyCachesForTests();
+  const playback = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    env,
+    {},
+    fetchImpl,
+  );
+  const playbackPayload = await playback.json();
+  assert.equal(playback.status, 200);
+  assert.deepEqual(
+    playbackPayload.MediaSources.map((source) => source.Name),
+    ["自动线路", "线路 2"],
+  );
+  assert.doesNotMatch(JSON.stringify(playbackPayload), /解析中/);
 });
 
 test("buckets the pending detail ETag so clients refresh within 20 seconds", async () => {

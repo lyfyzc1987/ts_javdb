@@ -116,13 +116,16 @@ const MAX_HLS_REWRITE_DEPTH = 8;
 const HLS_PLAYLIST_SCAN_MAX_CHARS = 64 * 1024;
 const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // DTO 结构变化时提升版本，客户端会把它当成新的实体版本并刷新旧详情页缓存。
+// v16：所有媒体源名称在响应出口统一去掉“解析中”，并把无源兜底保留为
+// 可播放的按需线路。旧 DTO 版本必须失效，否则客户端本地数据库里的
+// “自动线路（解析中）”详情页会继续显示。
 // v15：无源时不再返回 PlayAccess=None + 空 MediaSources（那会让客户端把
 // 条目判为不可用并清掉本地播放记录/进度条/播放按钮），改成按需占位源。
 // 结构变化必须提升版本，客户端才会把本地库里那份旧 DTO 当成新实体重新拉取。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v15";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v16";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-07-first-screen-19";
+const SERVER_BUILD_ID = "2026-10-07-first-screen-20";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -171,7 +174,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v33";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v34";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -6636,6 +6639,17 @@ function estimatedMediaBitrate(isHls, height) {
   return isHls ? 4_000_000 : 3_000_000;
 }
 
+// “解析中”是过渡状态，不应作为媒体信息显示。无论名称来自实时解析、旧缓存
+// 还是上游异常数据，都在 DTO 出口统一移除，保证客户端不会首屏看到该字样。
+function mediaSourceDisplayName(value, fallback) {
+  const clean = (input) => String(input || "")
+    .replace(/[（(]\s*解析中\s*[）)]/g, "")
+    .replace(/解析中/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return clean(value) || clean(fallback) || "自动线路";
+}
+
 function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = item.Id) {
   const isHls = Boolean(
     video.inlinePlaylist ||
@@ -6717,7 +6731,10 @@ function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = 
   return {
     Id: mediaSourceId,
     MediaSourceId: mediaSourceId,
-    Name: String(video.sourceName || video.title || item.Name || "").trim() || item.Name || "",
+    Name: mediaSourceDisplayName(
+      video.sourceName || video.title,
+      item.Name,
+    ),
     Path: streamUrl.toString(),
     DirectStreamUrl: `${streamUrl.pathname}${streamUrl.search}`,
     Protocol: "Http",
