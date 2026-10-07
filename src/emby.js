@@ -122,10 +122,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // v15：无源时不再返回 PlayAccess=None + 空 MediaSources（那会让客户端把
 // 条目判为不可用并清掉本地播放记录/进度条/播放按钮），改成按需占位源。
 // 结构变化必须提升版本，客户端才会把本地库里那份旧 DTO 当成新实体重新拉取。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v16";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v19";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-07-first-screen-20";
+const SERVER_BUILD_ID = "2026-10-08-numeric-code-and-cover-art-23";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -174,7 +174,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v34";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v37";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -3818,6 +3818,70 @@ function movieTaglines(movie) {
 // 注意：只有 /v4/movies/{id} 详情接口会返回真实图片地址；
 // /v2/search 的列表项只带 has_preview_images 标记，preview_images 是空数组。
 // 第一张固定用资源封面（用户要求“艺术图第一张改成资源封面”），后面才是预览剧照。
+// 只接受预览项的 large_url/url：thumb_url 是列表用的小图，上游有时还把它指向封面，
+// 若继续回退会把同一张封面以模糊缩略图再放进艺术图。
+function normalizedImageUrlKey(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    const pathname = url.pathname
+      .replace(/\/+$/, "")
+      .replace(/\/small_covers\//gi, "/covers/")
+      .toLowerCase();
+    return `${url.hostname.toLowerCase()}${pathname}`;
+  } catch {
+    return raw
+      .split(/[?#]/, 1)[0]
+      .replace(/\/+$/, "")
+      .replace(/\/small_covers\//gi, "/covers/")
+      .toLowerCase();
+  }
+}
+
+function isCoverImageUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  try {
+    return /(?:^|\/)(?:small_)?covers\//i.test(new URL(raw).pathname);
+  } catch {
+    return /(?:^|\/)(?:small_)?covers\//i.test(raw.split(/[?#]/, 1)[0]);
+  }
+}
+
+// 上游会把封面本身塞进预览图列表的第一张（形如 {番号}_l_0.jpg），而且常常是低清版：
+// 客户端按 BackdropImageTags 逐张取图时就会看到两张资源封面，其中一张还是模糊图。
+// URL 前缀过滤（covers / small_covers）拦不住这种 samples 目录下的封面派生图，
+// 所以按文件名判断：去掉结尾的“大小标记 + 序号”后，基础名和封面图文件名同源的、
+// 序号为 0 的那张直接跳过。序号非 0 的（真正的剧照预览）照常保留。
+const IMAGE_PREVIEW_INDEX_PATTERN = /^(.+?)[_\-.](?:[a-z]{1,3}[_\-.]|)(\d{1,3})$/;
+
+function imageFileStem(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  let pathname = raw;
+  try {
+    pathname = new URL(raw).pathname;
+  } catch {
+    pathname = raw.split(/[?#]/, 1)[0];
+  }
+  const name = (pathname.split("/").pop() || "")
+    .replace(/\.[a-z0-9]+$/i, "")
+    .toLowerCase();
+  if (!name) return null;
+  const match = IMAGE_PREVIEW_INDEX_PATTERN.exec(name);
+  if (!match || !match[1]) {
+    return { base: name, index: null };
+  }
+  return { base: match[1], index: Number(match[2]) };
+}
+
+function isCoverDerivedPreview(value, coverStem) {
+  if (!coverStem?.base) return false;
+  const info = imageFileStem(value);
+  return Boolean(info && info.index === 0 && info.base === coverStem.base);
+}
+
 function movieBackdropImages(movie) {
   const raw = movie?.preview_images;
   if (!Array.isArray(raw) || raw.length === 0) {
@@ -3825,17 +3889,29 @@ function movieBackdropImages(movie) {
   }
   const urls = [];
   const cover = String(movie?.cover_url || movie?.thumb_url || "").trim();
+  const coverKey = normalizedImageUrlKey(cover);
+  const coverStem = imageFileStem(cover);
+  const seen = new Set();
   if (cover) {
     urls.push(cover);
+    if (coverKey) seen.add(coverKey);
   }
   for (const entry of raw) {
     const value = typeof entry === "string"
       ? entry
-      : entry?.large_url || entry?.thumb_url || entry?.url || "";
+      : entry?.large_url || entry?.url || "";
     const url = String(value || "").trim();
-    if (url && !urls.includes(url)) {
-      urls.push(url);
-    }
+    const key = normalizedImageUrlKey(url);
+    if (
+      !url ||
+      !key ||
+      seen.has(key) ||
+      isCoverImageUrl(url) ||
+      isCoverDerivedPreview(url, coverStem) ||
+      (coverKey && key === coverKey)
+    ) continue;
+    seen.add(key);
+    urls.push(url);
     if (urls.length >= BACKDROP_IMAGE_LIMIT) {
       break;
     }
@@ -3856,7 +3932,9 @@ function refreshDetailBackdropTags(item) {
     return;
   }
   const bucket = Math.floor(Date.now() / PENDING_SOURCES_ETAG_BUCKET_MS);
-  item.BackdropImageTags = item.BackdropImageTags.map((tag) => `${tag}-${bucket}`);
+  item.BackdropImageTags = item.BackdropImageTags.map(
+    (tag) => `${tag}-art-v2-${bucket}`,
+  );
 }
 
 function itemEtag(item, options = {}) {
@@ -5055,9 +5133,22 @@ function normalizedCodeToken(value) {
   return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function selfHostedSearchCode(value) {
+function selfHostedSearchCode(value, options = {}) {
   const token = normalizedCodeToken(value);
-  return token.length >= 3 && !/^\d+$/.test(token);
+  if (token.length < 3) return false;
+  if (options.allowNumeric === true) return true;
+  return !/^\d+$/.test(token);
+}
+
+// 纯数字番号（052425-001 / 123456_789 这类）归一化后只剩数字。早期这里一律排除，
+// 结果这类资源的自建补源（Javtiful / GetAV）永远不会被查：第一次进详情页只有公共
+// 线路，等后台补完再点第二次才看到多条源。判断依据不能只看字符串——真实番号
+// （movieNumber(movie)）即使是数字也要查，而内部数字 id（movie.id）必须排除，
+// 否则会把内部 id 当番号丢给上游。
+function selfHostedSearchableCode(movie, code) {
+  return selfHostedSearchCode(code, {
+    allowNumeric: Boolean(movieNumber(movie)),
+  });
 }
 
 async function fetchSelfHostedPageText(
@@ -5355,7 +5446,8 @@ function selfHostedVariantsVideo(movie, code, env, merged) {
 }
 
 async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl, options = {}) {
-  if (!selfHostedSearchCode(code)) return null;
+  // 数字番号也要查自建源，否则第一次进详情页只有公共线路（见 selfHostedSearchableCode）。
+  if (!selfHostedSearchableCode(movie, code)) return null;
   const tasks = [
     {
       name: "javtiful",
@@ -5499,7 +5591,7 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   // 6.5 秒预算里既等不到公共线路、也等不到自建线路，只能回“自动线路（解析
   // 中）”。现在无条件并行启动，谁先拿到线路谁先发布，详情页首屏就能直接
   // 拿到真实线路和播放按钮。
-  if (selfHostedSearchCode(code)) {
+  if (selfHostedSearchableCode(movie, code)) {
     startSelfHostedVideo().then(
       (video) => publishPartial(video),
       () => {},
@@ -5550,9 +5642,14 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
       // 提前发布失败不影响下面的正常流程（后面还会再发布一次完整快照）。
     }
   }
+  // 第一条链路如果只拿到少量线路，不能马上用 5 秒的“已有线路”合并窗口：
+  // 线上实测另一条链路在 5~7 秒之间到达时会被截断，后续又把单条结果当成
+  // 已完成并写缓存。只有首条链路已经达到目标条数时才缩短窗口。
   const mergeBudget = resolverMergeBudget(
     env,
-    firstValid && firstHasUsableSource
+    firstValid &&
+      firstHasUsableSource &&
+      firstUsableSourceCount >= RESOLVER_SOURCE_TARGET_COUNT
       ? RESOLVER_SECONDARY_MERGE_MS
       : RESOLVER_THIN_MERGE_MS,
   );
@@ -5740,19 +5837,18 @@ const RESOLVE_VIDEO_STALE_PEEK_MS = 1200;
 //      公共批次一收尾（见 onPublicPhaseSettled）立刻改用短静默期返回；
 //   3. “主批次”且线路数 ≥ TARGET_COUNT 时用较短的 FIRST_SCREEN_SETTLE_MS：
 //      主批次基本代表上游的全部线路；
-//   4. 主批次已到但只有 1 条时用 FIRST_SCREEN_GRACE_MS：再给自建补源一点时间
-//      补齐，避免首屏只有一条源；
+//   4. 主批次已到但只有 1 条时继续等 FIRST_SCREEN_MAX_WAIT_MS：现场常见
+//      “主解析器先回 1 条、另一条解析链路 3~5 秒后补齐”，短宽限仍会误答单源；
 //   5. 无论哪条，整条解析链一旦收尾就立刻返回它（优先完整、已校验的结果）；
 //   6. 最坏也在 FIRST_SCREEN_MAX_WAIT_MS 内答复，剩余线路由后台继续跑并写
 //      缓存，客户端跨 20 秒时间桶重拉详情时补齐。
-const RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS = 3000;
 // 主批次（公共解析器）线路数达到这个条数就改用较短的静默窗口，不再等满宽限期。
 const RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT = 2;
 // 详情页首屏等待上限：宁可先给客户端少量线路，也不能让详情页一直转圈。
-// 实测线上公共解析器冷启动要 1.9~4.3 秒（单个响应 1.1~1.8MB），加上
-// FIRST_SCREEN_SETTLE_MS 的收尾静默期最坏约 4.7 秒；留出余量到 5.2 秒，
-// 既能覆盖绝大多数资源，又明显小于客户端约 10 秒的 HTTP 超时。
-const RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS = 5200;
+// 实测线上公共解析器冷启动要 1.9~4.3 秒（单个响应 1.1~1.8MB）；部分资源
+// 的自建补源合并要到约 7 秒才完成。留出余量到 7.4 秒，同时仍由详情请求的
+// 9 秒总截止线保护，低于客户端约 10 秒的 HTTP 超时。
+const RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS = 7400;
 // “主批次且已有多个线路”的快照到达后的静默窗口：只要这个窗口内不再出现
 // 线路更多的快照，就返回当前快照；期间整条解析链若收尾则优先返回完整结果。
 const RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS = 400;
@@ -6266,7 +6362,7 @@ async function resolveVideoForResponse(
     if (majorSeen) {
       delay = count >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT
         ? RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS
-        : RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS;
+        : RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS;
     } else if (publicPhaseSettled) {
       // 公共批次已收尾、主批次却始终没出现：上游确实没有更多线路，
       // 短静默期后就把已有的真实线路返回，不再空等到首屏上限。
@@ -7101,10 +7197,10 @@ function virtualFolder(library) {
 // 线路；冷缓存则先返回元数据（PlayAccess 仍为 Full，保留进度条与播放按钮），
 // 真正的解析交给后台继续跑完并写进缓存，用户在 PlaybackInfo 阶段拿到线路。
 // 冷启动时公共线路约 1~3 秒才发布，回退解析端冷启动实测 6~21 秒，旧值
-// 3000/4500 常常“刚超一点点”，结果只能回一条占位源。6.5 秒对 9 秒的请求
+// 3000/4500 常常“刚超一点点”，结果只能回一条占位源。7.4 秒对 9 秒的请求
 // 截止时间（扣除元数据预算）仍有安全余量；超时也会优先返回 onPartial 已经
 // 发布的公共线路快照，最坏才是占位源。
-const ITEM_DETAIL_RESOLVE_BUDGET_MS = 6500;
+const ITEM_DETAIL_RESOLVE_BUDGET_MS = 7400;
 // /Videos/{id}/stream 现场解析播放源的硬预算。客户端点播放后如果长时间收不到
 // 任何字节，就会弹 “Connection timeout, try again later”。旧实现无预算地
 // await 整条解析链（最坏 10 秒以上），还会在第一次失败后再清缓存重解析一次

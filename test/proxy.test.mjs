@@ -294,7 +294,7 @@ function expectedItemEtag(payload, options = {}) {
     }))
     : [];
   const stableDto = {
-    version: "item-dto-v16",
+    version: "item-dto-v19",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -1660,7 +1660,7 @@ test("returns a retryable detail response while cold resolution continues", asyn
     expectedItemEtag(secondPayload, { refreshSources: true }),
   );
   assert.equal(
-    [...db.rows.keys()].some((key) => key.includes("sources-v34|RCTD-740")),
+    [...db.rows.keys()].some((key) => key.includes("sources-v37|RCTD-740")),
     true,
   );
 });
@@ -1722,6 +1722,17 @@ test("keeps unverified multi-source HLS lines when validation budget expires", a
         JSON.stringify({ code: 0, data: [] }),
         { headers: { "content-type": "application/json" } },
       );
+    }
+    // 纯数字番号现在也会查自建补源（Javtiful / GetAV）：这里按“查不到”处理，
+    // 既不影响本用例的线路断言，也不让测试真的打到上游。
+    if (
+      target.includes("javtiful.com") ||
+      target.includes("r.jina.ai") ||
+      target.includes("getav.net")
+    ) {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
+      });
     }
     throw new Error(`Unexpected request: ${target}`);
   };
@@ -2025,6 +2036,16 @@ test("strips parsing-state text from every media source response boundary", asyn
           "content-range": "bytes 0-3/4",
           "content-type": "video/mp4",
         },
+      });
+    }
+    // 纯数字番号现在也会查自建补源（Javtiful / GetAV）：这里按“查不到”处理。
+    if (
+      target.includes("javtiful.com") ||
+      target.includes("r.jina.ai") ||
+      target.includes("getav.net")
+    ) {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
       });
     }
     assert.match(target, /\/api\/subtitle\?name=12345/);
@@ -4665,6 +4686,111 @@ test("waits for the slow public batch instead of answering with the first self-h
   );
 });
 
+test("waits through the extended cold-start window when the public batch completes with six lines", async () => {
+  // 同一资源的两种解析端点：
+  // - 主解析端 0.2 秒只回 1 条；
+  // - 上游公开端 6.8 秒才回其余 5 条。
+  // 线上实测有资源约 7 秒才补齐；旧实现会在第一份快照后 3~6.2 秒返回单条。
+  // 新实现必须跨过这两个窗口，等两条链路合并后再返回完整的 6 条。
+  const firstUrl = "https://fast-stream.jav.si/123456/primary-1080.mp4";
+  const publicUrls = [
+    "https://fast-stream.jav.si/123456/public-original.mp4",
+    "https://fast-stream.jav.si/123456/public-reducing.mp4",
+    "https://fast-stream.jav.si/123456/public-original-2.mp4",
+    "https://fast-stream.jav.si/123456/public-mosaic.mp4",
+    "https://fast-stream.jav.si/123456/public-mosaic-gg.mp4",
+  ];
+  const allUrls = [firstUrl, ...publicUrls];
+  const env = {
+    JAVSTRM_ORIGIN: "https://resolver.example",
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 7400,
+  };
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: { id: 42, number: "123456", title: "Numeric Cold Start" },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.startsWith("https://resolver.example/api/resolve")) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl: firstUrl,
+              sourceType: "video/mp4",
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (
+        target.startsWith(
+          "https://catembylegacy.fastcdn.dpdns.org/api/v/resolve",
+        )
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 6800));
+        return new Response(
+          JSON.stringify({
+            variants: publicUrls.map((sourceUrl, index) => ({
+              variant: index === 0 ? "javgg_original" : `javgg_backup_${index}`,
+              sourceUrl,
+              sourceType: "video/mp4",
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (allUrls.includes(target)) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      // 纯数字番号现在也会查自建补源（Javtiful / GetAV）：这里按“查不到”处理。
+      if (
+        target.includes("javtiful.com") ||
+        target.includes("r.jina.ai") ||
+        target.includes("getav.net")
+      ) {
+        return new Response("<html>No matching video</html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=123456/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(payload.MediaSourceCount, allUrls.length);
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ).sort(),
+    [...allUrls].sort(),
+  );
+});
+
 test("keeps inline HLS lines on the first screen when every upstream line is a data URL", async () => {
   const inlineSources = [0, 1, 2].map((index) =>
     `data:application/vnd.apple.mpegurl,${encodeURIComponent([
@@ -6692,15 +6818,20 @@ test("exposes upstream preview images as Emby backdrop art", async () => {
   const movie = {
     id: "42",
     number: "TEST-042",
-    cover_url: "https://jdforrepam.com/covers/test.jpg",
+    cover_url: "https://jdforrepam.com/rhe951l4q/small_covers/test.jpg",
     preview_images: [
       {
-        thumb_url: "https://jdforrepam.com/samples/test_s_0.jpg",
-        large_url: "https://jdforrepam.com/samples/test_l_0.jpg",
+        // 上游常把预览第一项直接指向封面；大小图目录不同，但归一化后应去重。
+        thumb_url: "https://jdforrepam.com/rhe951l4q/small_covers/test.jpg",
+        large_url: "https://jdforrepam.com/rhe951l4q/covers/test.jpg",
       },
       {
+        // 只有列表缩略图、没有 large_url 时直接跳过，避免模糊图进入艺术图。
         thumb_url: "https://jdforrepam.com/samples/test_s_1.jpg",
-        large_url: "https://jdforrepam.com/samples/test_l_1.jpg",
+      },
+      {
+        thumb_url: "https://jdforrepam.com/samples/test_s_2.jpg",
+        large_url: "https://jdforrepam.com/samples/test_l_2.jpg",
       },
     ],
   };
@@ -6725,10 +6856,10 @@ test("exposes upstream preview images as Emby backdrop art", async () => {
   // 会发现 tag 变了并重新取图；列表 DTO 不带，避免首页滚动时反复下载封面。
   assert.deepEqual(
     payload.BackdropImageTags.map((tag) => String(tag).split("-")[0]),
-    ["0", "1", "2"],
+    ["0", "1"],
   );
   assert.equal(
-    payload.BackdropImageTags.every((tag) => /^\d+-\d+$/.test(tag)),
+    payload.BackdropImageTags.every((tag) => /^\d+-art-v2-\d+$/.test(tag)),
     true,
   );
 
@@ -6750,7 +6881,10 @@ test("exposes upstream preview images as Emby backdrop art", async () => {
   );
   assert.equal(coverImage.status, 200);
   // 艺术图第一张改成资源封面。
-  assert.equal(coverBackdropUrl, "https://jdforrepam.com/covers/test.jpg");
+  assert.equal(
+    coverBackdropUrl,
+    "https://jdforrepam.com/rhe951l4q/small_covers/test.jpg",
+  );
 
   let backdropUrl;
   const image = await handleProxy(
@@ -6769,10 +6903,169 @@ test("exposes upstream preview images as Emby backdrop art", async () => {
     },
   );
   assert.equal(image.status, 200);
-  // 封面占掉第一位后，下标 1 起才是上游预览剧照的大图。
-  assert.equal(backdropUrl, "https://jdforrepam.com/samples/test_l_0.jpg");
+  // 重复封面和只有模糊 thumb_url 的项被过滤，下标 1 直接是正常预览大图。
+  assert.equal(backdropUrl, "https://jdforrepam.com/samples/test_l_2.jpg");
   assert.equal(image.headers.get("content-type"), "image/jpeg");
   assert.deepEqual(new Uint8Array(await image.arrayBuffer()), imageBytes);
+});
+
+test("drops the upstream first preview when it is a low-res copy of the cover", async () => {
+  const imageBytes = new Uint8Array([255, 216, 255, 217]);
+  const encryptedImageBytes = new Uint8Array([234, 21, 50, 21, 51]);
+  const movie = {
+    id: "42",
+    number: "TEST-042",
+    cover_url: "https://jdforrepam.com/covers/test.jpg",
+    preview_images: [
+      // 上游把封面塞进预览图列表第一张（低清版）：同一张封面出现两次，
+      // 而且这次是 samples 目录，URL 前缀过滤拦不住，只能按文件名同源判定。
+      {
+        thumb_url: "https://jdforrepam.com/samples/test_l_0.jpg",
+        large_url: "https://jdforrepam.com/samples/test_l_0.jpg",
+      },
+      {
+        thumb_url: "https://jdforrepam.com/samples/test_s_1.jpg",
+        large_url: "https://jdforrepam.com/samples/test_l_1.jpg",
+      },
+      {
+        thumb_url: "https://jdforrepam.com/samples/test_s_2.jpg",
+        large_url: "https://jdforrepam.com/samples/test_l_2.jpg",
+      },
+    ],
+  };
+  const movieResponse = () => new Response(
+    JSON.stringify({ success: 1, data: { movie } }),
+    { headers: { "content-type": "application/json" } },
+  );
+
+  const detail = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    {},
+    {},
+    async (url) => String(url).includes("/v4/movies/42")
+      ? movieResponse()
+      : new Response(encryptedImageBytes, {
+        headers: { "content-type": "image/jpeg" },
+      }),
+  );
+  const payload = await detail.json();
+  assert.equal(detail.status, 200);
+  // 艺术图只剩资源封面 + 两张真正的剧照预览：封面不再出现第二遍。
+  assert.deepEqual(
+    payload.BackdropImageTags.map((tag) => String(tag).split("-")[0]),
+    ["0", "1", "2"],
+  );
+
+  let firstPreviewUrl;
+  const firstPreview = await handleProxy(
+    new Request("https://clone.example/Items/42/Images/Backdrop/1"),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return movieResponse();
+      }
+      firstPreviewUrl = target;
+      return new Response(encryptedImageBytes, {
+        headers: { "content-type": "image/jpeg" },
+      });
+    },
+  );
+  assert.equal(firstPreview.status, 200);
+  assert.equal(firstPreviewUrl, "https://jdforrepam.com/samples/test_l_1.jpg");
+});
+
+test("queries self-hosted sources for an all-numeric movie number on the first screen", async () => {
+  // 纯数字番号（052425-001）归一化后只剩数字：早期实现把它排除在自建补源之外，
+  // 第一次进详情页只有公共线路，退出再点（后台已补全并写缓存）才看到多条源。
+  const number = "052425-001";
+  const publicUrl = "https://fast-stream.jav.si/052425-001/public.mp4";
+  const fullHdUrl = "https://fast-stream.jav.si/052425-001/javtiful-1080.mp4";
+  const hdUrl = "https://fast-stream.jav.si/052425-001/javtiful-720.mp4";
+  const detailUrl = "https://javtiful.com/zh/video/90001/052425-001";
+  const calls = [];
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number, title: `${number} Test` } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes("/resolve") && target.includes(`code=${number}`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "original",
+              sourceUrl: publicUrl,
+              sourceType: "video/mp4",
+              quality: 1080,
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === `https://javtiful.com/zh/search?q=${number}`) {
+        return new Response(`<a href="${detailUrl}">${number}</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: number,
+            playerSources: [
+              { src: fullHdUrl, type: "video/mp4", size: 1080 },
+              { src: hdUrl, type: "video/mp4", size: 720 },
+            ],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if ([publicUrl, fullHdUrl, hdUrl].includes(target)) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      if (target.includes("/api/subtitle?name=")) {
+        return new Response(
+          JSON.stringify({ code: 0, data: [] }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected request: ${target}`);
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  // 关键断言：数字番号第一次解析就查了自建补源，首屏直接是多条源。
+  assert.equal(
+    calls.includes(`https://javtiful.com/zh/search?q=${number}`),
+    true,
+  );
+  const sources = payload.MediaSources.map((source) => String(source.Path));
+  assert.equal(sources.length >= 3, true);
+  assert.equal(sources.some((path) => path.includes("javtiful-1080.mp4")), true);
+  assert.equal(sources.some((path) => path.includes("javtiful-720.mp4")), true);
 });
 
 test("serves the advertised Chinese subtitle stream", async () => {
