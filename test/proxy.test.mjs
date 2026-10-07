@@ -294,7 +294,7 @@ function expectedItemEtag(payload, options = {}) {
     }))
     : [];
   const stableDto = {
-    version: "item-dto-v19",
+    version: "item-dto-v20",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -1660,7 +1660,7 @@ test("returns a retryable detail response while cold resolution continues", asyn
     expectedItemEtag(secondPayload, { refreshSources: true }),
   );
   assert.equal(
-    [...db.rows.keys()].some((key) => key.includes("sources-v37|RCTD-740")),
+    [...db.rows.keys()].some((key) => key.includes("sources-v38|RCTD-740")),
     true,
   );
 });
@@ -6976,6 +6976,72 @@ test("drops the upstream first preview when it is a low-res copy of the cover", 
   assert.equal(firstPreviewUrl, "https://jdforrepam.com/samples/test_l_1.jpg");
 });
 
+test("drops a cover-derived preview when the cover filename carries a size suffix", async () => {
+  // 上游有些资源的封面文件名自带尺寸标记（covers/test_l.jpg），而预览图是
+  // samples/test_l_0.jpg。归一化时必须把结尾的尺寸标记和序号都剥掉，否则
+  // 两边基础名对不上，这张模糊的封面派生图会作为第二张“资源封面”混进艺术图。
+  const encryptedImageBytes = new Uint8Array([234, 21, 50, 21, 51]);
+  const movie = {
+    id: "42",
+    number: "TEST-042",
+    cover_url: "https://jdforrepam.com/rhe951l4q/covers/test_l.jpg",
+    preview_images: [
+      {
+        thumb_url: "https://jdforrepam.com/rhe951l4q/samples/test_s_0.jpg",
+        large_url: "https://jdforrepam.com/rhe951l4q/samples/test_l_0.jpg",
+      },
+      {
+        thumb_url: "https://jdforrepam.com/rhe951l4q/samples/test_s_1.jpg",
+        large_url: "https://jdforrepam.com/rhe951l4q/samples/test_l_1.jpg",
+      },
+    ],
+  };
+  const movieResponse = () => new Response(
+    JSON.stringify({ success: 1, data: { movie } }),
+    { headers: { "content-type": "application/json" } },
+  );
+
+  const detail = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    {},
+    {},
+    async (url) => String(url).includes("/v4/movies/42")
+      ? movieResponse()
+      : new Response(encryptedImageBytes, {
+        headers: { "content-type": "image/jpeg" },
+      }),
+  );
+  const payload = await detail.json();
+  assert.equal(detail.status, 200);
+  // 艺术图 = 资源封面 + 一张真正的剧照，没有第二张封面。
+  assert.deepEqual(
+    payload.BackdropImageTags.map((tag) => String(tag).split("-")[0]),
+    ["0", "1"],
+  );
+
+  let firstBackdropUrl;
+  const firstBackdrop = await handleProxy(
+    new Request("https://clone.example/Items/42/Images/Backdrop/1"),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return movieResponse();
+      }
+      firstBackdropUrl = target;
+      return new Response(encryptedImageBytes, {
+        headers: { "content-type": "image/jpeg" },
+      });
+    },
+  );
+  assert.equal(firstBackdrop.status, 200);
+  assert.equal(
+    firstBackdropUrl,
+    "https://jdforrepam.com/rhe951l4q/samples/test_l_1.jpg",
+  );
+});
+
 test("queries self-hosted sources for an all-numeric movie number on the first screen", async () => {
   // 纯数字番号（052425-001）归一化后只剩数字：早期实现把它排除在自建补源之外，
   // 第一次进详情页只有公共线路，退出再点（后台已补全并写缓存）才看到多条源。
@@ -7066,6 +7132,246 @@ test("queries self-hosted sources for an all-numeric movie number on the first s
   assert.equal(sources.length >= 3, true);
   assert.equal(sources.some((path) => path.includes("javtiful-1080.mp4")), true);
   assert.equal(sources.some((path) => path.includes("javtiful-720.mp4")), true);
+});
+
+test("keeps the inline GG HLS line next to the self-hosted MP4 on the first screen", async () => {
+  // 线上 AqKVJO（052425-001）的真实形态：
+  //   - 主解析器 javstrm 账号被停用，秒回 401；
+  //   - 公开回落端只给 1 条“服务器GG”线路，且是 data: 内联 HLS（不是 http 地址）；
+  //   - Javtiful 自建补源给 1 条 720P MP4。
+  // 旧实现把“内联 HLS”当成不可用线路，首屏只剩 Javtiful 那一条，用户看到
+  // “只有一个播放源”；这里断言首屏必须有两条：内联 HLS 走本服务 stream.m3u8，
+  // Javtiful 走原站地址。
+  const number = "052425-001";
+  const javtifulUrl = "https://fast-stream.jav.si/052425-001/javtiful-720.mp4";
+  const detailUrl = "https://javtiful.com/zh/video/90005/052425-001";
+  const inlinePlaylist = [
+    "#EXTM3U",
+    "#EXT-X-TARGETDURATION:10",
+    "#EXTINF:10,",
+    "https://media.example/052425-001/segment-0.ts",
+    "#EXT-X-ENDLIST",
+    "",
+  ].join("\n");
+  const env = { JAVSTRM_ORIGIN: "https://resolver.example" };
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number, title: `${number} Inline GG` } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.startsWith("https://resolver.example/api/resolve")) {
+        // 主解析器账号已被禁用。
+        return new Response(
+          JSON.stringify({ error: "帳號已被禁用" }),
+          { status: 401, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes("/api/v/resolve") && target.includes(`code=${number}`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [{
+              variant: "fcjav_original",
+              sourceSite: "服务器GG",
+              sourceUrl: `data:application/vnd.apple.mpegurl,${encodeURIComponent(inlinePlaylist)}`,
+              sourceType: "application/vnd.apple.mpegurl",
+            }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === `https://javtiful.com/zh/search?q=${number}`) {
+        return new Response(`<a href="${detailUrl}">${number}</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: number,
+            playerSources: [{ src: javtifulUrl, type: "video/mp4", size: 720 }],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === javtifulUrl) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
+  // 关键断言：内联 HLS 没有被当成不可用线路丢掉，首屏是 2 条。
+  assert.equal(payload.MediaSourceCount, 2);
+  const hls = payload.MediaSources.find((source) => source.Container === "m3u8");
+  const mp4 = payload.MediaSources.find((source) => source.Container === "mp4");
+  assert.ok(hls, "expected the inline GG HLS line on the first screen");
+  assert.ok(mp4, "expected the Javtiful MP4 line on the first screen");
+  assert.match(hls.DirectStreamUrl, /\/Videos\/42\/stream\.m3u8/);
+  assert.doesNotMatch(hls.DirectStreamUrl, /source=/);
+  assert.match(
+    new URL(mp4.Path).searchParams.get("source") || "",
+    /javtiful-720\.mp4/,
+  );
+});
+
+test("keeps waiting when the public resolver fails fast and GetAV lines are still loading", async () => {
+  // 线上真实时序：主解析器和公开回落端都秒挂（401），自建补源先回 1 条
+  // Javtiful，GetAV 的 2 条要 ~2.5 秒才到。旧实现在“公共批次收尾”时就把
+  // 静默窗口切成 400 毫秒，于是 ~0.7 秒用 1 条答复，客户端详情页只显示
+  // 一个播放源。新实现要求两条链路都收尾才用短窗口，必须等到 3 条。
+  const number = "RCTD-740";
+  const javtifulUrl = "https://fast-stream.jav.si/rctd-740/javtiful-720.mp4";
+  const detailUrl = "https://javtiful.com/zh/video/90006/RCTD-740";
+  const getavSourceQualities = [
+    ["raw_4k", 2160],
+    ["raw_1080p", 1080],
+  ];
+  const getavSources = getavSourceQualities.map(([type, quality]) => ({
+    movieId: number,
+    type,
+    url: `https://static.worldstatic.com/rctd-740/${quality}/index.txt`,
+    quality,
+  }));
+  const pageUrl = "https://getav.net/zh/videos/rctd-740";
+  const readerUrl = `https://r.jina.ai/${pageUrl}`;
+  const env = {
+    JAVSTRM_ORIGIN: "https://resolver.example",
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 6500,
+  };
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number, title: `${number} Late GetAV` } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (
+        target.startsWith("https://resolver.example/api/resolve") ||
+        target.includes("/api/v/resolve")
+      ) {
+        return new Response(
+          JSON.stringify({ error: "帳號已被禁用" }),
+          { status: 401, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === `https://javtiful.com/zh/search?q=${number}`) {
+        return new Response(`<a href="${detailUrl}">${number}</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        // 自建链路的第一条 0.3 秒就到。
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: number,
+            playerSources: [{ src: javtifulUrl, type: "video/mp4", size: 720 }],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === pageUrl || target === readerUrl) {
+        // GetAV 的线路要 2.5 秒才出现。
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        return new Response(
+          `<html><title>${number} Test | GetAV</title>` +
+          `${JSON.stringify({ videoSources: getavSources })}</html>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (/\/rctd-740\/\d+\/index\.txt$/.test(target)) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:6",
+          "#EXTINF:6,",
+          "segment.ts",
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (/\/rctd-740\/\d+\/segment\.ts$/.test(target)) {
+        return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+          status: 206,
+          headers: { "content-type": "video/mp2t" },
+        });
+      }
+      if (target === javtifulUrl) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
+  // 关键断言：没有停在“自建链路第一条”的半成品上，3 条都在首屏。
+  assert.equal(payload.MediaSourceCount, 3);
+  const names = payload.MediaSources.map((source) => String(source.Name));
+  assert.equal(names.includes("Javtiful 720P"), true);
+  assert.equal(
+    names.filter((name) => name.includes("GetAV")).length,
+    2,
+  );
 });
 
 test("serves the advertised Chinese subtitle stream", async () => {

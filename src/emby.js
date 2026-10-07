@@ -122,10 +122,12 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // v15：无源时不再返回 PlayAccess=None + 空 MediaSources（那会让客户端把
 // 条目判为不可用并清掉本地播放记录/进度条/播放按钮），改成按需占位源。
 // 结构变化必须提升版本，客户端才会把本地库里那份旧 DTO 当成新实体重新拉取。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v19";
+// v20：首屏“只有一条播放源、退出再进来才变多”的窗口逻辑重写（两条链路都收尾
+// 才用短窗口答复）+ 艺术图不再出现封面派生的模糊预览图。旧 DTO 必须失效。
+const ITEM_DTO_ETAG_VERSION = "item-dto-v20";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-08-numeric-code-and-cover-art-23";
+const SERVER_BUILD_ID = "2026-10-08-multisource-first-screen-24";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -174,7 +176,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v37";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v38";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -3855,6 +3857,11 @@ function isCoverImageUrl(value) {
 // 所以按文件名判断：去掉结尾的“大小标记 + 序号”后，基础名和封面图文件名同源的、
 // 序号为 0 的那张直接跳过。序号非 0 的（真正的剧照预览）照常保留。
 const IMAGE_PREVIEW_INDEX_PATTERN = /^(.+?)[_\-.](?:[a-z]{1,3}[_\-.]|)(\d{1,3})$/;
+// 有些站点的封面本身也带尺寸标记（covers/xxx_l.jpg），而预览图是
+// samples/xxx_l_0.jpg。去掉结尾的尺寸标记后两边基础名才会一致，
+// 否则同一张封面会以“模糊预览图”的形式再出现一次。
+const IMAGE_SIZE_SUFFIX_PATTERN =
+  /^(.+?)[_\-.](?:l|b|s|m|o|h|thumb|small|big|large|orig)$/i;
 
 function imageFileStem(value) {
   const raw = String(value || "").trim();
@@ -3870,10 +3877,11 @@ function imageFileStem(value) {
     .toLowerCase();
   if (!name) return null;
   const match = IMAGE_PREVIEW_INDEX_PATTERN.exec(name);
-  if (!match || !match[1]) {
-    return { base: name, index: null };
+  if (match && match[1]) {
+    return { base: match[1], index: Number(match[2]) };
   }
-  return { base: match[1], index: Number(match[2]) };
+  const size = IMAGE_SIZE_SUFFIX_PATTERN.exec(name);
+  return { base: size?.[1] || name, index: null };
 }
 
 function isCoverDerivedPreview(value, coverStem) {
@@ -5501,6 +5509,13 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   const onPublicPhaseSettled = typeof options.onPublicPhaseSettled === "function"
     ? options.onPublicPhaseSettled
     : null;
+  // onSelfHostedPhaseSettled：自建补源（Javtiful / GetAV）这一批也彻底落定时回调一次。
+  // 详情页据此判断“线路只会更多的两条链路是不是都跑完了”：没跑完就不能用短窗口
+  // 返回半成品（典型：公共解析器秒挂、自建补源还在合并，首屏只剩 1 条）。
+  const onSelfHostedPhaseSettled =
+    typeof options.onSelfHostedPhaseSettled === "function"
+      ? options.onSelfHostedPhaseSettled
+      : null;
   const code = movieNumber(movie) || movie.id || movie.title;
   if (!code) {
     return null;
@@ -5684,6 +5699,13 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   const selfHosted = selfHostedVideoTask
     ? await settledWithin(selfHostedVideoTask, selfHostedMergeBudget(env))
     : null;
+  if (onSelfHostedPhaseSettled) {
+    try {
+      onSelfHostedPhaseSettled({ started: Boolean(selfHostedVideoTask) });
+    } catch {
+      // 回调异常不能影响正常解析。
+    }
+  }
   const merged = mergeResolvedVideoVariants(env, publicVideo, selfHosted);
   const validated = await finalizeVideo(merged);
   if (validated) {
@@ -6341,8 +6363,9 @@ async function resolveVideoForResponse(
   // 只值得再等一个短静默期，不必再等满宽限期。
   let majorSeen = false;
   // 公共解析器两条链路是否已经彻底落定（resolveVideo 的 onPublicPhaseSettled）。
-  // 落定之后不可能再出现主批次快照，首屏不必再为“等主批次”空等。
   let publicPhaseSettled = false;
+  // 自建补源这一批是否已经落定（resolveVideo 的 onSelfHostedPhaseSettled）。
+  let selfHostedPhaseSettled = false;
   const partialSettled = new Promise((resolve) => {
     partialResolve = resolve;
   });
@@ -6359,16 +6382,20 @@ async function resolveVideoForResponse(
     if (major === true) majorSeen = true;
     if (partialTimer) clearTimeout(partialTimer);
     let delay;
-    if (majorSeen) {
-      delay = count >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT
-        ? RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS
-        : RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS;
-    } else if (publicPhaseSettled) {
-      // 公共批次已收尾、主批次却始终没出现：上游确实没有更多线路，
-      // 短静默期后就把已有的真实线路返回，不再空等到首屏上限。
+    const enough = count >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT;
+    if (
+      (majorSeen && enough) ||
+      (publicPhaseSettled && selfHostedPhaseSettled)
+    ) {
+      // 两种情况才值得结束首屏等待：
+      //   1. 主批次（公共解析器）已经给出足够多的线路——它基本代表上游有几条；
+      //   2. 两条链路都收尾了——不可能再有新线路，哪怕只有 1 条也得答复。
+      // 其余情况（线路还不够、且至少还有一条链路在跑）继续等。典型误答场景：
+      // 公共解析器账号被停用、秒挂，自建补源还在合并，旧逻辑这时会用 400 毫秒
+      // 的短窗口把“1 条线路”的半成品答复出去——用户看到的就是“第一次点开只有
+      // 一个播放源，退出再进来才变多”。
       delay = RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS;
     } else {
-      // 公共批次还在飞：这是“只有 1~2 条自建线路”最容易误答的时刻。
       delay = RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS;
     }
     partialTimer = setTimeout(() => {
@@ -6390,9 +6417,15 @@ async function resolveVideoForResponse(
     },
     onPublicPhaseSettled: () => {
       publicPhaseSettled = true;
-      // 公共批次收尾时若还没见过主批次，说明上游确实没给出更多线路：
-      // 把已经到手的真实线路（自建补源那几条）的静默窗口改成短窗口。
-      if (!majorSeen && partialResolve && partialVideo()) {
+      // 公共批次收尾后重新计时：若自建补源也收尾了，窗口会切成短静默期。
+      if (partialResolve && partialVideo()) {
+        armPartialWindow(resolvedVideoSourceCount(partial.video), false);
+      }
+    },
+    onSelfHostedPhaseSettled: () => {
+      selfHostedPhaseSettled = true;
+      // 自建补源的合并完成时再重新计时：此时两条链路都落定才会改用短窗口。
+      if (partialResolve && partialVideo()) {
         armPartialWindow(resolvedVideoSourceCount(partial.video), false);
       }
     },
