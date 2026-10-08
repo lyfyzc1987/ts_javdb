@@ -133,7 +133,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v22";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-08-media-range-passthrough-27";
+const SERVER_BUILD_ID = "2026-10-09-search-cache-and-hidefromresume-28";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -2999,6 +2999,9 @@ async function fetchWithRetry(
 const MOVIE_CACHE_TTL_MS = 10 * 60 * 1000;
 const RESOLVE_CACHE_TTL_MS = 30 * 60 * 1000;
 const LIST_CACHE_TTL_MS = 60 * 1000;
+// “没翻到底”的列表结果只在内存里留这么久：足够吸收同一瞬间的并发重试，
+// 又不会把一份少了几百条的列表钉住整整一分钟（客户端刷新后立刻能重新扫到全量）。
+const TRUNCATED_LIST_CACHE_TTL_MS = 10 * 1000;
 // 分类 / 搜索列表页在“共享边缘缓存”里的存活时间，比进程内缓存长得多。
 // 关键词搜索（尤其是标签 / 演员 / 片商）冷启动要全量扫描约 20 页上游，
 // 是最重的一条路径；如果共享缓存也只活 60 秒，那么每个新实例、每分钟都要
@@ -3076,8 +3079,13 @@ function createTtlCache(ttlMs, maxEntries) {
     return entry.value;
   };
 
-  const write = (key, value) => {
-    entries.set(key, { value, expires: Date.now() + ttlMs });
+  // ttlOverrideMs：个别结果需要比全局 TTL 更短的存活时间（例如“没翻到底”的
+  // 列表：只用来吸收同一瞬间的并发请求，不能像完整结果那样长时间复用）。
+  const write = (key, value, ttlOverrideMs = 0) => {
+    const lifetime = Number.isFinite(ttlOverrideMs) && ttlOverrideMs > 0
+      ? ttlOverrideMs
+      : ttlMs;
+    entries.set(key, { value, expires: Date.now() + lifetime });
     while (entries.size > maxEntries) {
       entries.delete(entries.keys().next().value);
     }
@@ -3262,23 +3270,28 @@ function edgeImageCacheKey(url) {
 // 分类 / 演员列表页的两级缓存：内存命中直接返回；内存没有但边缘有就回填内存；
 // 两边都没有才回源上游（回源结果非空时再写一份到边缘）。
 async function cachedListPage(cacheKey, ttlSeconds, compute) {
-  return LIST_CACHE.fetch(cacheKey, async () => {
-    const shared = await edgeCacheRead(EDGE_NAMESPACE_LIST, cacheKey);
-    if (shared !== undefined) {
-      return shared;
+  const cached = LIST_CACHE.read(cacheKey);
+  if (cached !== undefined) return cached;
+  const shared = await edgeCacheRead(EDGE_NAMESPACE_LIST, cacheKey);
+  if (shared !== undefined) {
+    LIST_CACHE.write(cacheKey, shared);
+    return shared;
+  }
+  const page = await LIST_CACHE.coalesce(cacheKey, compute);
+  if (page && Array.isArray(page.movies) && page.movies.length > 0) {
+    if (page.truncated) {
+      // 没翻到底的结果（上游抖动，或撞上翻页预算提前收尾）“少了几百条”。
+      // 这种结果绝不能进共享边缘缓存（5 分钟）或内存缓存（60 秒）：一旦被
+      // 缓存住，客户端在接下来几分钟里一直看到同一份缺量的列表，两端数量
+      // 也会互相矛盾（用户反馈的“搜索资源变少”）。这里只留 10 秒，
+      // 用来吸收同一瞬间的并发重试。
+      LIST_CACHE.write(cacheKey, page, TRUNCATED_LIST_CACHE_TTL_MS);
+    } else {
+      LIST_CACHE.write(cacheKey, page);
+      await edgeCacheWrite(EDGE_NAMESPACE_LIST, cacheKey, page, ttlSeconds);
     }
-    const page = await compute();
-    if (page && Array.isArray(page.movies) && page.movies.length > 0) {
-      // 没翻到底的结果（上游抖动，或撞上翻页预算提前收尾）只做短缓存：
-      // 否则一份“少了几百条”的列表会在共享边缘缓存里躺满 5 分钟，
-      // 客户端表现就是“搜索少了资源”。只有确认翻到底的结果才配长缓存。
-      const edgeTtlSeconds = page.truncated
-        ? Math.min(ttlSeconds, LIST_CACHE_TTL_MS / 1000)
-        : ttlSeconds;
-      await edgeCacheWrite(EDGE_NAMESPACE_LIST, cacheKey, page, edgeTtlSeconds);
-    }
-    return page;
-  });
+  }
+  return page;
 }
 
 // 全量扫描路径的“窗口复用”：整轮扫描只做一次，翻页时从窗口里切。
@@ -3287,7 +3300,15 @@ async function cachedListPage(cacheKey, ttlSeconds, compute) {
 // 扫描没到底（上游抖动 / 撞上翻页预算）且窗口不够翻时返回 null，
 // 由调用方退回原来的“按页重扫”，避免给出错位的分页。
 async function windowedListScan(windowKey, startIndex, limit, computeWindow) {
-  const window = await LIST_WINDOW_CACHE.fetch(windowKey, () => computeWindow(LIST_PAGE_WINDOW));
+  let window = LIST_WINDOW_CACHE.read(windowKey);
+  if (window === undefined) {
+    window = await LIST_WINDOW_CACHE.coalesce(windowKey, () => computeWindow(LIST_PAGE_WINDOW));
+    // 没翻到底的窗口同样不能缓存：它少了几百条，缓存 5 分钟会让翻页、重进
+    // 搜索结果页的客户端一直拿到缺量列表。只做并发合并，扫描窗口本身不留。
+    if (window && !window.truncated) {
+      LIST_WINDOW_CACHE.write(windowKey, window);
+    }
+  }
   if (!window || !Array.isArray(window.movies)) return null;
   if (window.truncated && startIndex + limit > window.movies.length) return null;
   return {
@@ -3300,13 +3321,19 @@ async function windowedListScan(windowKey, startIndex, limit, computeWindow) {
 
 // 并发抓取上游分页：原来一页一页顺序请求，首次打开分类/演员页要等很久。
 // 现在按页码小批量并发抓取、再按页码顺序合并，同时保留“够用就提前停止”的快速路径。
-const SOURCE_PAGE_CONCURRENCY = 6;
+// 并发度实测（同一批 20 个上游分页）：6 并发要 15.4 秒，而且总有分页卡到 10 秒
+// 超时后重试（长尾拖垮整轮扫描，搜索因此撞上翻页预算、只返回一半结果）；
+// 12 并发只要 5.7 秒、没有超时。上游在更高并发下会整体挂起（20 并发实测有请求
+// 卡住 5 分钟），所以定在 12。
+const SOURCE_PAGE_CONCURRENCY = 12;
 // 单次“列表 / 搜索”翻页扫描的墙钟预算（毫秒）。
 // 上游偶发抖动时，单个分页要等满 FETCH_TIMEOUT_MS 再重试一次，最坏能把一次搜索
 // 拖到 20 秒以上，客户端就报 “Connection timeout”。这里给整轮扫描一个绝对截止
 // 时间：预算内没翻完就按“没翻到底”返回已有结果（上层本来就是这样处理部分结果的），
-// 用略少的条数换取“不再超时”。正常一次全量扫描约 2 秒，7 秒预算留了 3 倍余量。
-const LIST_SCAN_DEADLINE_MS = 7000;
+// 用略少的条数换取“不再超时”。12 并发下正常一次全量扫描（约 20 页上游分页）
+// 实测 6 秒左右，9 秒预算留了余量；再往上调就会逼近客户端自己的请求超时
+// （Emby 客户端约 10 秒），反而会被客户端砍断。
+const LIST_SCAN_DEADLINE_MS = 9000;
 
 async function fetchPagesInParallel(options) {
   const {
@@ -6801,8 +6828,13 @@ function createTtlMap(ttlMs, maxEntries) {
     entries.set(key, entry);
     return entry.value;
   };
-  const write = (key, value) => {
-    entries.set(key, { value, expires: Date.now() + ttlMs });
+  // ttlOverrideMs：个别结果需要比全局 TTL 更短的存活时间（例如“没翻到底”的
+  // 列表：只用来吸收同一瞬间的并发请求，不能像完整结果那样长时间复用）。
+  const write = (key, value, ttlOverrideMs = 0) => {
+    const lifetime = Number.isFinite(ttlOverrideMs) && ttlOverrideMs > 0
+      ? ttlOverrideMs
+      : ttlMs;
+    entries.set(key, { value, expires: Date.now() + lifetime });
     while (entries.size > maxEntries) {
       entries.delete(entries.keys().next().value);
     }
@@ -8821,24 +8853,65 @@ function dropPlaybackRecord(state, itemId) {
 }
 
 // 移除一条播放记录：删条目 + 立墓碑（两者分开存，互相盖不掉）
-async function removePlaybackRecord(env, token, state, itemId) {
+async function removePlaybackRecord(env, token, state, itemId, aliases = []) {
   if (!state || !itemId) return false;
-  const old = dropPlaybackRecord(state, itemId);
+  // 同一部影片在客户端眼里有两种 Id 写法（上游数字 Id 与番号，见
+  // playbackItemIdAliases）。记录可能落在其中任一种写法下，两种都要清掉。
+  const targets = [...new Set(
+    [itemId, ...(Array.isArray(aliases) ? aliases : [])]
+      .map((value) => String(value === undefined || value === null ? "" : value).trim())
+      .filter(Boolean),
+  )];
   const key = await playbackStateKey(env, token);
   // 写入前强制读一次最新的墓碑表，避免把别的实例刚立的墓碑覆盖掉
   const store = await readTombstones(env, key, { fresh: true });
-  store[itemId] = {
-    at: Date.now(),
-    positionTicks: Math.max(0, Number(old && old.positionTicks) || 0),
-    played: Boolean(old && old.played),
-    // 记下移除时正在使用的播放会话:同一会话之后的进度上报都属于残留。
-    playSessionId: String((old && old.playSessionId) || lastPlaySession(key, itemId) || ""),
-    pendingPlaySessionId: "",
-    pendingAt: 0,
-  };
+  let removed = false;
+  for (const target of targets) {
+    const old = dropPlaybackRecord(state, target);
+    removed = removed || Boolean(old);
+    store[target] = {
+      at: Date.now(),
+      positionTicks: Math.max(0, Number(old && old.positionTicks) || 0),
+      played: Boolean(old && old.played),
+      // 记下移除时正在使用的播放会话:同一会话之后的进度上报都属于残留。
+      playSessionId: String((old && old.playSessionId) || lastPlaySession(key, target) || ""),
+      pendingPlaySessionId: "",
+      pendingAt: 0,
+    };
+  }
   // 即使当时手上没有这条记录也要立墓碑：并发的旧快照可能正把它写回来。
   await writeTombstones(env, key, store);
-  return Boolean(old);
+  return removed;
+}
+
+// 同一部影片在客户端眼里有两种 Id 写法：上游自己的数字 Id（movie.id）和番号
+// （movie.number）。mapMovie 优先用前者、缺字段时退回后者，所以同一部片在不同
+// 请求里可能拿到不同写法；播放记录因此可能落在任一种写法下，而客户端“移除记录”
+// 时传的又可能是另一种。这里把两种写法都算出来，保证删除一定命中。
+// getMovieCached 有进程内 + 边缘缓存，正常删除只会多一次可忽略的查表开销。
+async function playbackItemIdAliases(itemId, env, fetchImpl, token) {
+  const aliases = new Set();
+  const raw = String(itemId === undefined || itemId === null ? "" : itemId).trim();
+  if (!raw) return [];
+  aliases.add(raw);
+  try {
+    const movie = await getMovieCached(raw, env, fetchImpl, token);
+    if (movie) {
+      for (const candidate of [movie.id, movie.number]) {
+        const value = String(candidate === undefined || candidate === null ? "" : candidate).trim();
+        if (value) aliases.add(value);
+      }
+    }
+  } catch {
+    // 回源失败不影响删除：至少按客户端传来的 Id 处理。
+  }
+  return [...aliases];
+}
+
+// 删除入口统一走这里：先把“番号 / 数字 Id”两种写法都解析出来再删。
+async function removePlaybackRecordById(env, fetchImpl, token, state, itemId) {
+  const aliases = await playbackItemIdAliases(itemId, env, fetchImpl, token);
+  return removePlaybackRecord(env, token, state, itemId, aliases);
 }
 
 const PLAYBACK_REPLAY_CONFIRM_TICKS = 5 * 60 * 10_000_000;
@@ -9835,7 +9908,7 @@ function deleteTargetIdFromPath(path) {
 // 各客户端“标记已播/未播 / 移除播放记录 / 从继续观看中移除 / 取消收藏”的写法五花八门
 // （/PlayedItems、/UnplayedItems、/UserData、/UserPlayedItems …），这里统一成一套
 // “条目级用户数据”处理，避免客户端拿到 404。
-async function applyItemUserDataAction(itemId, action, request, env, token) {
+async function applyItemUserDataAction(itemId, action, request, env, token, fetchImpl = fetch) {
   const method = request.method;
   const state = await readPlaybackState(env, token);
   const existing = state[itemId];
@@ -9844,27 +9917,27 @@ async function applyItemUserDataAction(itemId, action, request, env, token) {
   if (method === "DELETE" && (action === "playingitems" || action === "userdata")) {
     // 结束播放 / 移除续播记录：整条删掉，条目立刻从“继续观看”消失；
     // 同时立墓碑（单独存储），抑制客户端随后补发的残留上报。
-    await removePlaybackRecord(env, token, state, itemId);
+    await removePlaybackRecordById(env, fetchImpl, token, state, itemId);
     await writePlaybackState(env, state, token);
     return userDataForRecord(undefined);
   }
   if (action === "playeditems" && method === "DELETE") {
     // “标记未播放 / 删除观看记录”也必须走墓碑，否则客户端刷新后迟到的
     // 进度上报会立刻把记录重新创建出来。
-    await removePlaybackRecord(env, token, state, itemId);
+    await removePlaybackRecordById(env, fetchImpl, token, state, itemId);
     await writePlaybackState(env, state, token);
     return userDataForRecord(undefined);
   }
   if (action === "unplayeditems") {
     // “标记未播放”等于把条目移出继续观看，按移除处理（同样立墓碑）。
-    await removePlaybackRecord(env, token, state, itemId);
+    await removePlaybackRecordById(env, fetchImpl, token, state, itemId);
     await writePlaybackState(env, state, token);
     return userDataForRecord(state[itemId]);
   }
   if (action === "userdata" && (method === "POST" || method === "PUT")) {
     // 部分客户端不用 DELETE，而是向 UserData 回写 PlaybackPositionTicks=0
     // 来清掉续播；这也必须立墓碑，否则紧接着补发的旧进度会再次把它带回列表。
-    await removePlaybackRecord(env, token, state, itemId);
+    await removePlaybackRecordById(env, fetchImpl, token, state, itemId);
     await writePlaybackState(env, state, token);
     return userDataForRecord(state[itemId]);
   }
@@ -9958,7 +10031,7 @@ function batchDeleteItemIds(url) {
 // Emby 部分客户端不是按单条路径删除，而是批量请求：
 // DELETE /Users/{uid}/Items/Resume?Ids=xxx 或 DELETE /Items?Ids=xxx。
 // 这些路径平时会被列表读取分支接住，所以必须在读取前处理。
-async function handleBatchPlaybackDelete(path, request, env, url) {
+async function handleBatchPlaybackDelete(path, request, env, url, fetchImpl = fetch) {
   const method = request.method;
   const isBatchPath = /^\/Items(?:\/(?:Resume|Delete|Remove))?$/i.test(path);
   const canDelete = method === "DELETE" || method === "POST" || method === "PUT";
@@ -9973,7 +10046,7 @@ async function handleBatchPlaybackDelete(path, request, env, url) {
   const token = getToken(request, url);
   const state = await readPlaybackState(env, token);
   for (const itemId of itemIds.slice(0, 200)) {
-    await removePlaybackRecord(env, token, state, itemId);
+    await removePlaybackRecordById(env, fetchImpl, token, state, itemId);
   }
   await writePlaybackState(env, state, token);
   return noContentResponse();
@@ -9981,7 +10054,7 @@ async function handleBatchPlaybackDelete(path, request, env, url) {
 
 // 兜底：只要是针对某一个条目的增删改，就当作成功处理，
 // 避免客户端在“移除播放记录 / 继续观看”时报 404。
-async function handleFallbackDelete(path, request, env, url) {
+async function handleFallbackDelete(path, request, env, url, fetchImpl = fetch) {
   const method = request.method;
   if (method !== "DELETE" && method !== "POST" && method !== "PUT") {
     return null;
@@ -9995,7 +10068,7 @@ async function handleFallbackDelete(path, request, env, url) {
     }
     if (targetId) {
       const token = getToken(request, url);
-      await applyItemUserDataAction(targetId, fallbackItemAction(requestPath), request, env, token);
+      await applyItemUserDataAction(targetId, fallbackItemAction(requestPath), request, env, token, fetchImpl);
     }
     return noContentResponse();
   }
@@ -10008,7 +10081,7 @@ async function handleFallbackDelete(path, request, env, url) {
   }
   if (targetId) {
     const token = getToken(request, url);
-    await applyItemUserDataAction(targetId, fallbackItemAction(requestPath), request, env, token);
+    await applyItemUserDataAction(targetId, fallbackItemAction(requestPath), request, env, token, fetchImpl);
   }
   return noContentResponse();
 }
@@ -10032,7 +10105,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
   }
   if (!isHandledPath(requestPath)) {
     // 删除类请求（移除播放记录/收藏）先按“删除即成功”兜底，避免客户端 404。
-    const earlyFallbackDelete = await handleFallbackDelete(requestPath, request, env, url);
+    const earlyFallbackDelete = await handleFallbackDelete(requestPath, request, env, url, fetchImpl);
     if (earlyFallbackDelete) {
       return earlyFallbackDelete;
     }
@@ -10148,7 +10221,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
   }
 
   const token = getToken(request, url);
-  const batchPlaybackDelete = await handleBatchPlaybackDelete(path, request, env, url);
+  const batchPlaybackDelete = await handleBatchPlaybackDelete(path, request, env, url, fetchImpl);
   if (batchPlaybackDelete) {
     return batchPlaybackDelete;
   }
@@ -10331,12 +10404,29 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
   const hideFromResumeMatch = path.match(/^\/Items\/([^/]+)\/HideFromResume$/i);
   if (hideFromResumeMatch) {
     const hideItemId = decodeURIComponent(hideFromResumeMatch[1]);
-    const hide = isTruthyUserDataFlag(
-      pickUserDataValue({}, url.searchParams, ["Hide", "hide"]),
-    );
+    // Emby 客户端“从继续观看中移除”有几种写法：
+    //   POST /Items/{id}/HideFromResume   body {"Hide": true}
+    //   POST /Items/{id}/HideFromResume?Hide=true
+    //   DELETE /Items/{id}/HideFromResume     （DELETE 只有“移除”一种语义）
+    // 早期实现只读查询串，于是带 body 的 POST 和 DELETE 都被当成 Hide=false，
+    // 走“清除墓碑”分支，播放记录原地不动——用户反馈的“删除记录没有生效”就是这个。
+    let hideBody = {};
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      try {
+        hideBody = parseJsonBodyText(await request.clone().text());
+      } catch {
+        hideBody = {};
+      }
+    }
+    const hideParam = pickUserDataValue(hideBody, url.searchParams, ["Hide", "hide"]);
+    // 没带任何参数时：DELETE 一律按“移除续播记录”处理（客户端常用这种写法）。
+    // 显式传 Hide=false 才表示“取消隐藏”（清墓碑）。
+    const hide = hideParam === undefined && request.method === "DELETE"
+      ? true
+      : isTruthyUserDataFlag(hideParam);
     const hiddenState = await readPlaybackState(env, token);
     if (hide) {
-      await removePlaybackRecord(env, token, hiddenState, hideItemId);
+      await removePlaybackRecordById(env, fetchImpl, token, hiddenState, hideItemId);
       await writePlaybackState(env, hiddenState, token);
     } else {
       await clearPlaybackTombstone(
@@ -10352,7 +10442,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
     const userDataItemId = decodeURIComponent(userDataMatch[1]);
     const userDataState = await readPlaybackState(env, token);
     if (request.method === "DELETE") {
-      await removePlaybackRecord(env, token, userDataState, userDataItemId);
+      await removePlaybackRecordById(env, fetchImpl, token, userDataState, userDataItemId);
       await writePlaybackState(env, userDataState, token);
       return jsonResponse(userDataForRecord(userDataState[userDataItemId]));
     }
@@ -10392,7 +10482,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       if (explicitProgressClear) {
         // UserData 回写 0 进度（或未播状态）也是客户端的“移除续播”操作，
         // 按删除处理并立墓碑；收藏字段若同请求带回，仍按原值保留。
-        await removePlaybackRecord(env, token, userDataState, userDataItemId);
+        await removePlaybackRecordById(env, fetchImpl, token, userDataState, userDataItemId);
         if (favoriteParam !== undefined) {
           const favoriteRecord = userDataState[userDataItemId] || {
             itemId: userDataItemId,
@@ -10487,7 +10577,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
     const deleteItemId = decodeURIComponent(playbackItemDeleteMatch[2]);
     const deleteState = await readPlaybackState(env, token);
     if (deleteAction === "playeditems") {
-      await removePlaybackRecord(env, token, deleteState, deleteItemId);
+      await removePlaybackRecordById(env, fetchImpl, token, deleteState, deleteItemId);
       await writePlaybackState(env, deleteState, token);
       return jsonResponse(userDataForRecord(deleteState[deleteItemId]));
     }
@@ -10540,7 +10630,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
   if (playedItemsMatch && request.method === "DELETE") {
     const removedPlayedId = decodeURIComponent(playedItemsMatch[1]);
     const removedPlayedState = await readPlaybackState(env, token);
-    await removePlaybackRecord(env, token, removedPlayedState, removedPlayedId);
+    await removePlaybackRecordById(env, fetchImpl, token, removedPlayedState, removedPlayedId);
     await writePlaybackState(env, removedPlayedState, token);
     return jsonResponse(userDataForRecord(removedPlayedState[removedPlayedId]));
   }
@@ -10550,7 +10640,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
     const unplayedState = await readPlaybackState(env, token);
     // “标记未播放”就是把条目移出继续观看：删记录 + 立墓碑，
     // 否则客户端紧接着补发的旧进度会把它又写回来。
-    await removePlaybackRecord(env, token, unplayedState, unplayedItemId);
+    await removePlaybackRecordById(env, fetchImpl, token, unplayedState, unplayedItemId);
     await writePlaybackState(env, unplayedState, token);
     return jsonResponse(userDataForRecord(unplayedState[unplayedItemId]));
   }
@@ -10705,6 +10795,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       request,
       env,
       token,
+      fetchImpl,
     ));
   }
   // 旧版 / 第三方客户端的写法：/UserPlayedItems/{id}、/UserFavoriteItems/{id}
@@ -10714,7 +10805,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
     const legacyAction =
       legacyUserItemMatch[1].toLowerCase() === "played" ? "playeditems" : "favoriteitems";
     if (["POST", "PUT", "DELETE"].includes(request.method)) {
-      return jsonResponse(await applyItemUserDataAction(legacyItemId, legacyAction, request, env, token));
+      return jsonResponse(await applyItemUserDataAction(legacyItemId, legacyAction, request, env, token, fetchImpl));
     }
     if (request.method === "GET") {
       const legacyState = await readPlaybackState(env, token);
@@ -10724,7 +10815,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
 
   // 统一兜底：走到这里说明前面所有具体删除处理都没匹配上。
   // 退一步按“删除/标记 = 清掉该条目的播放记录”处理，避免客户端报 404。
-  const genericFallbackDelete = await handleFallbackDelete(path, request, env, url);
+  const genericFallbackDelete = await handleFallbackDelete(path, request, env, url, fetchImpl);
   if (genericFallbackDelete) {
     return genericFallbackDelete;
   }
@@ -10934,7 +11025,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
     );
   }
 
-  const lateFallbackDelete = await handleFallbackDelete(path, request, env, url);
+  const lateFallbackDelete = await handleFallbackDelete(path, request, env, url, fetchImpl);
   if (lateFallbackDelete) {
     return lateFallbackDelete;
   }

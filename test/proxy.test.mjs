@@ -8134,3 +8134,176 @@ test("stores and returns actor favorites through the Emby person endpoints", asy
   );
   assert.equal((await afterFavorites.json()).TotalRecordCount, 0);
 });
+
+test("HideFromResume accepts the client's JSON body form", async () => {
+  // Emby 客户端“从继续观看中移除”发的是
+  //   POST /Items/{id}/HideFromResume  body {"Hide": true}
+  // 早期实现只读查询串，于是把 body 里的 Hide 当成 false（走“清墓碑”分支），
+  // 播放记录原地不动——这就是用户反馈的“删除记录没有生效”。
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-body",
+    PositionTicks: 120_000_000,
+  }));
+
+  const hidden = await callLocalEmby(embyJsonRequest(
+    "/Users/bbjavdb-user/Items/42/HideFromResume",
+    { Hide: true },
+  ));
+  assert.equal(hidden.status, 200);
+  assert.equal((await hidden.json()).PlaybackPositionTicks, 0);
+
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
+
+  // 同一会话的迟到进度不能把刚删掉的记录带回来（墓碑要立住）。
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing/Progress", {
+    ItemId: "42",
+    PlaySessionId: "session-body",
+    PositionTicks: 120_000_000,
+  }));
+  const again = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await again.json()).PlaybackPositionTicks, 0);
+});
+
+test("removes a record stored under the numeric id when the client deletes by number", async () => {
+  // 同一部影片在客户端眼里有两种 Id 写法（上游数字 Id / 番号），记录可能落在
+  // 任一种下面，而“移除记录”传的又可能是另一种。删除必须两种都清掉。
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    if (target.includes("/v4/movies/")) {
+      return new Response(JSON.stringify({
+        success: 1,
+        data: {
+          movie: {
+            id: "12345",
+            number: "ABP-123",
+            title: "ABP-123",
+            can_play: true,
+            has_cnsub: true,
+          },
+        },
+      }), { headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ success: 1, data: { movies: [] } }), {
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  await handleProxy(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "12345",
+    PlaySessionId: "session-alias",
+    PositionTicks: 120_000_000,
+  }), {}, {}, fetchImpl);
+
+  const before = await handleProxy(new Request(
+    "https://clone.example/emby/Items/12345/UserData",
+  ), {}, {}, fetchImpl);
+  assert.equal((await before.json()).PlaybackPositionTicks, 120_000_000);
+
+  const deleted = await handleProxy(embyJsonRequest(
+    "/Users/bbjavdb-user/PlayedItems/ABP-123",
+    undefined,
+    "DELETE",
+  ), {}, {}, fetchImpl);
+  assert.equal(deleted.status, 200);
+
+  const after = await handleProxy(new Request(
+    "https://clone.example/emby/Items/12345/UserData",
+  ), {}, {}, fetchImpl);
+  assert.equal((await after.json()).PlaybackPositionTicks, 0);
+});
+
+test("keeps a scan that never reached the end out of the shared list cache", async () => {
+  // “搜索资源变少 / 两端数量对不上”的根因：一轮没翻到底的扫描（上游抖动或撞上
+  // 翻页预算）也被写进 5 分钟的边缘缓存，缺量结果被钉死。这里锁住：没翻到底的
+  // 结果只允许在实例内存里短存（吸收同一瞬间的并发请求），绝不进共享缓存。
+  const puts = [];
+  const previousCaches = globalThis.caches;
+  globalThis.caches = {
+    default: {
+      async match() {
+        return undefined;
+      },
+      async put(request) {
+        puts.push(new URL(request.url).pathname);
+      },
+      async delete() {},
+    },
+  };
+  try {
+    const movies = Array.from({ length: 50 }, (_, index) => ({
+      id: `trunc-${index}`,
+      number: `TRUNC-${String(index).padStart(3, "0")}`,
+      title: `母亲 ${index}`,
+      can_play: true,
+      has_cnsub: true,
+    }));
+    let firstPageServed = 0;
+    const fetchImpl = async (url) => {
+      const target = String(url);
+      if (!target.includes("/v2/search")) {
+        return new Response(JSON.stringify({ success: 1, data: { movies: [] } }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const page = Number(new URL(target).searchParams.get("page") || 1);
+      if (page === 1) {
+        firstPageServed += 1;
+        // 正好一整页（50 条 = 上游单页上限），扫描必须继续往后翻才知道有没有翻到底。
+        return new Response(JSON.stringify({ success: 1, data: { movies } }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error("upstream page failure");
+    };
+
+    const response = await handleProxy(
+      new Request(
+        "https://clone.example/emby/Items?SearchTerm=%E6%AF%8D%E4%BA%B2&Recursive=true&IncludeItemTypes=Movie&Limit=20",
+      ),
+      {},
+      {},
+      fetchImpl,
+    );
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(firstPageServed > 0, true);
+    // 第一页的 50 条仍然要返回给客户端（部分结果好过报错）。
+    assert.equal(payload.Items.length, 20);
+    // 但这份“没翻到底”的结果不能进共享边缘缓存。
+    assert.deepEqual(puts.filter((path) => path.includes("/v1/list/")), []);
+  } finally {
+    if (previousCaches === undefined) {
+      delete globalThis.caches;
+    } else {
+      globalThis.caches = previousCaches;
+    }
+  }
+});
+
+test("HideFromResume also accepts a bare DELETE", async () => {
+  // 有的客户端直接用 DELETE 表示“从继续观看里移除”，不带任何参数。
+  await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
+    ItemId: "42",
+    PlaySessionId: "session-del",
+    PositionTicks: 120_000_000,
+  }));
+
+  const deleted = await callLocalEmby(embyJsonRequest(
+    "/Users/bbjavdb-user/Items/42/HideFromResume",
+    undefined,
+    "DELETE",
+  ));
+  assert.equal(deleted.status, 200);
+  assert.equal((await deleted.json()).PlaybackPositionTicks, 0);
+
+  const readBack = await callLocalEmby(new Request(
+    "https://clone.example/emby/Items/42/UserData",
+  ));
+  assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
+});
