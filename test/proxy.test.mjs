@@ -6190,15 +6190,11 @@ test("retries a transient 5xx media response once", async () => {
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
 });
 
-test("buffers a media Range request once and serves the slice without background warmup", async () => {
+test("passes a media Range request through to the upstream and returns the partial response", async () => {
   const sourceUrl = "https://fast-stream.jav.si/video/range-first.ts";
   const proxyUrl =
     `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
   const requestedRange = "bytes=4-7";
-  const fullBytes = Uint8Array.from(
-    { length: 20 },
-    (_, index) => index,
-  );
   const partialBytes = Uint8Array.from([4, 5, 6, 7]);
   let upstreamFetches = 0;
   let waitUntilCalls = 0;
@@ -6208,6 +6204,7 @@ test("buffers a media Range request once and serves the slice without background
       return task;
     },
   };
+  const seenRanges = [];
 
   const response = await handleProxy(
     new Request(proxyUrl, { headers: { range: requestedRange } }),
@@ -6215,11 +6212,12 @@ test("buffers a media Range request once and serves the slice without background
     context,
     async (_url, init = {}) => {
       upstreamFetches += 1;
-      assert.equal(init.headers.get("range"), null);
-      return new Response(fullBytes, {
-        status: 200,
+      seenRanges.push(init.headers.get("range"));
+      return new Response(partialBytes, {
+        status: 206,
         headers: {
-          "content-length": String(fullBytes.length),
+          "content-length": String(partialBytes.length),
+          "content-range": "bytes 4-7/20",
           "content-type": "video/mp2t",
         },
       });
@@ -6227,6 +6225,7 @@ test("buffers a media Range request once and serves the slice without background
   );
 
   assert.equal(upstreamFetches, 1);
+  assert.deepEqual(seenRanges, [requestedRange]);
   assert.equal(waitUntilCalls, 0);
   assert.equal(response.status, 206);
   assert.equal(response.headers.get("content-range"), "bytes 4-7/20");
@@ -6237,39 +6236,70 @@ test("buffers a media Range request once and serves the slice without background
   );
 });
 
-test("coalesces concurrent media Range requests into one full segment fetch", async () => {
+test("serves a repeated identical media Range request from the range cache without a second upstream fetch", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/range-repeat.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const partialBytes = Uint8Array.from([9, 8, 7, 6]);
+  let upstreamFetches = 0;
+
+  const upstream = async () => {
+    upstreamFetches += 1;
+    return new Response(partialBytes, {
+      status: 206,
+      headers: {
+        "content-length": String(partialBytes.length),
+        "content-range": "bytes 4-7/20",
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const first = await handleProxy(
+    new Request(proxyUrl, { headers: { range: "bytes=4-7" } }),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(first.status, 206);
+  // Drain the first response so the tee finishes and writes the range cache.
+  assert.deepEqual(new Uint8Array(await first.arrayBuffer()), partialBytes);
+  assert.equal(upstreamFetches, 1);
+
+  const second = await handleProxy(
+    new Request(proxyUrl, { headers: { range: "bytes=4-7" } }),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(upstreamFetches, 1);
+  assert.equal(second.status, 206);
+  assert.equal(second.headers.get("content-range"), "bytes 4-7/20");
+  assert.deepEqual(new Uint8Array(await second.arrayBuffer()), partialBytes);
+});
+
+test("passes different concurrent media Range requests through on separate connections", async () => {
   const sourceUrl = "https://fast-stream.jav.si/video/concurrent-range.ts";
   const proxyUrl =
     `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
-  const fullBytes = Uint8Array.from(
-    { length: 12 },
-    (_, index) => index,
-  );
-  let upstreamFetches = 0;
-  let waitUntilCalls = 0;
-  const context = {
-    waitUntil(task) {
-      waitUntilCalls += 1;
-      return task;
-    },
-  };
+  const seenRanges = [];
 
   const responses = await Promise.all(
     Array.from({ length: 3 }, (_, index) => {
       const start = index * 4;
+      const rangeHeader = `bytes=${start}-${start + 3}`;
+      const partialBytes = Uint8Array.from([start, start + 1, start + 2, start + 3]);
       return handleProxy(
-        new Request(proxyUrl, {
-          headers: { range: `bytes=${start}-${start + 3}` },
-        }),
+        new Request(proxyUrl, { headers: { range: rangeHeader } }),
         {},
-        context,
+        {},
         async (_url, init = {}) => {
-          upstreamFetches += 1;
-          assert.equal(init.headers.get("range"), null);
-          return new Response(fullBytes, {
-            status: 200,
+          seenRanges.push(init.headers.get("range"));
+          return new Response(partialBytes, {
+            status: 206,
             headers: {
-              "content-length": String(fullBytes.length),
+              "content-length": String(partialBytes.length),
+              "content-range": `bytes ${start}-${start + 3}/12`,
               "content-type": "video/mp2t",
             },
           });
@@ -6278,8 +6308,10 @@ test("coalesces concurrent media Range requests into one full segment fetch", as
     }),
   );
 
-  assert.equal(upstreamFetches, 1);
-  assert.equal(waitUntilCalls, 0);
+  assert.deepEqual(
+    [...seenRanges].sort(),
+    ["bytes=0-3", "bytes=4-7", "bytes=8-11"],
+  );
   for (let index = 0; index < responses.length; index += 1) {
     const response = responses[index];
     const start = index * 4;
@@ -6304,6 +6336,7 @@ test("proxies resolver CDN Range requests for every current media suffix", async
       `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
     const bytes = new Uint8Array([0x47, 0x40, 0x11, 0x10]);
     let upstreamFetches = 0;
+    let seenRange = null;
 
     const response = await handleProxy(
       new Request(proxyUrl, { headers: { range: "bytes=0-3" } }),
@@ -6311,11 +6344,12 @@ test("proxies resolver CDN Range requests for every current media suffix", async
       {},
       async (_url, init = {}) => {
         upstreamFetches += 1;
-        assert.equal(init.headers.get("range"), null);
+        seenRange = init.headers.get("range");
         return new Response(bytes, {
-          status: 200,
+          status: 206,
           headers: {
             "content-length": String(bytes.length),
+            "content-range": "bytes 0-3/4",
             "content-type": "application/octet-stream",
           },
         });
@@ -6323,6 +6357,7 @@ test("proxies resolver CDN Range requests for every current media suffix", async
     );
 
     assert.equal(upstreamFetches, 1);
+    assert.equal(seenRange, "bytes=0-3");
     assert.equal(response.status, 206);
     assert.equal(response.headers.get("content-range"), "bytes 0-3/4");
     assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
@@ -7992,4 +8027,110 @@ test("streams relative URLs from alternate resolver response fields", async () =
   ]);
   assert.deepEqual(freshRanges, ["bytes=0-511", "bytes=0-3"]);
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), videoBytes);
+});
+
+test("remembers the first login password per username and rejects later mismatches", async () => {
+  const env = { PLAYBACK_DB: createPlaybackD1() };
+  const login = (username, password) =>
+    callLocalEmby(
+      new Request("https://clone.example/emby/Users/AuthenticateByName", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ Username: username, Pw: password }),
+      }),
+      env,
+    );
+
+  // 首次登录：任意密码都会被记住
+  const first = await login("alice", "first-pass");
+  assert.equal(first.status, 200);
+
+  // 模拟请求落到另一个实例：清掉进程内存缓存，持久化存储里的密码必须仍然生效
+  resetEmbyCachesForTests();
+
+  const second = await login("alice", "first-pass");
+  assert.equal(second.status, 200);
+
+  const wrong = await login("alice", "other-pass");
+  assert.equal(wrong.status, 401);
+  assert.equal((await wrong.json()).Message, "密码不正确");
+
+  // 被拒绝的错误密码不能覆盖已记住的密码
+  resetEmbyCachesForTests();
+  const stillCorrect = await login("alice", "first-pass");
+  assert.equal(stillCorrect.status, 200);
+
+  // 每个用户名各自记住自己的首次密码
+  const bob = await login("bob", "bob-pass");
+  assert.equal(bob.status, 200);
+  const bobWrong = await login("bob", "alice-first-pass");
+  assert.equal(bobWrong.status, 401);
+});
+
+test("stores and returns actor favorites through the Emby person endpoints", async () => {
+  const env = { PLAYBACK_DB: createPlaybackD1() };
+  const personId = "person:Yua Mikami";
+  const encodedPersonId = encodeURIComponent(personId);
+  const userId = "bbjavdb-user";
+
+  const favorite = await callLocalEmby(
+    embyJsonRequest(`/Users/${userId}/FavoriteItems/${encodedPersonId}`),
+    env,
+  );
+  assert.equal(favorite.status, 200);
+  assert.equal((await favorite.json()).IsFavorite, true);
+
+  // 演员详情 /Items/person:<名>：旧实现完全没有 UserData，客户端于是显示未收藏
+  const detail = await callLocalEmby(
+    new Request(`https://clone.example/emby/Items/${encodedPersonId}`),
+    env,
+  );
+  const detailPayload = await detail.json();
+  assert.equal(detailPayload.Type, "Person");
+  assert.equal(detailPayload.UserData.IsFavorite, true);
+
+  // 批量取条目 /Items?Ids=person:<名>
+  const batch = await callLocalEmby(
+    new Request(`https://clone.example/emby/Items?Ids=${encodedPersonId}`),
+    env,
+  );
+  const [batchPerson] = (await batch.json()).Items;
+  assert.equal(batchPerson.Type, "Person");
+  assert.equal(batchPerson.UserData.IsFavorite, true);
+
+  // /Persons/<演员名>
+  const person = await callLocalEmby(
+    new Request(`https://clone.example/emby/Persons/${encodeURIComponent("Yua Mikami")}`),
+    env,
+  );
+  assert.equal((await person.json()).UserData.IsFavorite, true);
+
+  // 收藏页包含这位演员
+  const favorites = await callLocalEmby(
+    new Request("https://clone.example/emby/Items?Filters=IsFavorite&IncludeItemTypes=Person"),
+    env,
+  );
+  const favoritePayload = await favorites.json();
+  assert.equal(favoritePayload.TotalRecordCount, 1);
+  assert.equal(favoritePayload.Items[0].Id, personId);
+  assert.equal(favoritePayload.Items[0].UserData.IsFavorite, true);
+
+  // 取消收藏：三个读取入口都应回到未收藏
+  const unfavorite = await callLocalEmby(
+    embyJsonRequest(`/Users/${userId}/FavoriteItems/${encodedPersonId}`, undefined, "DELETE"),
+    env,
+  );
+  assert.equal((await unfavorite.json()).IsFavorite, false);
+
+  const after = await callLocalEmby(
+    new Request(`https://clone.example/emby/Items/${encodedPersonId}`),
+    env,
+  );
+  assert.equal((await after.json()).UserData.IsFavorite, false);
+
+  const afterFavorites = await callLocalEmby(
+    new Request("https://clone.example/emby/Items?Filters=IsFavorite&IncludeItemTypes=Person"),
+    env,
+  );
+  assert.equal((await afterFavorites.json()).TotalRecordCount, 0);
 });

@@ -133,7 +133,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v22";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-08-firstscreen-settled-26";
+const SERVER_BUILD_ID = "2026-10-08-media-range-passthrough-27";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -1789,6 +1789,93 @@ function cachedMediaSegmentResponse(record, request) {
   });
 }
 
+// Range 缓存键：同一分片的不同 Range 分开缓存，互不影响。
+function mediaSegmentRangeCacheKey(cacheKey, rangeHeader) {
+  return `${cacheKey}|range|${String(rangeHeader || "").trim().toLowerCase()}`;
+}
+
+// 把上游 206 响应的元数据（Content-Range / Content-Type / ETag 等）连同
+// 这一段 Range 的字节一起记下来，供“完全相同的 Range”本地重放。
+function mediaRangeRecordForBytes(upstream, bytes) {
+  const headers = mediaSegmentRecordHeaders(upstream, bytes.byteLength);
+  const contentRange = upstream.headers.get("content-range") || "";
+  if (contentRange) {
+    headers.set("content-range", contentRange);
+  }
+  // Range 响应是临时的：本地内存缓存就够，别让 Cloudflare 再存一份。
+  headers.set("cache-control", "no-store");
+  return {
+    bytes,
+    headers: [...headers.entries()],
+    status: upstream.status,
+    statusText: upstream.statusText,
+    contentRange,
+    rangeable: true,
+  };
+}
+
+// Range 响应“边透传边缓存”：
+//  - 字节一到就转发给客户端（首个字节 = 上游 TTFB），不再等整段下载完；
+//  - 完整读完后写进 Range 缓存，完全相同的 Range 下次直接本地命中；
+//  - 只有体积不超过上限的 Range 才缓存（Range 分块通常 ~1 MB），超限只透传。
+function teeMediaRangeResponseBody(upstream, rangeKey, maxBytes) {
+  if (!upstream.body) return upstream;
+  const contentLength = Number(upstream.headers.get("content-length"));
+  const limit = Math.max(0, Math.floor(Number(maxBytes) || 0));
+  const shouldCache = Number.isSafeInteger(contentLength) &&
+    contentLength > 0 &&
+    contentLength <= limit;
+  let buffer = shouldCache ? new Uint8Array(contentLength) : null;
+  let offset = 0;
+  let stored = false;
+  const store = () => {
+    if (stored || !buffer || offset !== buffer.byteLength) return;
+    stored = true;
+    MEDIA_SEGMENT_RANGE_CACHE.write(
+      rangeKey,
+      mediaRangeRecordForBytes(upstream, buffer),
+    );
+  };
+  const reader = upstream.body.getReader();
+  const body = new ReadableStream({
+    async pull(controller) {
+      let result;
+      try {
+        result = await reader.read();
+      } catch (error) {
+        controller.error(error);
+        return;
+      }
+      if (result.done) {
+        store();
+        controller.close();
+        return;
+      }
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value);
+      if (buffer) {
+        if (offset + chunk.byteLength <= buffer.byteLength) {
+          buffer.set(chunk, offset);
+          offset += chunk.byteLength;
+        } else {
+          buffer = null;
+        }
+      }
+      controller.enqueue(chunk);
+    },
+    cancel(reason) {
+      store();
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: mediaProxyResponseHeaders(upstream),
+  });
+}
+
 async function fetchMediaUpstreamResponse(
   request,
   sourceUrl,
@@ -1875,69 +1962,39 @@ async function fetchMediaUpstreamResponse(
 
   if (usesMediaSegmentCache && !needsEmbeddedTsNormalization) {
     if (request.headers.has("range")) {
-      // HLS 播放器（含 Android 自带播放器）对同一分片会并发发出多个 Range，
-      // 甚至带多线程加速/断点续传对同一分片重复取前缀。旧实现把每个 Range
-      // 原样透传给 CDN：同一分片被反复回源，Worker 的 CPU/内存很快被打到
-      // Cloudflare 1102（截图中的 “503 error code: 1102”），表现就是播放
-      // 一直卡、不断重试。
-      // 这里改成“同一分片只合并下载一次完整内容”，缓存后在内存里切片返回，
-      // 之后的并发/续传 Range 全部本地命中、不再回源；只有整段体积超过缓存
-      // 上限时才回退到直接透传，避免占用过多内存。
-      if (
-        mediaSegmentRangeBuffersInFlight >=
-          MEDIA_SEGMENT_RANGE_BUFFER_CONCURRENCY &&
-        !MEDIA_SEGMENT_BODY_CACHE.hasPending(cacheKey)
-      ) {
-        return fetchUpstreamWithRetry();
-      }
-      const countsTowardRangeBufferLimit =
-        mediaSegmentRangeBuffersInFlight <
-        MEDIA_SEGMENT_RANGE_BUFFER_CONCURRENCY;
-      if (countsTowardRangeBufferLimit) {
-        mediaSegmentRangeBuffersInFlight += 1;
-      }
-      let buffered;
-      try {
-        buffered = await MEDIA_SEGMENT_BODY_CACHE.coalesce(
-          cacheKey,
-          async () => {
-            const fullHeaders = new Headers(headers);
-            fullHeaders.delete("range");
-            const upstream = await fetchUpstreamWithRetry(fullHeaders);
-            if (!upstream.ok || upstream.status !== 200) {
-              try {
-                await upstream.body?.cancel();
-              } catch {}
-              return null;
-            }
-            const contentLength = Number(upstream.headers.get("content-length"));
-            if (
-              Number.isSafeInteger(contentLength) &&
-              contentLength > MAX_CACHED_MEDIA_SEGMENT_BYTES
-            ) {
-              try {
-                await upstream.body?.cancel();
-              } catch {}
-              return null;
-            }
-            const result = await bufferMediaSegmentResponse(upstream, sourceUrl);
-            if (result?.cacheable) {
-              MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, result.record);
-              return result.record;
-            }
-            return null;
-          },
-        );
-      } finally {
-        if (countsTowardRangeBufferLimit) {
-          mediaSegmentRangeBuffersInFlight -= 1;
-        }
-      }
-      if (buffered?.bytes) {
-        const response = cachedMediaSegmentResponse(buffered, request);
+      // Range 请求原样透传给上游：首个字节 = 上游 TTFB，多个 Range 并行下载
+      // （多线程加速 / 断点续传）不会被串行化成一条连接。完整收到这一段
+      // Range 后缓存下来，完全相同的 Range 重试直接本地命中、不再回源。
+      // 旧实现会先把整段分片完整下载再在内存里切片返回，首个字节要等整段
+      // 下完（实测 GetAV 4K 分片 6.8 秒），播放因此一直卡。
+      const rangeHeader = request.headers.get("range");
+      const rangeKey = mediaSegmentRangeCacheKey(cacheKey, rangeHeader);
+      const cachedRange = MEDIA_SEGMENT_RANGE_CACHE.read(rangeKey);
+      if (cachedRange?.bytes) {
+        const response = mediaRecordResponse(cachedRange, request);
         if (response) return response;
       }
-      return fetchUpstreamWithRetry();
+      // 同一分片的“整段下载”已经在进行（例如另一个没带 Range 的请求）：
+      // 等它一次，避免同一分片被下载两遍。没有在下载时不做任何等待。
+      if (MEDIA_SEGMENT_BODY_CACHE.hasPending(cacheKey)) {
+        const buffered = await MEDIA_SEGMENT_BODY_CACHE.coalesce(
+          cacheKey,
+          async () => null,
+        );
+        if (buffered?.bytes) {
+          const response = cachedMediaSegmentResponse(buffered, request);
+          if (response) return response;
+        }
+      }
+      const upstream = await fetchUpstreamWithRetry();
+      if (upstream.status === 206 && !upstream.headers.has("content-encoding")) {
+        return teeMediaRangeResponseBody(
+          upstream,
+          rangeKey,
+          MAX_CACHED_MEDIA_SEGMENT_RANGE_BYTES,
+        );
+      }
+      return upstream;
     }
     const upstream = await fetchUpstreamWithRetry();
     const response = streamCompleteMediaSegmentResponse(upstream, cacheKey);
@@ -2981,11 +3038,21 @@ const MAX_LIST_WINDOW_ENTRIES = 8;
 // 压到 32 MB。分片缓存只是“seek/断点续传时少一次回源”，条数减少不会
 // 影响播放正确性，却能显著降低触发 Cloudflare 1102（内存/CPU 超限）的概率。
 const MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES = 2;
-// 同一分片的 Range 合并下载最多并发 2 个：既避免同一分片被反复回源，
-// 又不让多个大分片同时驻留内存（Cloudflare 1102 的另一大来源）。
-// 超过并发上限的 Range 请求直接透传，等前面的下载写进缓存后自然会命中。
-const MEDIA_SEGMENT_RANGE_BUFFER_CONCURRENCY = 2;
-let mediaSegmentRangeBuffersInFlight = 0;
+// 单个 Range 响应的本地缓存。多线程 HLS 播放器（“m3u8 多线程加速 / 断点
+// 续传”那类实现）会把同一分片拆成多个 Range 并行拉取，还会对同一 Range
+// 反复重试。旧实现为了“同一分片只回源一次”，把 Range 请求改成“先完整下载
+// 整段、再在内存里切片返回”：首个字节必须等整段下完（实测 GetAV 4K 分片
+// 要 6.8 秒），播放器缓冲直接被抽空，表现为一直卡；而且它把客户端的并行
+// 下载强行串行成一条连接，客户端的多线程加速彻底失效。
+// 现在改回“Range 原样透传 + 边传边缓存”：
+//   - 首个字节 = 上游 TTFB，不再等整段下载完；
+//   - 每个 Range 各走一条连接，客户端的并行加速真正生效；
+//   - 完整收到某一段 Range 后按“分片 + Range”缓存，完全相同的 Range
+//     （断点续传重试、seek 回看）直接命中本地，不再回源。
+// 单条上限 2 MB：Range 分块通常 ~1 MB，缓存的是“块”而不是 13 MB 的整段，
+// 同样的内存预算能覆盖更多请求，也不会再把实例内存打爆（Cloudflare 1102）。
+const MEDIA_SEGMENT_RANGE_CACHE_MAX_ENTRIES = 24;
+const MAX_CACHED_MEDIA_SEGMENT_RANGE_BYTES = 2 * 1024 * 1024;
 // 伪 PNG/TS 分片只需要缓存“PNG 前缀长度”和上游总长度。这个元数据很小，
 // 可以比完整分片多留很多条，让并发 Range 请求不用反复探测同一分片。
 const MEDIA_SEGMENT_PREFIX_CACHE_MAX_ENTRIES = 1024;
@@ -3081,6 +3148,10 @@ const MEDIA_SEGMENT_BODY_CACHE = createTtlCache(
 const MEDIA_SEGMENT_PREFIX_CACHE = createTtlCache(
   MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
   MEDIA_SEGMENT_PREFIX_CACHE_MAX_ENTRIES,
+);
+const MEDIA_SEGMENT_RANGE_CACHE = createTtlCache(
+  MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
+  MEDIA_SEGMENT_RANGE_CACHE_MAX_ENTRIES,
 );
 
 // ---------- 边缘缓存（跨实例复用） ----------
@@ -4759,7 +4830,10 @@ function collectionFilterName(query) {
 }
 
 // 演员条目（供客户端打开演员详情页 / 展示演员名）
-function personItemDto(id, name, env) {
+function personItemDto(id, name, env, state = null) {
+  // 演员也要带 UserData：客户端收藏演员后，收藏图标 / 收藏页读的就是这里的
+  // IsFavorite。旧实现完全不返回 UserData，于是“收藏演员”看起来没有效果。
+  const record = state && typeof state === "object" ? state[id] : undefined;
   return {
     Id: id,
     Name: name,
@@ -4772,6 +4846,7 @@ function personItemDto(id, name, env) {
     ImageTags: {},
     BackdropImageTags: [],
     Overview: "",
+    UserData: userDataForRecord(record),
   };
 }
 
@@ -7468,7 +7543,12 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   // 演员条目：Id 为 person:<演员名> 时直接返回 Person 对象，不当作影片回源。
   const personNameFromId = personNameFromItemId(id);
   if (personNameFromId) {
-    return jsonResponse(personItemDto(id, personNameFromId, env));
+    return jsonResponse(personItemDto(
+      id,
+      personNameFromId,
+      env,
+      await readPlaybackState(env, token),
+    ));
   }
   const requestDeadline = Date.now() + ITEM_REQUEST_DEADLINE_MS;
   const metadataBudgetMs = remainingRequestMs(
@@ -7950,6 +8030,10 @@ async function lookupSessionUsername(env, token) {
 }
 
 // “记住首次登录密码”：同一用户名第二次登录时，密码必须与首次一致。
+// 登录密码必须和播放状态走同一套持久化：只放进程内存时，请求换个实例
+// 就查不到已存密码，表现成“随便什么密码都能登录”。
+//   login-password —— 用户名 → 首次登录密码（首次记住，之后必须一致）
+const EDGE_NAMESPACE_LOGIN_PASSWORD = "login-password";
 const LOGIN_PASSWORD_KEY_PREFIX = "login-password:v1:";
 const MEMORY_LOGIN_PASSWORDS = new Map();
 
@@ -7964,16 +8048,21 @@ function loginPasswordRecordKey(username) {
 async function readStoredLoginPassword(env, username) {
   const name = normalizedLoginName(username);
   if (!name) return "";
-  const kv = playbackKv(env);
   const memoryValue = MEMORY_LOGIN_PASSWORDS.get(name);
-  if (!kv) {
-    return typeof memoryValue === "string" ? memoryValue : "";
-  }
   try {
-    const value = await kv.get(loginPasswordRecordKey(username), "text");
-    if (typeof value === "string" && value.length > 0) {
-      MEMORY_LOGIN_PASSWORDS.set(name, value);
-      return value;
+    const record = await durableJsonRead(
+      env,
+      EDGE_NAMESPACE_LOGIN_PASSWORD,
+      loginPasswordRecordKey(username),
+    );
+    if (record && typeof record.password === "string" && record.password) {
+      MEMORY_LOGIN_PASSWORDS.set(name, record.password);
+      return record.password;
+    }
+    if (record !== undefined && record !== null) {
+      // 持久化存储明确回答“这个用户名没存过密码”，以它为准，
+      // 不能沿用本实例内存里可能残留的旧值。
+      return "";
     }
   } catch (error) {
     console.error(JSON.stringify({
@@ -7981,6 +8070,8 @@ async function readStoredLoginPassword(env, username) {
       error: error instanceof Error ? error.message : String(error),
     }));
   }
+  // record === undefined：当前部署没有任何持久化存储（例如本机 Node 环境），
+  // 退回进程内存兜底。
   return typeof memoryValue === "string" ? memoryValue : "";
 }
 
@@ -7993,10 +8084,15 @@ async function storeStoredLoginPassword(env, username, password) {
   } catch {
     // 内存兜底失败不影响主流程
   }
-  const kv = playbackKv(env);
-  if (!kv) return;
+  // 关键：不能只写进程内存。请求可能落到别的实例（或实例刚重启），只有
+  // 持久化存储才能保证“同一用户名第二次登录密码必须一致”。
   try {
-    await kv.put(loginPasswordRecordKey(username), pw);
+    await durableJsonWrite(
+      env,
+      EDGE_NAMESPACE_LOGIN_PASSWORD,
+      loginPasswordRecordKey(username),
+      { password: pw, updatedAt: Date.now() },
+    );
   } catch (error) {
     console.error(JSON.stringify({
       message: "Stored login password write failed",
@@ -8962,7 +9058,7 @@ async function favoriteItemsPage(query, env, fetchImpl, token) {
     const personName = personNameFromItemId(record.itemId);
     if (personName) {
       if (kinds.persons) {
-        items.push(personItemDto(record.itemId, personName, env));
+        items.push(personItemDto(record.itemId, personName, env, state));
       }
       continue;
     }
@@ -9079,10 +9175,10 @@ async function studioFacetItems(env, fetchImpl, token) {
 }
 
 // 单条影片元数据（不解析播放源）：批量取条目时用，保证标签/演员等字段齐全。
-async function movieItemById(id, requestUrl, env, fetchImpl, token) {
+async function movieItemById(id, requestUrl, env, fetchImpl, token, state = null) {
   const personName = personNameFromItemId(id);
   if (personName) {
-    return personItemDto(id, personName, env);
+    return personItemDto(id, personName, env, state);
   }
   const movie = await getMovieCached(id, env, fetchImpl, token);
   if (!movie || (!movie.id && !movie.number)) {
@@ -10117,6 +10213,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
               env,
               fetchImpl,
               token,
+              batchState,
             );
             if (batchItem) {
               batchItems.push(attachPlaybackUserData(batchItem, batchState));
@@ -10203,7 +10300,12 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
   const personSingleMatch = path.match(/^\/Persons\/([^/]+)$/i);
   if (personSingleMatch) {
     const personName = decodeURIComponent(personSingleMatch[1]);
-    return jsonResponse(personItemDto(personIdForName(personName), personName, env));
+    return jsonResponse(personItemDto(
+      personIdForName(personName),
+      personName,
+      env,
+      await readPlaybackState(env, token),
+    ));
   }
   // 分类页 / 片商页：给客户端的列表填上真实条目。
   // 点进去以后客户端会带 GenreIds / StudioIds 回来，再转成上游搜索。
@@ -10869,6 +10971,7 @@ export function resetEmbyCachesForTests() {
   API_TOKEN_CACHE.clear();
   MEDIA_SEGMENT_BODY_CACHE.clear();
   MEDIA_SEGMENT_PREFIX_CACHE.clear();
+  MEDIA_SEGMENT_RANGE_CACHE.clear();
   SUBTITLE_STREAM_TOKENS.clear();
   SUBTITLE_BODY_CACHE.clear();
   MEMORY_PLAYBACK_STATES.clear();
