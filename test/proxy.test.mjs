@@ -294,7 +294,7 @@ function expectedItemEtag(payload, options = {}) {
     }))
     : [];
   const stableDto = {
-    version: "item-dto-v20",
+    version: "item-dto-v22",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -1660,7 +1660,7 @@ test("returns a retryable detail response while cold resolution continues", asyn
     expectedItemEtag(secondPayload, { refreshSources: true }),
   );
   assert.equal(
-    [...db.rows.keys()].some((key) => key.includes("sources-v38|RCTD-740")),
+    [...db.rows.keys()].some((key) => key.includes("sources-v40|RCTD-740")),
     true,
   );
 });
@@ -4686,6 +4686,120 @@ test("waits for the slow public batch instead of answering with the first self-h
   );
 });
 
+test("answers the first screen with the settled self-hosted lines instead of waiting for a slow public batch", async () => {
+  // 线上真实时序：主解析器账号被停用（秒挂 401），回退解析器冷启动 6~8 秒才返回；
+  // 自建补源（Javtiful / GetAV）0.3~1.3 秒就能给出 3~4 条真实线路。旧实现必须等
+  // “两条链路都收尾”才用短静默期，于是首屏死等到 7.4 秒上限，客户端只能看到 1 条
+  // （甚至“自动线路”占位源）。这里断言：只要有一条链路彻底收尾、且线路数达到提前
+  // 返回阈值，就用这批线路立刻答复，不再空等那条慢链路。
+  const detailUrl = "https://javtiful.com/zh/video/99998/RCTD-741";
+  const selfHostedUrls = [
+    "https://fast-stream.jav.si/rctd-741/self-1080.mp4",
+    "https://fast-stream.jav.si/rctd-741/self-720.mp4",
+    "https://fast-stream.jav.si/rctd-741/self-480.mp4",
+  ];
+  const publicUrls = [
+    "https://fast-stream.jav.si/rctd-741/pub-original.mp4",
+    "https://fast-stream.jav.si/rctd-741/pub-reducing.mp4",
+  ];
+  const allUrls = [...selfHostedUrls, ...publicUrls];
+  const env = {
+    // 预算比公共批次（3 秒）更宽：首屏提前返回不是被预算截断，而是链路收尾。
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 6500,
+  };
+  const startedAt = Date.now();
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/43"),
+    env,
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/43")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: { id: 43, number: "RCTD-741", title: "RCTD-741 Settled" },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes("/api/v/resolve?code=RCTD-741")) {
+        // 公共解析链路：慢到超出首屏静默窗口。
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        return new Response(
+          JSON.stringify({
+            variants: publicUrls.map((sourceUrl, index) => ({
+              variant: index === 0 ? "original" : "backup",
+              sourceUrl,
+              sourceType: "video/mp4",
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-741") {
+        return new Response(`<a href="${detailUrl}">RCTD-741 Test</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: "RCTD-741 Test",
+            playerSources: selfHostedUrls.map((src, index) => ({
+              src,
+              type: "video/mp4",
+              size: 1080 - index * 360,
+            })),
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (allUrls.includes(target)) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-741/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  const elapsed = Date.now() - startedAt;
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
+  // 关键断言 1：首屏就是自建链路那 3 条真实线路，不是占位源。
+  assert.equal(payload.MediaSourceCount, selfHostedUrls.length);
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ).sort(),
+    [...selfHostedUrls].sort(),
+  );
+  // 关键断言 2：没有等满 3 秒的公共批次，更没有死等 7.4 秒首屏上限。
+  assert.ok(elapsed < 2000, `first screen took ${elapsed}ms`);
+});
 test("waits through the extended cold-start window when the public batch completes with six lines", async () => {
   // 同一资源的两种解析端点：
   // - 主解析端 0.2 秒只回 1 条；
@@ -6859,7 +6973,7 @@ test("exposes upstream preview images as Emby backdrop art", async () => {
     ["0", "1"],
   );
   assert.equal(
-    payload.BackdropImageTags.every((tag) => /^\d+-art-v2-\d+$/.test(tag)),
+    payload.BackdropImageTags.every((tag) => /^\d+-[0-9a-z]+-art-v3-\d+$/.test(tag)),
     true,
   );
 
@@ -6974,6 +7088,119 @@ test("drops the upstream first preview when it is a low-res copy of the cover", 
   );
   assert.equal(firstPreview.status, 200);
   assert.equal(firstPreviewUrl, "https://jdforrepam.com/samples/test_l_1.jpg");
+});
+
+test("drops the cover-derived preview when the cover filename ends with a number", async () => {
+  // 旧实现把“封面名以数字结尾”误当成预览序号（ssis-123 → 基础名 ssis、序号 123），
+  // 于是 samples/ssis-123_l_0.jpg 的基础名对不上封面，模糊的封面派生图混进艺术图。
+  const imageBytes = new Uint8Array([255, 216, 255, 217]);
+  const encryptedImageBytes = new Uint8Array([234, 21, 50, 21, 51]);
+  const movie = {
+    id: "42",
+    number: "SSIS-123",
+    cover_url: "https://jdforrepam.com/covers/ssis-123.jpg",
+    preview_images: [
+      {
+        thumb_url: "https://jdforrepam.com/samples/ssis-123_s_0.jpg",
+        large_url: "https://jdforrepam.com/samples/ssis-123_l_0.jpg",
+      },
+      {
+        thumb_url: "https://jdforrepam.com/samples/ssis-123_s_1.jpg",
+        large_url: "https://jdforrepam.com/samples/ssis-123_l_1.jpg",
+      },
+      {
+        thumb_url: "https://jdforrepam.com/samples/ssis-123_s_2.jpg",
+        large_url: "https://jdforrepam.com/samples/ssis-123_l_2.jpg",
+      },
+    ],
+  };
+  const movieResponse = () => new Response(
+    JSON.stringify({ success: 1, data: { movie } }),
+    { headers: { "content-type": "application/json" } },
+  );
+
+  const detail = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    {},
+    {},
+    async (url) => String(url).includes("/v4/movies/42")
+      ? movieResponse()
+      : new Response(encryptedImageBytes, {
+        headers: { "content-type": "image/jpeg" },
+      }),
+  );
+  const payload = await detail.json();
+  assert.equal(detail.status, 200);
+  // 艺术图只保留资源封面 + 两张真正的剧照（序号 1、2）。
+  assert.deepEqual(
+    payload.BackdropImageTags.map((tag) => String(tag).split("-")[0]),
+    ["0", "1", "2"],
+  );
+
+  let firstPreviewUrl;
+  const firstPreview = await handleProxy(
+    new Request("https://clone.example/Items/42/Images/Backdrop/1"),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return movieResponse();
+      }
+      firstPreviewUrl = target;
+      return new Response(encryptedImageBytes, {
+        headers: { "content-type": "image/jpeg" },
+      });
+    },
+  );
+  assert.equal(firstPreview.status, 200);
+  assert.equal(
+    firstPreviewUrl,
+    "https://jdforrepam.com/samples/ssis-123_l_1.jpg",
+  );
+  assert.deepEqual(new Uint8Array(await firstPreview.arrayBuffer()), imageBytes);
+});
+
+test("drops a cover-resized preview that carries no preview index", async () => {
+  // 上游另一种形态：预览图直接是封面缩放版，文件名没有序号
+  // （covers/test.jpg 对应 samples/test_l.jpg）。它既不是真剧照，也不该混进艺术图。
+  const encryptedImageBytes = new Uint8Array([234, 21, 50, 21, 51]);
+  const movie = {
+    id: "42",
+    number: "TEST-042",
+    cover_url: "https://jdforrepam.com/covers/test.jpg",
+    preview_images: [
+      {
+        thumb_url: "https://jdforrepam.com/samples/test_s.jpg",
+        large_url: "https://jdforrepam.com/samples/test_l.jpg",
+      },
+      {
+        thumb_url: "https://jdforrepam.com/samples/test_s_1.jpg",
+        large_url: "https://jdforrepam.com/samples/test_l_1.jpg",
+      },
+    ],
+  };
+  const movieResponse = () => new Response(
+    JSON.stringify({ success: 1, data: { movie } }),
+    { headers: { "content-type": "application/json" } },
+  );
+
+  const detail = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    {},
+    {},
+    async (url) => String(url).includes("/v4/movies/42")
+      ? movieResponse()
+      : new Response(encryptedImageBytes, {
+        headers: { "content-type": "image/jpeg" },
+      }),
+  );
+  const payload = await detail.json();
+  assert.equal(detail.status, 200);
+  assert.deepEqual(
+    payload.BackdropImageTags.map((tag) => String(tag).split("-")[0]),
+    ["0", "1"],
+  );
 });
 
 test("drops a cover-derived preview when the cover filename carries a size suffix", async () => {

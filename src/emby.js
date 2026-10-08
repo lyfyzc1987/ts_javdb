@@ -124,10 +124,16 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // 结构变化必须提升版本，客户端才会把本地库里那份旧 DTO 当成新实体重新拉取。
 // v20：首屏“只有一条播放源、退出再进来才变多”的窗口逻辑重写（两条链路都收尾
 // 才用短窗口答复）+ 艺术图不再出现封面派生的模糊预览图。旧 DTO 必须失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v20";
+// v22：首屏“只给一条链路先到的那 1~2 条线路”的判定放宽为“任一条链路彻底收尾
+// 且线路数达到 3 条就答复”，并让自建补源收尾时立刻通知首屏；同时提升播放源缓存
+// 版本，避免上一版缓存的“单源/占位源”结果继续命中。旧 DTO 与旧缓存都必须失效。
+// v21：艺术图 tag 从“只有下标”改成“下标 + 内容指纹”。旧 tag 在同一时间桶内
+// 不变，客户端会一直用本地缓存里那张错位的旧图（表现为去重没生效、还是两张
+// 资源封面）；带上指纹后换图必然换 tag，客户端一定会重新拉。
+const ITEM_DTO_ETAG_VERSION = "item-dto-v22";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-08-multisource-first-screen-24";
+const SERVER_BUILD_ID = "2026-10-08-firstscreen-settled-26";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -176,7 +182,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v38";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v40";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -3863,31 +3869,53 @@ const IMAGE_PREVIEW_INDEX_PATTERN = /^(.+?)[_\-.](?:[a-z]{1,3}[_\-.]|)(\d{1,3})$
 const IMAGE_SIZE_SUFFIX_PATTERN =
   /^(.+?)[_\-.](?:l|b|s|m|o|h|thumb|small|big|large|orig)$/i;
 
-function imageFileStem(value) {
+// 文件名：去掉目录、扩展名并转小写。封面和预览图的“同源”判定都基于它。
+function imageFileName(value) {
   const raw = String(value || "").trim();
-  if (!raw) return null;
+  if (!raw) return "";
   let pathname = raw;
   try {
     pathname = new URL(raw).pathname;
   } catch {
     pathname = raw.split(/[?#]/, 1)[0];
   }
-  const name = (pathname.split("/").pop() || "")
+  return (pathname.split("/").pop() || "")
     .replace(/\.[a-z0-9]+$/i, "")
     .toLowerCase();
+}
+
+// 封面文件的基础名：只剥掉结尾的尺寸标记（covers/test_l.jpg → test）。
+// 封面绝不能套用“序号”规则：封面名本身可能以数字结尾（ssis-123.jpg），
+// 按序号切分会把基础名截成 ssis，与预览图 samples/ssis-123_l_0.jpg 的
+// 基础名对不上，那张模糊的封面派生图就会作为第二张“资源封面”混进艺术图。
+function imageBaseName(value) {
+  const name = imageFileName(value);
+  if (!name) return null;
+  const size = IMAGE_SIZE_SUFFIX_PATTERN.exec(name);
+  return size?.[1] || name;
+}
+
+function imageFileStem(value) {
+  const name = imageFileName(value);
   if (!name) return null;
   const match = IMAGE_PREVIEW_INDEX_PATTERN.exec(name);
   if (match && match[1]) {
     return { base: match[1], index: Number(match[2]) };
   }
   const size = IMAGE_SIZE_SUFFIX_PATTERN.exec(name);
-  return { base: size?.[1] || name, index: null };
+  // size=false 说明这个名字既没有序号也没有尺寸标记，跟封面无关。
+  return { base: size?.[1] || name, index: null, sized: Boolean(size) };
 }
 
-function isCoverDerivedPreview(value, coverStem) {
-  if (!coverStem?.base) return false;
+// 与封面同源的“模糊封面图”：上游把封面塞进预览列表时，文件名要么是
+// 封面派生图（samples/<封面基础名>_l_0.jpg，序号 0），要么直接是封面本身的
+// 缩放版（samples/<封面基础名>_l.jpg，没有序号）。真正的剧照预览一定带
+// 序号（_1、_2…），所以只丢这两种，序号非 0 的照常保留。
+function isCoverDerivedPreview(value, coverBase) {
+  if (!coverBase) return false;
   const info = imageFileStem(value);
-  return Boolean(info && info.index === 0 && info.base === coverStem.base);
+  if (!info || info.base !== coverBase) return false;
+  return info.index === 0 || (info.index === null && info.sized === true);
 }
 
 function movieBackdropImages(movie) {
@@ -3898,7 +3926,7 @@ function movieBackdropImages(movie) {
   const urls = [];
   const cover = String(movie?.cover_url || movie?.thumb_url || "").trim();
   const coverKey = normalizedImageUrlKey(cover);
-  const coverStem = imageFileStem(cover);
+  const coverBase = imageBaseName(cover);
   const seen = new Set();
   if (cover) {
     urls.push(cover);
@@ -3915,7 +3943,7 @@ function movieBackdropImages(movie) {
       !key ||
       seen.has(key) ||
       isCoverImageUrl(url) ||
-      isCoverDerivedPreview(url, coverStem) ||
+      isCoverDerivedPreview(url, coverBase) ||
       (coverKey && key === coverKey)
     ) continue;
     seen.add(key);
@@ -3935,14 +3963,32 @@ function movieBackdropImages(movie) {
 // 所以详情 DTO 里把 tag 按同一个时间桶换掉。
 // 只作用于详情 DTO：列表/首页 DTO 不拼，否则滚动列表时封面会被反复下载。
 // 主封面（Primary）也不拼：它几乎不变，重新下载只增加流量没有收益。
-function refreshDetailBackdropTags(item) {
+// 艺术图 tag 里的“这是哪一张图”指纹：内容不同就必须是不同的 tag。
+// 旧实现 tag 只有下标（"1-art-v2-<桶>"），一旦列表错位（例如去掉了封面
+// 派生的模糊首图，原下标 1 变成另一张图），下标 1 的 tag 在同一个 20 秒桶里
+// 完全没变，客户端继续用本地缓存里那张旧图——用户看到的就是“改完了还是
+// 两张资源封面/模糊图”。FNV-1a 只用来区分图片，不需要加密强度。
+function backdropTagFingerprint(value) {
+  let hash = 0x811c9dc5;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(36);
+}
+
+function refreshDetailBackdropTags(item, movie) {
   if (!item || !Array.isArray(item.BackdropImageTags) || !item.BackdropImageTags.length) {
     return;
   }
   const bucket = Math.floor(Date.now() / PENDING_SOURCES_ETAG_BUCKET_MS);
-  item.BackdropImageTags = item.BackdropImageTags.map(
-    (tag) => `${tag}-art-v2-${bucket}`,
-  );
+  const urls = movie ? movieBackdropImages(movie) : [];
+  item.BackdropImageTags = item.BackdropImageTags.map((tag, index) => {
+    const url = urls[index] || "";
+    const fingerprint = backdropTagFingerprint(normalizedImageUrlKey(url));
+    return `${index}-${fingerprint}-art-v3-${bucket}`;
+  });
 }
 
 function itemEtag(item, options = {}) {
@@ -5535,6 +5581,19 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   };
   let selfHostedVideoTask = null;
   let selfHostedResolutionFinished = true;
+  // 自建补源这一批的“收尾”只通知一次：真正收尾（拿到它全部能拿的线路，或失败）
+  // 时立刻通知详情页首屏，不必再等公共解析器那条慢链路的合并窗口。
+  let selfHostedPhaseNotified = false;
+  const notifySelfHostedPhaseSettled = () => {
+    if (selfHostedPhaseNotified) return;
+    selfHostedPhaseNotified = true;
+    if (!onSelfHostedPhaseSettled) return;
+    try {
+      onSelfHostedPhaseSettled({ started: Boolean(selfHostedVideoTask) });
+    } catch {
+      // 回调异常不能影响正常解析。
+    }
+  };
   const startSelfHostedVideo = () => {
     if (!selfHostedVideoTask) {
       selfHostedResolutionFinished = false;
@@ -5557,6 +5616,13 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
           selfHostedResolutionFinished = true;
           return null;
         },
+      );
+      // 任务真正收尾的那一刻就发信号。旧实现只在“等满自建合并预算之后”才发，
+      // 而那次 await 排在公共解析器的合并窗口之后（线上实测 8 秒开外），首屏
+      // 根本用不上这个信号。收尾即发，首屏才能立刻改用它来判断“不会再多了”。
+      selfHostedVideoTask.then(
+        () => notifySelfHostedPhaseSettled(),
+        () => notifySelfHostedPhaseSettled(),
       );
     }
     return selfHostedVideoTask;
@@ -5699,13 +5765,8 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   const selfHosted = selfHostedVideoTask
     ? await settledWithin(selfHostedVideoTask, selfHostedMergeBudget(env))
     : null;
-  if (onSelfHostedPhaseSettled) {
-    try {
-      onSelfHostedPhaseSettled({ started: Boolean(selfHostedVideoTask) });
-    } catch {
-      // 回调异常不能影响正常解析。
-    }
-  }
+  // 若任务到这时还没收尾（等满自建合并预算），也通知一次：详情页不该再为它空等。
+  notifySelfHostedPhaseSettled();
   const merged = mergeResolvedVideoVariants(env, publicVideo, selfHosted);
   const validated = await finalizeVideo(merged);
   if (validated) {
@@ -5866,6 +5927,13 @@ const RESOLVE_VIDEO_STALE_PEEK_MS = 1200;
 //      缓存，客户端跨 20 秒时间桶重拉详情时补齐。
 // 主批次（公共解析器）线路数达到这个条数就改用较短的静默窗口，不再等满宽限期。
 const RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT = 2;
+// 只有一条链路彻底收尾（另一条还在跑）时，线路数要达到这个条数才值得提前返回
+// 首屏。1~2 条正是用户反馈“只显示一两个播放源”的情形：此时宁可再等另一条链路
+// （上限 FIRST_SCREEN_MAX_WAIT_MS），也不要让用户以为这部片只有一两条线路。
+// 达到 3 条（例如 GetAV 的 1080/720/480）时，即便公共解析器还在慢慢跑，也先让
+// 客户端拿到可直接播放的多线路，后到的线路由后台补进缓存、客户端下次刷新
+// （20 秒时间桶）再取。
+const RESOLVE_VIDEO_FIRST_SCREEN_EARLY_EXIT_COUNT = 3;
 // 详情页首屏等待上限：宁可先给客户端少量线路，也不能让详情页一直转圈。
 // 实测线上公共解析器冷启动要 1.9~4.3 秒（单个响应 1.1~1.8MB）；部分资源
 // 的自建补源合并要到约 7 秒才完成。留出余量到 7.4 秒，同时仍由详情请求的
@@ -6382,18 +6450,29 @@ async function resolveVideoForResponse(
     if (major === true) majorSeen = true;
     if (partialTimer) clearTimeout(partialTimer);
     let delay;
+    // 只要有一条链路彻底收尾、且已经拿到目标条数，就不必再等另一条：公共解析器
+    // 和自建补源是两条并行链路，各自都能独立给出多条真实线路。旧条件是“两条都
+    // 收尾”才用短窗口，线上 primary 账号被停用（primary 秒挂 401）、回退源又慢到
+    // 6~8 秒时该条件永远不成立，于是自建链路早已给出 3~4 条也仍然死等到 7.4 秒
+    // 上限，首屏只能显示 1 条（甚至占位源），退出详情页再进来才因为后台解析完成
+    // 而变多——用户看到的正是“第一次点开只有一个播放源，退出再进才变多”。
     const enough = count >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT;
+    // 只有一条链路收尾时，线路数必须够“像样”（见上面的条数说明）才提前返回：
+    // 2 条自建线路往往只是补齐的第一批，公共解析器随后还会给出互补线路。
+    const enoughToExitEarly =
+      count >= RESOLVE_VIDEO_FIRST_SCREEN_EARLY_EXIT_COUNT;
+    const externalSettled = publicPhaseSettled || selfHostedPhaseSettled;
     if (
       (majorSeen && enough) ||
+      (externalSettled && enoughToExitEarly) ||
       (publicPhaseSettled && selfHostedPhaseSettled)
     ) {
-      // 两种情况才值得结束首屏等待：
+      // 以下三种情况才值得结束首屏等待：
       //   1. 主批次（公共解析器）已经给出足够多的线路——它基本代表上游有几条；
-      //   2. 两条链路都收尾了——不可能再有新线路，哪怕只有 1 条也得答复。
-      // 其余情况（线路还不够、且至少还有一条链路在跑）继续等。典型误答场景：
-      // 公共解析器账号被停用、秒挂，自建补源还在合并，旧逻辑这时会用 400 毫秒
-      // 的短窗口把“1 条线路”的半成品答复出去——用户看到的就是“第一次点开只有
-      // 一个播放源，退出再进来才变多”。
+      //   2. 两条链路里已有一条彻底收尾，且线路数达到 EARLY_EXIT_COUNT——另一条要么还在跑但互补
+      //      线路有限，要么根本挂了；继续等满 7.4 秒只会让首屏迟迟不出多线路；
+      //   3. 两条链路都收尾了——不可能再有新线路，哪怕只有 1 条也得答复。
+      // 其余情况（线路还不够、且两条链路都还没收尾）继续等满宽限期。
       delay = RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS;
     } else {
       delay = RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS;
@@ -7479,7 +7558,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     item.Path = sources[0].Path;
     item.HasSubtitles = subtitles.length > 0;
     // 艺术图同样按 20 秒时间桶换 tag，客户端重进详情页时会重新取图。
-    refreshDetailBackdropTags(item);
+    refreshDetailBackdropTags(item, movie);
     return itemJsonResponse(item, request, { pendingSources: true });
   }
   const mediaSources = mediaSourcesForVideo(
@@ -7498,7 +7577,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   item.HasSubtitles = subtitles.length > 0;
   // 详情页每 20 秒允许客户端刷新一次：解析完成后重新进入能拿到最新线路、
   // 字幕轨和艺术图，而不是客户端本地库里那份上一次部署时的旧 DTO。
-  refreshDetailBackdropTags(item);
+  refreshDetailBackdropTags(item, movie);
   return itemJsonResponse(item, request, { refreshSources: true });
 }
 
