@@ -133,7 +133,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v22";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-09-search-cache-and-hidefromresume-28";
+const SERVER_BUILD_ID = "2026-10-09-media-retry-trunc-cache-cap-29";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -168,6 +168,16 @@ const REMOTE_MEDIA_PROBE_BYTES = 512;
 // 交给上层立刻换下一条线路。响应头一到达就清掉定时器，真正的响应体流式传输
 // 不受影响，不会把一个大文件的正常播放中途掐断。
 const MEDIA_UPSTREAM_HEADERS_TIMEOUT_MS = 6000;
+// 光有“总预算”不够：上游 CDN 的抖动形态是“这条连接连上了但不回头”。
+// 旧实现把 6 秒整块交给一次 fetch，抖动期间客户端要干等满 6 秒才拿到 504，
+// 实测 GetAV 分片出现 first-byte 7.4s（探针超时重试后才成功），播放器那边
+// 已经判这次分片失败 → 卡顿/重试。
+// 现在把同一个总预算切成多次短尝试：单次最多 2.5 秒，失败立刻换一条新连接重试，
+// 抖动通常第 2 次就恢复正常；总等待上限仍是 6 秒（headersTimeoutMs），
+// 不会比旧实现更久，也不会出现“一条线路卡死 6 秒才换线”的长尾。
+const MEDIA_UPSTREAM_HEADERS_ATTEMPT_TIMEOUT_MS = 2500;
+const MEDIA_UPSTREAM_HEADERS_MAX_ATTEMPTS = 3;
+const MEDIA_UPSTREAM_RETRY_DELAY_MS = 120;
 // 合成超时响应用的标记头：带上它表示“是我们主动放弃的”，
 // 上层据此跳过 5xx 立即重试，避免又多等一个超时周期。
 const MEDIA_UPSTREAM_TIMEOUT_HEADER = "x-catemby-upstream-timeout";
@@ -1708,6 +1718,7 @@ function streamCompleteMediaSegmentResponse(upstream, cacheKey) {
   const cacheBytes = new Uint8Array(contentLength);
   let cacheOffset = 0;
   let cacheComplete = true;
+  let delivered = 0;
   const reader = upstream.body.getReader();
   const body = new ReadableStream({
     async pull(controller) {
@@ -1719,6 +1730,14 @@ function streamCompleteMediaSegmentResponse(upstream, cacheKey) {
         return;
       }
       if (result.done) {
+        if (delivered < contentLength) {
+          // 声明了 content-length 却提前结束（上游断流），别把截断的分片
+          // 当完整数据发出去，否则播放器会卡在半段上。
+          controller.error(
+            new Error(`media segment truncated: ${delivered}/${contentLength}`),
+          );
+          return;
+        }
         if (cacheComplete && cacheOffset === cacheBytes.byteLength) {
           MEDIA_SEGMENT_BODY_CACHE.write(
             cacheKey,
@@ -1731,6 +1750,7 @@ function streamCompleteMediaSegmentResponse(upstream, cacheKey) {
       const chunk = result.value instanceof Uint8Array
         ? result.value
         : new Uint8Array(result.value);
+      delivered += chunk.byteLength;
       if (cacheComplete) {
         if (cacheOffset + chunk.byteLength <= cacheBytes.byteLength) {
           cacheBytes.set(chunk, cacheOffset);
@@ -1814,6 +1834,26 @@ function mediaRangeRecordForBytes(upstream, bytes) {
   };
 }
 
+// 推断“这段响应体本应有多少字节”，用来识别上游中途断流（短读）：
+//  - 有 content-length 且响应体没被压缩 → 就是 content-length；
+//  - 上游是 chunked（不给 content-length）的 206 → 用 content-range 算
+//    end - start + 1。实测 GetAV 分片就是这种：响应头声明
+//    “bytes 0-2744239/2744240”，实际只送 866890 字节就结束。
+// 拿不到任何长度信息时返回 0，表示“无从判断”，不做截断检查。
+function expectedUpstreamBodyBytes(headers) {
+  if (!headers || headers.has("content-encoding")) return 0;
+  const contentLength = Number(headers.get("content-length"));
+  if (Number.isSafeInteger(contentLength) && contentLength > 0) {
+    return contentLength;
+  }
+  const range = parseMediaContentRange(headers.get("content-range") || "");
+  if (range) {
+    const length = range.end - range.start + 1;
+    if (Number.isSafeInteger(length) && length > 0) return length;
+  }
+  return 0;
+}
+
 // Range 响应“边透传边缓存”：
 //  - 字节一到就转发给客户端（首个字节 = 上游 TTFB），不再等整段下载完；
 //  - 完整读完后写进 Range 缓存，完全相同的 Range 下次直接本地命中；
@@ -1827,6 +1867,10 @@ function teeMediaRangeResponseBody(upstream, rangeKey, maxBytes) {
     contentLength <= limit;
   let buffer = shouldCache ? new Uint8Array(contentLength) : null;
   let offset = 0;
+  // expectedBytes > 0 时才做短读检查；delivered 独立于 buffer 计数，
+  // 因为超过缓存上限的响应（buffer 置空）同样需要检测截断。
+  const expectedBytes = expectedUpstreamBodyBytes(upstream.headers);
+  let delivered = 0;
   let stored = false;
   const store = () => {
     if (stored || !buffer || offset !== buffer.byteLength) return;
@@ -1847,6 +1891,16 @@ function teeMediaRangeResponseBody(upstream, rangeKey, maxBytes) {
         return;
       }
       if (result.done) {
+        if (expectedBytes > 0 && delivered < expectedBytes) {
+          // 上游“回了响应头，但响应体中途断流”。旧实现把它当作正常结束，
+          // 播放器拿到一段截断的分片后卡在解码/缓冲，表现为播放一直卡。
+          // 显式让流失败：播放器会重试这一段（多线程/断点续传逻辑生效），
+          // 而不是把半段数据当成完整分片。
+          controller.error(
+            new Error(`media range truncated: ${delivered}/${expectedBytes}`),
+          );
+          return;
+        }
         store();
         controller.close();
         return;
@@ -1854,6 +1908,7 @@ function teeMediaRangeResponseBody(upstream, rangeKey, maxBytes) {
       const chunk = result.value instanceof Uint8Array
         ? result.value
         : new Uint8Array(result.value);
+      delivered += chunk.byteLength;
       if (buffer) {
         if (offset + chunk.byteLength <= buffer.byteLength) {
           buffer.set(chunk, offset);
@@ -1899,6 +1954,21 @@ async function fetchMediaUpstreamResponse(
   const headersDeadline = Number(options.headersDeadline) > 0
     ? Number(options.headersDeadline)
     : 0;
+  const headersAttemptTimeoutMs = positiveEnvMilliseconds(
+    env,
+    "MEDIA_UPSTREAM_HEADERS_ATTEMPT_TIMEOUT_MS",
+    MEDIA_UPSTREAM_HEADERS_ATTEMPT_TIMEOUT_MS,
+  );
+  const headersMaxAttempts = Math.max(
+    1,
+    Math.floor(
+      positiveEnvMilliseconds(
+        env,
+        "MEDIA_UPSTREAM_HEADERS_MAX_ATTEMPTS",
+        MEDIA_UPSTREAM_HEADERS_MAX_ATTEMPTS,
+      ),
+    ),
+  );
   const upstreamTimeoutResponse = () => new Response(null, {
     status: 504,
     statusText: "Gateway Timeout",
@@ -1907,15 +1977,8 @@ async function fetchMediaUpstreamResponse(
       [MEDIA_UPSTREAM_TIMEOUT_HEADER]: "1",
     },
   });
-  const fetchUpstream = async (requestHeaders = headers) => {
-    const budgetMs = headersDeadline > 0
-      ? Math.min(headersTimeoutMs, headersDeadline - Date.now())
-      : headersTimeoutMs;
-    if (budgetMs <= 0) {
-      // 本次播放请求的“响应头预算”已经用完：不要再发起注定超时的请求，
-      // 直接告诉上层这条线路不可用，让它换线或尽快回错误。
-      return upstreamTimeoutResponse();
-    }
+  // 单次尝试：只负责“拿到响应头”，超时/连接中断都折算成合成的 504。
+  const fetchUpstreamOnce = async (requestHeaders, attemptBudgetMs) => {
     try {
       return await fetchWithTimeout(
         fetchImpl,
@@ -1925,30 +1988,61 @@ async function fetchMediaUpstreamResponse(
           headers: requestHeaders,
           redirect: "follow",
         },
-        budgetMs,
+        attemptBudgetMs,
       );
     } catch {
       // 连接被中断、DNS 失败、上游不回响应头 —— 统一按“这条线路不可用”处理。
       return upstreamTimeoutResponse();
     }
   };
-  // 上游 CDN 偶发 5xx 时，直接把它转发给播放器会让客户端弹
-  // “Playback failed: Could not fetch …”。这里对媒体请求做一次立即重试，
-  // 只有连续两次都 5xx 才交给播放器处理。
-  const fetchUpstreamWithRetry = async (requestHeaders = headers) => {
-    const first = await fetchUpstream(requestHeaders);
-    if (
-      first.status >= 500 &&
-      first.status < 600 &&
-      !first.headers.get(MEDIA_UPSTREAM_TIMEOUT_HEADER)
-    ) {
-      try {
-        first.body?.cancel?.();
-      } catch {}
-      return fetchUpstream(requestHeaders);
-    }
-    return first;
+  // “这次响应值不值得换条连接重试”：合成的超时（抖动/挂起）和上游 5xx
+  // 都重试；其余状态（200/206/3xx/4xx）说明上游确实回了话，直接交给上层。
+  const isRetryableUpstreamResponse = (response) => {
+    if (!response) return true;
+    if (response.headers.get(MEDIA_UPSTREAM_TIMEOUT_HEADER)) return true;
+    return response.status >= 500 && response.status < 600;
   };
+
+  // 一次媒体请求内“等响应头”的循环：
+  //   - 每条线路的总预算 = min(headersTimeoutMs(6s), 本次播放剩余的换线预算)；
+  //   - 预算内切成最多 3 次短尝试（每次 ≤2.5s），任一次拿到响应头就返回；
+  //   - “超时”和“上游 5xx”都算可重试：抖动恢复后第 2 次通常就成功，
+  //     播放器不会再看到 7 秒长尾，也不会因为一次 5xx 直接弹 Playback failed。
+  // 旧实现是“总预算一次性交给一次 fetch”，抖动要干等满 6 秒才 504，
+  // 且合成的超时被 fetchUpstreamWithRetry 判成“不可重试”，一次抖动就报废整条线路。
+  const fetchUpstream = async (requestHeaders = headers) => {
+    const deadline = Math.min(
+      headersDeadline > 0 ? headersDeadline : Number.POSITIVE_INFINITY,
+      Date.now() + headersTimeoutMs,
+    );
+    let lastResponse = null;
+    for (let attempt = 0; attempt < headersMaxAttempts; attempt += 1) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      const attemptBudgetMs = Math.min(headersAttemptTimeoutMs, remainingMs);
+      const response = await fetchUpstreamOnce(requestHeaders, attemptBudgetMs);
+      lastResponse = response;
+      if (!isRetryableUpstreamResponse(response)) {
+        return response;
+      }
+      try {
+        response?.body?.cancel?.();
+      } catch {}
+      if (attempt + 1 >= headersMaxAttempts) break;
+      const waitMs = Math.min(
+        MEDIA_UPSTREAM_RETRY_DELAY_MS,
+        Math.max(0, deadline - Date.now() - 1),
+      );
+      if (waitMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+    }
+    return lastResponse ?? upstreamTimeoutResponse();
+  };
+  // 上游 5xx / 连接抖动都在 fetchUpstream 内部按“短尝试 + 重试”处理，
+  // 这里保留别名，调用方语义不变。
+  const fetchUpstreamWithRetry = (requestHeaders = headers) =>
+    fetchUpstream(requestHeaders);
   if (!usesMediaSegmentCache) {
     return fetchUpstreamWithRetry();
   }
@@ -3060,17 +3154,48 @@ const MAX_CACHED_MEDIA_SEGMENT_RANGE_BYTES = 2 * 1024 * 1024;
 // 可以比完整分片多留很多条，让并发 Range 请求不用反复探测同一分片。
 const MEDIA_SEGMENT_PREFIX_CACHE_MAX_ENTRIES = 1024;
 const MAX_CACHED_MEDIA_SEGMENT_BYTES = 16 * 1024 * 1024;
+// 条数上限之外再加一道“总字节上限”。媒体分片缓存的条目大小差得很远
+// （GetAV 4K 分片 13.4 MB，HLS Range 块约 1 MB），只数条数时并发下载很容易
+// 让单实例内存冲上七八十 MB，转成 Cloudflare 1102（内存超限）。
+// 24 MB + 24 MB 仍然覆盖“seek / 断点续传时少回源”的常见场景，
+// 但把媒体缓存的内存峰值从 80 MB 压到 48 MB。
+const MEDIA_SEGMENT_BODY_CACHE_MAX_TOTAL_BYTES = 24 * 1024 * 1024;
+const MEDIA_SEGMENT_RANGE_CACHE_MAX_TOTAL_BYTES = 24 * 1024 * 1024;
 
-function createTtlCache(ttlMs, maxEntries) {
+// 媒体缓存条目都形如 { bytes: Uint8Array, headers, ... }，按实际字节数记账。
+function mediaCacheEntryBytes(record) {
+  const length = record?.bytes?.byteLength;
+  return Number.isSafeInteger(length) && length > 0 ? length : 0;
+}
+
+// sizeOf / maxTotalBytes：媒体分片缓存只按“条数”限流是不够的 —— 24 条 Range
+// 缓存每条约 1-2 MB，多个分片并发下载时，光这一张 Map 就能吃掉几十 MB，
+// Cloudflare 1102（内存超限）就是这么撞上的。再加一道“总字节上限”：
+// 写入时按 sizeOf(value) 记账，超了就从最久未用的一端淘汰。
+function createTtlCache(ttlMs, maxEntries, options = {}) {
   const entries = new Map();
   const pending = new Map();
+  const sizeOf = typeof options.sizeOf === "function" ? options.sizeOf : null;
+  const maxTotalBytes = Number.isFinite(options.maxTotalBytes) &&
+      options.maxTotalBytes > 0
+    ? Math.floor(options.maxTotalBytes)
+    : 0;
+  let totalBytes = 0;
   let generation = 0;
+
+  const drop = (key) => {
+    const entry = entries.get(key);
+    if (!entry) return undefined;
+    entries.delete(key);
+    if (entry.size > 0) totalBytes -= entry.size;
+    return entry.value;
+  };
 
   const read = (key) => {
     const entry = entries.get(key);
     if (!entry) return undefined;
     if (entry.expires <= Date.now()) {
-      entries.delete(key);
+      drop(key);
       return undefined;
     }
     // 命中后挪到末尾，容量满时优先淘汰最久没用到的键。
@@ -3085,9 +3210,19 @@ function createTtlCache(ttlMs, maxEntries) {
     const lifetime = Number.isFinite(ttlOverrideMs) && ttlOverrideMs > 0
       ? ttlOverrideMs
       : ttlMs;
-    entries.set(key, { value, expires: Date.now() + lifetime });
-    while (entries.size > maxEntries) {
-      entries.delete(entries.keys().next().value);
+    const size = sizeOf
+      ? Math.max(0, Math.floor(Number(sizeOf(value)) || 0))
+      : 0;
+    drop(key);
+    entries.set(key, { value, expires: Date.now() + lifetime, size });
+    totalBytes += size;
+    while (
+      entries.size > maxEntries ||
+      (maxTotalBytes > 0 && totalBytes > maxTotalBytes)
+    ) {
+      const oldest = entries.keys().next().value;
+      if (oldest === undefined) break;
+      drop(oldest);
     }
   };
 
@@ -3122,7 +3257,7 @@ function createTtlCache(ttlMs, maxEntries) {
     write,
     // 手动丢弃某个 key（例如缓存里的直链已失效，需要重新解析）。
     forget: (key) => {
-      entries.delete(key);
+      drop(key);
       pending.delete(key);
     },
     // 同一个 key 的并发请求只回源一次；失败不缓存，等下次再试。
@@ -3134,6 +3269,7 @@ function createTtlCache(ttlMs, maxEntries) {
       generation += 1;
       entries.clear();
       pending.clear();
+      totalBytes = 0;
     },
   };
 }
@@ -3152,6 +3288,10 @@ const API_TOKEN_CACHE = createTtlCache(60 * 1000, 500);
 const MEDIA_SEGMENT_BODY_CACHE = createTtlCache(
   MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
   MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES,
+  {
+    sizeOf: mediaCacheEntryBytes,
+    maxTotalBytes: MEDIA_SEGMENT_BODY_CACHE_MAX_TOTAL_BYTES,
+  },
 );
 const MEDIA_SEGMENT_PREFIX_CACHE = createTtlCache(
   MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
@@ -3160,6 +3300,10 @@ const MEDIA_SEGMENT_PREFIX_CACHE = createTtlCache(
 const MEDIA_SEGMENT_RANGE_CACHE = createTtlCache(
   MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
   MEDIA_SEGMENT_RANGE_CACHE_MAX_ENTRIES,
+  {
+    sizeOf: mediaCacheEntryBytes,
+    maxTotalBytes: MEDIA_SEGMENT_RANGE_CACHE_MAX_TOTAL_BYTES,
+  },
 );
 
 // ---------- 边缘缓存（跨实例复用） ----------

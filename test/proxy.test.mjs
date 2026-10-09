@@ -6843,6 +6843,137 @@ test("does not cache a streamed media segment after an early client cancel", asy
   );
 });
 
+test("retries a stalled media upstream on a fresh connection within the same line", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/stall-retry.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const bytes = Uint8Array.from([1, 2, 3, 4]);
+  let attempts = 0;
+  const startedAt = Date.now();
+  const response = await handleProxy(
+    new Request(proxyUrl, { headers: { range: "bytes=0-3" } }),
+    {
+      MEDIA_UPSTREAM_HEADERS_TIMEOUT_MS: "6000",
+      MEDIA_UPSTREAM_HEADERS_ATTEMPT_TIMEOUT_MS: "80",
+    },
+    {},
+    async (_url, init = {}) => {
+      attempts += 1;
+      if (attempts === 1) {
+        // 第一跳“TCP 连上了但不回响应头”。真实 fetch 会在超时后 abort，
+        // stub 必须照做，否则测试会一直挂住。
+        return new Promise((_, reject) => {
+          const signal = init.signal;
+          const abort = () => reject(signal.reason ?? new Error("aborted"));
+          if (signal.aborted) abort();
+          else signal.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return new Response(bytes, {
+        status: 206,
+        headers: {
+          "content-length": String(bytes.length),
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp2t",
+        },
+      });
+    },
+  );
+
+  assert.equal(attempts, 2);
+  assert.equal(response.status, 206);
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
+  // 旧实现会把 6 秒整块交给一次 fetch：抖动期间要干等满 6 秒才 504。
+  // 现在第一次尝试 80ms 就放弃并换连接，第二次直接拿到数据。
+  assert.ok(
+    Date.now() - startedAt < 2000,
+    "a stalled connection must be retried long before the line budget runs out",
+  );
+});
+
+test("errors the proxied body when the upstream truncates a media Range response", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/truncated-range.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const total = 2744240;
+  const response = await handleProxy(
+    new Request(proxyUrl, { headers: { range: "bytes=0-" } }),
+    {},
+    {},
+    async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          // 上游声明了 content-range，却只送出 866890 字节就结束
+          // （实测 GetAV 分片就是这种“响应头之后中途断流”）。
+          controller.enqueue(new Uint8Array(866890));
+          controller.close();
+        },
+      }),
+      {
+        status: 206,
+        headers: {
+          "content-range": `bytes 0-${total - 1}/${total}`,
+          "content-type": "video/MP2T",
+        },
+      },
+    ),
+  );
+
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-length"), null);
+  // 静默短读会让播放器把半段分片当成完整分片，卡在解码/缓冲上；
+  // 现在必须显式失败，客户端才会重试这一段。
+  await assert.rejects(response.arrayBuffer(), /truncated/);
+});
+
+test("keeps the media Range cache under its total byte budget", async () => {
+  const entryLength = 2 * 1024 * 1024;
+  const bytes = new Uint8Array(entryLength);
+  const cacheableResponse = () => new Response(bytes, {
+    status: 206,
+    headers: {
+      "content-length": String(entryLength),
+      "content-range": `bytes 0-${entryLength - 1}/${entryLength}`,
+      "content-type": "video/mp2t",
+    },
+  });
+  const requestFor = (index) => new Request(
+    `https://clone.example/emby-media/?url=${
+      encodeURIComponent(`https://fast-stream.jav.si/video/budget-${index}.ts`)
+    }&kind=segment&hls=1`,
+    { headers: { range: `bytes=0-${entryLength - 1}` } },
+  );
+
+  // 每条 2 MB，13 条共 26 MB，超过 24 MB 的总字节上限。
+  for (let index = 0; index < 13; index += 1) {
+    const response = await handleProxy(
+      requestFor(index),
+      {},
+      {},
+      async () => cacheableResponse(),
+    );
+    assert.equal(response.status, 206);
+    // 读干响应体，tee 才会把这一段写进 Range 缓存。
+    await response.arrayBuffer();
+  }
+
+  // 最老的那条已经被淘汰：必须回源。
+  let evictedFetches = 0;
+  await handleProxy(requestFor(0), {}, {}, async () => {
+    evictedFetches += 1;
+    return cacheableResponse();
+  });
+  assert.equal(evictedFetches, 1);
+
+  // 最新的一条仍在缓存里：不应回源（说明上限是按字节淘汰，而不是清空整张表）。
+  let newestFetches = 0;
+  await handleProxy(requestFor(12), {}, {}, async () => {
+    newestFetches += 1;
+    return cacheableResponse();
+  });
+  assert.equal(newestFetches, 0);
+});
+
 test("uses the GetAV Referer for static.worldstatic.com media and keeps hotlink headers", async () => {
   const sourceUrl = "https://static.worldstatic.com/signed/rctd-740/index.txt?token=abc";
   const playlistBytes = new TextEncoder().encode(
