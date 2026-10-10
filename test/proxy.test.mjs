@@ -294,7 +294,9 @@ function expectedItemEtag(payload, options = {}) {
     }))
     : [];
   const stableDto = {
-    version: "item-dto-v22",
+    // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
+    // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
+    version: "item-dto-v25",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -1660,7 +1662,7 @@ test("returns a retryable detail response while cold resolution continues", asyn
     expectedItemEtag(secondPayload, { refreshSources: true }),
   );
   assert.equal(
-    [...db.rows.keys()].some((key) => key.includes("sources-v40|RCTD-740")),
+    [...db.rows.keys()].some((key) => /sources-v\d+\|RCTD-740/.test(key)),
     true,
   );
 });
@@ -4686,12 +4688,13 @@ test("waits for the slow public batch instead of answering with the first self-h
   );
 });
 
-test("answers the first screen with the settled self-hosted lines instead of waiting for a slow public batch", async () => {
-  // 线上真实时序：主解析器账号被停用（秒挂 401），回退解析器冷启动 6~8 秒才返回；
-  // 自建补源（Javtiful / GetAV）0.3~1.3 秒就能给出 3~4 条真实线路。旧实现必须等
-  // “两条链路都收尾”才用短静默期，于是首屏死等到 7.4 秒上限，客户端只能看到 1 条
-  // （甚至“自动线路”占位源）。这里断言：只要有一条链路彻底收尾、且线路数达到提前
-  // 返回阈值，就用这批线路立刻答复，不再空等那条慢链路。
+test("waits within the bounded first-screen grace for a public batch that still lands in time", async () => {
+  // 线上真实时序：自建补源（Javtiful / GetAV）0.3~1.3 秒先回 3~4 条，公共解析器
+  // 1.5~4 秒才把整批线路挤完。旧实现只要自建链路“单独收尾 + ≥3 条”就用 400ms
+  // 静默窗口提前答复，首屏停在自建那 3~4 条，退出详情页再进才变多（用户反馈的
+  // “第一次点开只有一个/几个播放源”）。现在给公共批次留一段有界的补时：只要求
+  // 公共批次在补时（RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS）内落地，就用两批合并后
+  // 的完整线路答复；补时用尽仍然没有公共线路的极端情况由下面那条用例覆盖。
   const detailUrl = "https://javtiful.com/zh/video/99998/RCTD-741";
   const selfHostedUrls = [
     "https://fast-stream.jav.si/rctd-741/self-1080.mp4",
@@ -4704,7 +4707,7 @@ test("answers the first screen with the settled self-hosted lines instead of wai
   ];
   const allUrls = [...selfHostedUrls, ...publicUrls];
   const env = {
-    // 预算比公共批次（3 秒）更宽：首屏提前返回不是被预算截断，而是链路收尾。
+    // 预算比公共批次（3 秒）更宽：首屏返回不是被预算截断。
     ITEM_DETAIL_RESOLVE_BUDGET_MS: 6500,
   };
   const startedAt = Date.now();
@@ -4726,7 +4729,7 @@ test("answers the first screen with the settled self-hosted lines instead of wai
         );
       }
       if (target.includes("/api/v/resolve?code=RCTD-741")) {
-        // 公共解析链路：慢到超出首屏静默窗口。
+        // 公共解析链路：慢到超出自建快照的旧静默窗口，但仍在补时窗口内。
         await new Promise((resolve) => setTimeout(resolve, 3000));
         return new Response(
           JSON.stringify({
@@ -4789,7 +4792,101 @@ test("answers the first screen with the settled self-hosted lines instead of wai
     ),
     false,
   );
-  // 关键断言 1：首屏就是自建链路那 3 条真实线路，不是占位源。
+  // 关键断言 1：首屏是两批合并后的完整线路，不是先到的自建那 3 条。
+  assert.equal(payload.MediaSourceCount, allUrls.length);
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ).sort(),
+    [...allUrls].sort(),
+  );
+  // 关键断言 2：等到了公共批次（3 秒），但被补时窗口约束住，没有拖到 9 秒上限。
+  assert.ok(elapsed < 4500, `first screen took ${elapsed}ms`);
+});
+
+test("answers with the self-hosted lines once the first-screen grace expires", async () => {
+  // 公共解析器这条链路偶尔会整条挂住（本地实测 HZGD-032：8.8 秒都没吐出第一条
+  // 线路）。此时手上已经有自建补源的 3 条真实线路，首屏不该陪它空等到 9 秒上限，
+  // 否则客户端要么一直转圈、要么撞上自己的 HTTP 超时。
+  const detailUrl = "https://javtiful.com/zh/video/99997/RCTD-742";
+  const selfHostedUrls = [
+    "https://fast-stream.jav.si/rctd-742/self-1080.mp4",
+    "https://fast-stream.jav.si/rctd-742/self-720.mp4",
+    "https://fast-stream.jav.si/rctd-742/self-480.mp4",
+  ];
+  const env = {
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 9000,
+  };
+  const startedAt = Date.now();
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/44"),
+    env,
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/44")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: { id: 44, number: "RCTD-742", title: "RCTD-742 Stalled" },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes("/api/v/resolve?code=RCTD-742")) {
+        // 公共解析器挂住：整条链路超过首屏预算仍不吐出任何线路。
+        await new Promise((resolve) => setTimeout(resolve, 7000));
+        return new Response(JSON.stringify({ variants: [] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (target === "https://javtiful.com/zh/search?q=RCTD-742") {
+        return new Response(`<a href="${detailUrl}">RCTD-742 Test</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: "RCTD-742 Test",
+            playerSources: selfHostedUrls.map((src, index) => ({
+              src,
+              type: "video/mp4",
+              size: 1080 - index * 360,
+            })),
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (selfHostedUrls.includes(target)) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-742/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  const elapsed = Date.now() - startedAt;
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  // 首屏是自建那 3 条真实线路，而不是“自动线路”占位源。
   assert.equal(payload.MediaSourceCount, selfHostedUrls.length);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
@@ -4797,8 +4894,9 @@ test("answers the first screen with the settled self-hosted lines instead of wai
     ).sort(),
     [...selfHostedUrls].sort(),
   );
-  // 关键断言 2：没有等满 3 秒的公共批次，更没有死等 7.4 秒首屏上限。
-  assert.ok(elapsed < 2000, `first screen took ${elapsed}ms`);
+  // 关键断言：补时窗口一过就答复，没有死等到 9 秒上限。
+  assert.ok(elapsed >= 4500, `first screen returned too early at ${elapsed}ms`);
+  assert.ok(elapsed < 7000, `first screen took ${elapsed}ms`);
 });
 test("waits through the extended cold-start window when the public batch completes with six lines", async () => {
   // 同一资源的两种解析端点：
@@ -6891,6 +6989,138 @@ test("retries a stalled media upstream on a fresh connection within the same lin
   );
 });
 
+test("accepts media response headers that arrive slower than the old attempt budget", async () => {
+  // 实测 GetAV 分片的响应头 TTFB 常态 1.9~4.3 秒（本地探针 + wrangler tail）。
+  // 旧实现单次尝试只有 2.5 秒：这种“慢但正常”的响应会被 cancel 掉换新连接，
+  // 新连接重新握手再等一遍，6 秒总预算耗尽后客户端拿到合成 504
+  // （日志里 GET /emby-media/ 504 Gateway Timeout (6019ms)），播放器只能重试，
+  // 表现就是播放一直卡。这里用默认 env（不覆盖超时常量）固定住新行为。
+  const sourceUrl = "https://fast-stream.jav.si/video/slow-headers.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const bytes = Uint8Array.from([1, 2, 3, 4]);
+  let attempts = 0;
+  const response = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    async (_url, init = {}) => {
+      attempts += 1;
+      await new Promise((resolve) => setTimeout(resolve, 2800));
+      if (init.signal?.aborted) throw new Error("aborted");
+      return new Response(bytes, {
+        status: 200,
+        headers: {
+          "content-length": String(bytes.length),
+          "content-type": "video/mp2t",
+        },
+      });
+    },
+  );
+
+  assert.equal(attempts, 1, "a slow but healthy upstream must not be retried away");
+  assert.equal(response.status, 200);
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
+});
+
+test("keeps waiting past the old 6s attempt cap for a slow GetAV segment", async () => {
+  // 线上实测（Worker 直连 + 逐段探针）：GetAV 1080P 分片的响应头 TTFB 最大 5.9 秒，
+  // 已经贴到旧的“单次尝试 6 秒”边界。边界上的分片会被 cancel 掉换新连接重等，
+  // 12 秒总预算耗尽后客户端拿到合成 504（线上复现 1/22 分片，耗时 12189ms ≈ 6+6）。
+  // 这里用默认 env 固定住“第一次尝试 9 秒”这个行为：6.5 秒才回响应头必须直接成功。
+  const sourceUrl = "https://fast-stream.jav.si/video/very-slow-headers.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const bytes = Uint8Array.from([1, 2, 3, 4]);
+  let attempts = 0;
+  const response = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    async (_url, init = {}) => {
+      attempts += 1;
+      await new Promise((resolve) => setTimeout(resolve, 6500));
+      if (init.signal?.aborted) throw new Error("aborted");
+      return new Response(bytes, {
+        status: 200,
+        headers: {
+          "content-length": String(bytes.length),
+          "content-type": "video/mp2t",
+        },
+      });
+    },
+  );
+
+  assert.equal(attempts, 1, "a 6.5s TTFB must not be cancelled by the attempt budget");
+  assert.equal(response.status, 200);
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
+});
+
+test("fails a media Range body whose upstream stops sending bytes", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/stalled-range.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  let cancelled = false;
+  const response = await handleProxy(
+    new Request(proxyUrl, { headers: { range: "bytes=0-3" } }),
+    { MEDIA_SEGMENT_STREAM_IDLE_TIMEOUT_MS: "60" },
+    {},
+    async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(Uint8Array.from([1]));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      {
+        status: 206,
+        headers: {
+          "content-length": "4",
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp2t",
+        },
+      },
+    ),
+  );
+
+  assert.equal(response.status, 206);
+  // 旧实现只有一个 reader.read() 的 await：上游不再吐字节就永远等下去
+  // （日志里出现过单个分片挂 46 秒），客户端最终自己弹 Connection timeout。
+  // 现在必须主动让流失败，播放器才会重试这一段。
+  await assert.rejects(response.arrayBuffer(), /stalled/);
+  assert.equal(cancelled, true, "the stalled upstream body must be released");
+});
+
+test("fails a full media segment body whose upstream stops sending bytes", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/stalled-full.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const response = await handleProxy(
+    new Request(proxyUrl),
+    { MEDIA_SEGMENT_STREAM_IDLE_TIMEOUT_MS: "60" },
+    {},
+    async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(4));
+        },
+      }),
+      {
+        status: 200,
+        headers: {
+          "content-length": "8",
+          "content-type": "video/mp2t",
+        },
+      },
+    ),
+  );
+
+  assert.equal(response.status, 200);
+  await assert.rejects(response.arrayBuffer(), /stalled/);
+});
+
 test("errors the proxied body when the upstream truncates a media Range response", async () => {
   const sourceUrl = "https://fast-stream.jav.si/video/truncated-range.ts";
   const proxyUrl =
@@ -7971,13 +8201,22 @@ test("refreshes a stale media URL and accepts SenPlayer stream path variants", a
   );
 
   assert.equal(response.status, 206);
-  assert.deepEqual(calls, [
-    "https://fast-stream.jav.si/video/stale.mp4",
-    "https://jdforrepam.com/api/v4/movies/42",
-    `${RESOLVER}/api/v/resolve?code=TEST-001&lang=zh`,
-    "https://javtiful.com/zh/search?q=TEST-001",
-    "https://r.jina.ai/https://getav.net/zh/videos/test-001",
-    "https://getav.net/zh/videos/test-001",
+  // 解析器 JSON 现在会先读一次边缘缓存再回源（见 resolverJsonUrl），回源这条
+  // fetch 会晚一个微任务落到 fetchImpl 上。解析器与自建补源（javtiful/getav）
+  // 是并行链路，它们之间的相对顺序不是契约——这里只固定真正有语义的顺序：
+  // 先试旧地址、再查影片、然后并发解析（解析器必须在其中）、最后拉新地址。
+  assert.equal(calls[0], "https://fast-stream.jav.si/video/stale.mp4");
+  assert.equal(calls[1], "https://jdforrepam.com/api/v4/movies/42");
+  assert.deepEqual(
+    [...calls.slice(2, -2)].sort(),
+    [
+      `${RESOLVER}/api/v/resolve?code=TEST-001&lang=zh`,
+      "https://javtiful.com/zh/search?q=TEST-001",
+      "https://r.jina.ai/https://getav.net/zh/videos/test-001",
+      "https://getav.net/zh/videos/test-001",
+    ].sort(),
+  );
+  assert.deepEqual(calls.slice(-2), [
     "https://fast-stream.jav.si/video/fresh.mp4",
     "https://fast-stream.jav.si/video/fresh.mp4",
   ]);
@@ -8147,12 +8386,20 @@ test("streams relative URLs from alternate resolver response fields", async () =
   );
 
   assert.equal(response.status, 206);
-  assert.deepEqual(calls, [
-    "https://jdforrepam.com/api/v4/movies/42",
-    `${RESOLVER}/api/v/resolve?code=TEST-001&lang=zh`,
-    "https://javtiful.com/zh/search?q=TEST-001",
-    "https://r.jina.ai/https://getav.net/zh/videos/test-001",
-    "https://getav.net/zh/videos/test-001",
+  // 解析器 JSON 回源前会先读一次边缘缓存，fetchImpl 上的落点因此比自建补源晚
+  // 一个微任务。两条链路是并发的，彼此的相对顺序不是契约：这里只固定“先查
+  // 影片、再并发解析（解析器必须在其中）、最后拉媒体”的有语义顺序。
+  assert.equal(calls[0], "https://jdforrepam.com/api/v4/movies/42");
+  assert.deepEqual(
+    [...calls.slice(1, -2)].sort(),
+    [
+      `${RESOLVER}/api/v/resolve?code=TEST-001&lang=zh`,
+      "https://javtiful.com/zh/search?q=TEST-001",
+      "https://r.jina.ai/https://getav.net/zh/videos/test-001",
+      "https://getav.net/zh/videos/test-001",
+    ].sort(),
+  );
+  assert.deepEqual(calls.slice(-2), [
     `${UPSTREAM}/video/fresh.mp4`,
     `${UPSTREAM}/video/fresh.mp4`,
   ]);
@@ -8437,4 +8684,63 @@ test("HideFromResume also accepts a bare DELETE", async () => {
     "https://clone.example/emby/Items/42/UserData",
   ));
   assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
+});
+
+test("proxies an HLS child segment on a rotating CDN host once depth >= 1", async () => {
+  // 上游线路把分片放在随时换域名的 CDN 上（实测同一部片几天内从
+  // halcyonfinancialgroup.online 换到 valorpath.online / vid-snap-player.com）。
+  // 静态白名单永远追不上，漏一个域名整条线路的分片就全部 403，客户端表现为
+  // “一直加载中 / 卡顿”。本服务改写清单后产生的子资源请求必须放行任意公网域名。
+  const segmentUrl = "https://sjt9.valorpath.online/v/seg-1-f2-v1-a1.woff2?k=abc";
+  let fetched = null;
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(segmentUrl)}&hls=1&kind=segment&depth=1`,
+    ),
+    {},
+    {},
+    async (url) => {
+      fetched = String(url);
+      return new Response("segment-bytes", {
+        headers: { "content-type": "video/mp4" },
+      });
+    },
+  );
+
+  assert.equal(fetched, segmentUrl);
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), "segment-bytes");
+});
+
+test("still rejects an unknown media host for a depth 0 client-supplied URL", async () => {
+  // 放宽只针对“本服务改写清单后产生的子资源”：客户端自己塞进来的 url 参数
+  // 没有 hls/kind/depth 标记，仍然只认静态白名单，避免变成任意代理。
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent("https://totally-unknown-cdn.zzz/seg.ts")}`,
+    ),
+    {},
+    {},
+    () => {
+      throw new Error("fetch must not be called");
+    },
+  );
+
+  assert.equal(response.status, 403);
+});
+
+test("still rejects a private host even for a depth >= 1 HLS child", async () => {
+  // isPublicUnicastHostname 拒绝 IP 字面量、localhost 与内网保留后缀。
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent("http://127.0.0.1:8123/seg.ts")}&hls=1&kind=segment&depth=1`,
+    ),
+    {},
+    {},
+    () => {
+      throw new Error("fetch must not be called");
+    },
+  );
+
+  assert.equal(response.status, 403);
 });

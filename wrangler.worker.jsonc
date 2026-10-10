@@ -8,7 +8,6 @@
     "UPSTREAM_ORIGIN": "https://catembylegacy.fastcdn.dpdns.org",
     "EMBY_SERVER_VERSION": "4.8.0.0",
     "EMBY_GUEST_ACCESS": "true",
-    "JAVSTRM_ORIGIN": "https://javstrm.emby-59f.workers.dev",
     "PLAYBACK_DEPLOY_TAG": "worker"
   },
   "d1_databases": [
