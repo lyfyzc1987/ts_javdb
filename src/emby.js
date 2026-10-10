@@ -121,6 +121,18 @@ const INLINE_HLS_CONTENT_TYPES = new Set([
 // 旧上限会把稍大的备用线路直接过滤掉，客户端就只剩一条播放源。
 const MAX_INLINE_HLS_LENGTH = 12_000_000;
 const MAX_HLS_REWRITE_DEPTH = 8;
+// GetAV 的分片在首次从上游 CDN 边缘取回时很慢：实测同一分片冷取 0.24~2.21MB/s，
+// 读完后被上游边缘缓存后可达 50~414MB/s。HLS 清单返回后，后台读掉开头几段，
+// 让播放器真正请求这些分片时命中热对象。这里必须限制并发、数量和总预算：
+//   - 4K 单段约 13.4MB，数量过多会浪费上游流量；
+//   - 后台任务通过 ctx.waitUntil 运行，不能超过 Worker 的生命周期预算；
+//   - 失败静默处理，绝不改变正常清单或阻塞播放请求。
+const GETAV_HLS_PREFETCH_SEGMENTS = 3;
+const GETAV_HLS_PREFETCH_CONCURRENCY = 2;
+const GETAV_HLS_PREFETCH_BUDGET_MS = 15 * 1000;
+const GETAV_HLS_PREFETCH_RECENT_MS = 60 * 1000;
+const GETAV_HLS_PREFETCH_IN_FLIGHT = new Set();
+const GETAV_HLS_PREFETCH_RECENT = new Map();
 // 校验播放源时只需要看清单的“开头几条”就能判断第一条分片/子清单是否可播。
 // 解析器会把整份清单（实测 RCTD-740 约 2MB）塞进 data: URL，如果按行全量
 // 展开再逐条探测，单次 PlaybackInfo 就会吃掉大量 CPU/内存并触发 Cloudflare
@@ -151,7 +163,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v25";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-10-resolve-budget-debug-off-37";
+const SERVER_BUILD_ID = "2026-10-10-getav-prefetch-38";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -2666,6 +2678,173 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth) {
   return output.join("\n");
 }
 
+function isGetavPrefetchMediaUrl(value) {
+  try {
+    const url = value instanceof URL ? value : new URL(String(value || ""));
+    if (url.protocol !== "https:" && url.protocol !== "http:") return false;
+    const host = url.hostname.toLowerCase();
+    return host === "worldstatic.com" || host.endsWith(".worldstatic.com");
+  } catch {
+    return false;
+  }
+}
+
+function directHlsSegmentUrls(playlist, manifestUrl) {
+  let baseUrl;
+  try {
+    baseUrl = new URL(String(manifestUrl || ""));
+  } catch {
+    return [];
+  }
+  const urls = [];
+  const seen = new Set();
+  let nextUriKind = "";
+  for (const rawLine of String(playlist || "").replace(/\r\n?/g, "\n").split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("#")) {
+      if (/^#EXT-X-STREAM-INF:/i.test(line)) {
+        nextUriKind = "manifest";
+      }
+      continue;
+    }
+    const kind = nextUriKind;
+    nextUriKind = "";
+    // Master playlist 的后继 URI 是子清单，真正分片的预热会在子清单返回时触发。
+    if (kind === "manifest") continue;
+    let target;
+    try {
+      target = new URL(line, baseUrl);
+    } catch {
+      continue;
+    }
+    if (target.protocol !== "https:" && target.protocol !== "http:") continue;
+    const key = target.toString();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    urls.push(target);
+  }
+  return urls;
+}
+
+function getavPrefetchLimit(env) {
+  const configured = Number(env?.GETAV_HLS_PREFETCH_SEGMENTS);
+  if (Number.isFinite(configured)) {
+    return Math.min(4, Math.max(0, Math.floor(configured)));
+  }
+  return GETAV_HLS_PREFETCH_SEGMENTS;
+}
+
+function pruneGetavPrefetchRecent(now) {
+  for (const [key, warmedAt] of GETAV_HLS_PREFETCH_RECENT) {
+    if (now - warmedAt >= GETAV_HLS_PREFETCH_RECENT_MS) {
+      GETAV_HLS_PREFETCH_RECENT.delete(key);
+    }
+  }
+}
+
+async function warmGetavSegment(
+  target,
+  request,
+  env,
+  fetchImpl,
+  deadline,
+) {
+  const remainingMs = deadline - Date.now();
+  const key = target.toString();
+  if (remainingMs <= 0) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), remainingMs);
+  try {
+    const response = await fetchImpl(key, {
+      method: "GET",
+      headers: new Headers({
+        accept: "video/*,application/octet-stream,*/*;q=0.8",
+        origin: upstreamOrigin(env),
+        referer: GETAV_MEDIA_REFERER,
+        "user-agent": request.headers.get("user-agent") || "Mozilla/5.0",
+      }),
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      try {
+        await response.body?.cancel();
+      } catch {}
+      return;
+    }
+    const reader = response.body?.getReader();
+    if (reader) {
+      for (;;) {
+        const result = await reader.read();
+        if (result.done) break;
+      }
+    }
+    GETAV_HLS_PREFETCH_RECENT.set(key, Date.now());
+  } catch {
+    // 预热是纯优化：超时、断流或 CDN 抖动都不影响真实播放请求。
+  } finally {
+    clearTimeout(timer);
+    GETAV_HLS_PREFETCH_IN_FLIGHT.delete(key);
+  }
+}
+
+function scheduleGetavHlsPrefetch(
+  playlist,
+  manifestUrl,
+  request,
+  env,
+  fetchImpl,
+  ctx,
+) {
+  if (
+    request.method !== "GET" ||
+    typeof fetchImpl !== "function" ||
+    !ctx ||
+    typeof ctx.waitUntil !== "function"
+  ) {
+    return;
+  }
+  const limit = getavPrefetchLimit(env);
+  if (limit <= 0) return;
+  const now = Date.now();
+  pruneGetavPrefetchRecent(now);
+  const targets = directHlsSegmentUrls(playlist, manifestUrl)
+    .filter(isGetavPrefetchMediaUrl)
+    .filter((url) => {
+      const key = url.toString();
+      return !GETAV_HLS_PREFETCH_IN_FLIGHT.has(key) &&
+        !GETAV_HLS_PREFETCH_RECENT.has(key);
+    })
+    .slice(0, limit);
+  if (!targets.length) return;
+
+  for (const target of targets) {
+    GETAV_HLS_PREFETCH_IN_FLIGHT.add(target.toString());
+  }
+  const deadline = Date.now() + GETAV_HLS_PREFETCH_BUDGET_MS;
+  let cursor = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= targets.length) return;
+      await warmGetavSegment(
+        targets[index],
+        request,
+        env,
+        fetchImpl,
+        deadline,
+      );
+    }
+  };
+  const workers = Array.from(
+    { length: Math.min(GETAV_HLS_PREFETCH_CONCURRENCY, targets.length) },
+    () => worker(),
+  );
+  ctx.waitUntil(Promise.all(workers).catch(() => {}));
+}
+
 function isHlsResponse(upstream, sourceUrl) {
   const contentType = String(upstream.headers.get("content-type") || "").toLowerCase();
   if (INLINE_HLS_CONTENT_TYPES.has(contentType.split(";")[0].trim())) {
@@ -2695,7 +2874,14 @@ function adjustedContentRangeAfterPrefix(contentRange, prefixLength, bodyLength)
   return `bytes ${virtualStart}-${virtualEnd}/${virtualTotal}`;
 }
 
-async function proxyMediaResponse(upstream, sourceUrl, request, env, depth = 0) {
+async function proxyMediaResponse(
+  upstream,
+  sourceUrl,
+  request,
+  env,
+  depth = 0,
+  options = {},
+) {
   const requestUrl = new URL(request.url);
   const kind = String(requestUrl.searchParams.get("kind") || "").toLowerCase();
   const encrypted = requestUrl.searchParams.get("encrypted") === "1";
@@ -2800,6 +2986,14 @@ async function proxyMediaResponse(upstream, sourceUrl, request, env, depth = 0) 
 
   const finalUrl = upstream.url || sourceUrl;
   const rewritten = rewriteHlsManifest(text, finalUrl, request.url, depth);
+  scheduleGetavHlsPrefetch(
+    text,
+    finalUrl,
+    request,
+    env,
+    options.fetchImpl,
+    options.ctx,
+  );
   headers.delete("content-length");
   headers.delete("content-range");
   headers.set("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
@@ -10456,6 +10650,7 @@ async function streamResponse(id, request, env, fetchImpl, token, ctx = null) {
           request,
           env,
           0,
+          { fetchImpl, ctx },
         );
         response.headers.set(
           "content-disposition",
@@ -11901,6 +12096,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       request,
       env,
       hlsRewriteDepth(url.searchParams.get("depth")),
+      { fetchImpl, ctx },
     );
   }
 
@@ -11945,6 +12141,8 @@ export function resetEmbyCachesForTests() {
   MEDIA_SEGMENT_BODY_CACHE.clear();
   MEDIA_SEGMENT_PREFIX_CACHE.clear();
   MEDIA_SEGMENT_RANGE_CACHE.clear();
+  GETAV_HLS_PREFETCH_IN_FLIGHT.clear();
+  GETAV_HLS_PREFETCH_RECENT.clear();
   SUBTITLE_STREAM_TOKENS.clear();
   SUBTITLE_BODY_CACHE.clear();
   MEMORY_PLAYBACK_STATES.clear();

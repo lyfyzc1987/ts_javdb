@@ -6081,6 +6081,111 @@ test("rewrites a 206 HLS manifest for an explicit manifest request", async () =>
   assert.ok(rewritten.includes(encodeURIComponent(segmentUrl)));
 });
 
+test("prewarms the first GetAV HLS segments in the background", async () => {
+  const manifestUrl = "https://static.worldstatic.com/getav/prefetch/index.txt";
+  const segmentUrls = Array.from(
+    { length: 5 },
+    (_, index) =>
+      `https://static.worldstatic.com/getav/prefetch/seg-${index}.woff2?e=1`,
+  );
+  const manifest = [
+    "#EXTM3U",
+    ...segmentUrls.flatMap((segmentUrl) => {
+      const parsed = new URL(segmentUrl);
+      return [
+        "#EXTINF:6,",
+        parsed.pathname.split("/").pop() + parsed.search,
+      ];
+    }),
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const calls = [];
+  const backgroundTasks = [];
+  let activeFetches = 0;
+  let maxActiveFetches = 0;
+  const context = {
+    waitUntil(task) {
+      backgroundTasks.push(task);
+      return task;
+    },
+  };
+  const fetchImpl = async (url, init = {}) => {
+    const target = String(url);
+    calls.push(target);
+    if (target === manifestUrl) {
+      return new Response(manifest, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    }
+    assert.equal(init.method, "GET");
+    assert.equal(init.headers.get("referer"), "https://getav.net/");
+    assert.equal(init.headers.get("range"), null);
+    activeFetches += 1;
+    maxActiveFetches = Math.max(maxActiveFetches, activeFetches);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    activeFetches -= 1;
+    return new Response(new Uint8Array([0x47, 0, 0, 0]), {
+      headers: { "content-type": "video/mp2t" },
+    });
+  };
+
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(manifestUrl)}&hls=1&kind=manifest`,
+    ),
+    {},
+    context,
+    fetchImpl,
+  );
+
+  assert.equal(response.status, 200);
+  const rewritten = await response.text();
+  assert.equal((rewritten.match(/\/emby-media\//g) || []).length, 5);
+  assert.equal(backgroundTasks.length, 1);
+  await Promise.all(backgroundTasks);
+
+  assert.equal(calls[0], manifestUrl);
+  assert.deepEqual(calls.slice(1).sort(), segmentUrls.slice(0, 3).sort());
+  assert.equal(maxActiveFetches, 2);
+});
+
+test("does not prewarm HLS segments from non-GetAV hosts", async () => {
+  const manifestUrl = "https://fast-stream.jav.si/live/index.m3u8";
+  const segmentUrl = "https://fast-stream.jav.si/live/segment-0.ts";
+  const manifest = [
+    "#EXTM3U",
+    "#EXTINF:6,",
+    segmentUrl,
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  let fetches = 0;
+  const backgroundTasks = [];
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(manifestUrl)}&hls=1&kind=manifest`,
+    ),
+    {},
+    {
+      waitUntil(task) {
+        backgroundTasks.push(task);
+        return task;
+      },
+    },
+    async (url) => {
+      fetches += 1;
+      assert.equal(String(url), manifestUrl);
+      return new Response(manifest, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    },
+  );
+
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(fetches, 1);
+  assert.equal(backgroundTasks.length, 0);
+});
+
 test("does not forward Range when a direct HLS stream is a manifest", async () => {
   const sourceUrl = "https://static.worldstatic.com/rctd-740/4k/index.txt";
   const segmentUrl = "https://static.worldstatic.com/rctd-740/4k/seg-0.woff2?e=1";
