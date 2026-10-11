@@ -10,7 +10,7 @@ const SIGNATURE_SECRET =
   "71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa";
 const ROOT_ID = "bbjavdb-root";
 // “中文可播放”分类在客户端显示为“中文字幕”：只收“有中文字幕且可播放”的影片。
-// 原“可播放”分类已按要求移除，避免与“有码/无码/欧美”重复。
+// 原“可播放”分类已按要求移除，避免与“有码/无码/FC2”重复。
 const CHINESE_PLAYABLE_LIBRARY_ID = "bbjavdb-chinese-playable";
 const CENSORED_LIBRARY_ID = "bbjavdb-censored";
 const UNCENSORED_LIBRARY_ID = "bbjavdb-uncensored";
@@ -56,8 +56,8 @@ const LIBRARIES = [
   },
   {
     id: WESTERN_LIBRARY_ID,
-    name: "欧美",
-    sourceType: "2",
+    name: "FC2",
+    sourceType: "3",
     sourceFilter: "can_play",
     matches: (movie) => Boolean(movie?.can_play),
   },
@@ -131,8 +131,12 @@ const GETAV_HLS_PREFETCH_SEGMENTS = 3;
 const GETAV_HLS_PREFETCH_CONCURRENCY = 2;
 const GETAV_HLS_PREFETCH_BUDGET_MS = 15 * 1000;
 const GETAV_HLS_PREFETCH_RECENT_MS = 60 * 1000;
+const GETAV_HLS_ROLLING_PREFETCH_SEGMENTS = 3;
+const GETAV_HLS_SEGMENT_MAP_MAX_ENTRIES = 1024;
+const GETAV_HLS_SEGMENT_MAP_TTL_MS = 10 * 60 * 1000;
 const GETAV_HLS_PREFETCH_IN_FLIGHT = new Set();
 const GETAV_HLS_PREFETCH_RECENT = new Map();
+const GETAV_HLS_NEXT_SEGMENTS = new Map();
 // 校验播放源时只需要看清单的“开头几条”就能判断第一条分片/子清单是否可播。
 // 解析器会把整份清单（实测 RCTD-740 约 2MB）塞进 data: URL，如果按行全量
 // 展开再逐条探测，单次 PlaybackInfo 就会吃掉大量 CPU/内存并触发 Cloudflare
@@ -163,7 +167,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v25";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-10-getav-prefetch-38";
+const SERVER_BUILD_ID = "2026-10-11-getav-rolling-fc2-39";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -412,17 +416,6 @@ function errorResponse(status, message) {
     ErrorCode: status === 401 ? "Unauthorized" : "UnknownError",
     Message: message,
   }, status);
-}
-
-function temporaryPlaybackResponse(message, retryAfterSeconds = 1) {
-  return jsonResponse({
-    error: message,
-    ErrorCode: "ServiceUnavailable",
-    Message: message,
-  }, 503, {
-    "retry-after": String(Math.max(1, Math.floor(Number(retryAfterSeconds) || 1))),
-    "x-emby-retryable": "1",
-  });
 }
 
 function apiOrigin(env) {
@@ -2743,6 +2736,32 @@ function pruneGetavPrefetchRecent(now) {
   }
 }
 
+function pruneGetavSegmentMap(now) {
+  for (const [key, entry] of GETAV_HLS_NEXT_SEGMENTS) {
+    if (now - entry.createdAt >= GETAV_HLS_SEGMENT_MAP_TTL_MS) {
+      GETAV_HLS_NEXT_SEGMENTS.delete(key);
+    }
+  }
+}
+
+function registerGetavSegmentSequence(segmentUrls, now) {
+  const getavUrls = segmentUrls.filter(isGetavPrefetchMediaUrl);
+  if (getavUrls.length < 2) return;
+  pruneGetavSegmentMap(now);
+  for (let index = 0; index < getavUrls.length - 1; index += 1) {
+    if (GETAV_HLS_NEXT_SEGMENTS.size >= GETAV_HLS_SEGMENT_MAP_MAX_ENTRIES) break;
+    const next = getavUrls
+      .slice(index + 1, index + 1 + GETAV_HLS_ROLLING_PREFETCH_SEGMENTS)
+      .map((url) => url.toString());
+    if (next.length) {
+      GETAV_HLS_NEXT_SEGMENTS.set(getavUrls[index].toString(), {
+        createdAt: now,
+        next,
+      });
+    }
+  }
+}
+
 async function warmGetavSegment(
   target,
   request,
@@ -2789,9 +2808,8 @@ async function warmGetavSegment(
   }
 }
 
-function scheduleGetavHlsPrefetch(
-  playlist,
-  manifestUrl,
+function queueGetavPrefetchTargets(
+  targets,
   request,
   env,
   fetchImpl,
@@ -2805,21 +2823,17 @@ function scheduleGetavHlsPrefetch(
   ) {
     return;
   }
-  const limit = getavPrefetchLimit(env);
-  if (limit <= 0) return;
   const now = Date.now();
   pruneGetavPrefetchRecent(now);
-  const targets = directHlsSegmentUrls(playlist, manifestUrl)
-    .filter(isGetavPrefetchMediaUrl)
+  const queuedTargets = targets
     .filter((url) => {
       const key = url.toString();
       return !GETAV_HLS_PREFETCH_IN_FLIGHT.has(key) &&
         !GETAV_HLS_PREFETCH_RECENT.has(key);
-    })
-    .slice(0, limit);
-  if (!targets.length) return;
+    });
+  if (!queuedTargets.length) return;
 
-  for (const target of targets) {
+  for (const target of queuedTargets) {
     GETAV_HLS_PREFETCH_IN_FLIGHT.add(target.toString());
   }
   const deadline = Date.now() + GETAV_HLS_PREFETCH_BUDGET_MS;
@@ -2828,9 +2842,9 @@ function scheduleGetavHlsPrefetch(
     for (;;) {
       const index = cursor;
       cursor += 1;
-      if (index >= targets.length) return;
+      if (index >= queuedTargets.length) return;
       await warmGetavSegment(
-        targets[index],
+        queuedTargets[index],
         request,
         env,
         fetchImpl,
@@ -2839,10 +2853,63 @@ function scheduleGetavHlsPrefetch(
     }
   };
   const workers = Array.from(
-    { length: Math.min(GETAV_HLS_PREFETCH_CONCURRENCY, targets.length) },
+    { length: Math.min(GETAV_HLS_PREFETCH_CONCURRENCY, queuedTargets.length) },
     () => worker(),
   );
   ctx.waitUntil(Promise.all(workers).catch(() => {}));
+}
+
+function scheduleGetavHlsPrefetch(
+  playlist,
+  manifestUrl,
+  request,
+  env,
+  fetchImpl,
+  ctx,
+) {
+  const limit = getavPrefetchLimit(env);
+  if (limit <= 0) return;
+  const targets = directHlsSegmentUrls(playlist, manifestUrl);
+  registerGetavSegmentSequence(targets, Date.now());
+  queueGetavPrefetchTargets(
+    targets.filter(isGetavPrefetchMediaUrl).slice(0, limit),
+    request,
+    env,
+    fetchImpl,
+    ctx,
+  );
+}
+
+function scheduleGetavRollingPrefetch(
+  sourceUrl,
+  request,
+  env,
+  fetchImpl,
+  ctx,
+) {
+  if (
+    request.method !== "GET" ||
+    typeof fetchImpl !== "function" ||
+    !ctx ||
+    typeof ctx.waitUntil !== "function"
+  ) {
+    return;
+  }
+  const now = Date.now();
+  pruneGetavSegmentMap(now);
+  const entry = GETAV_HLS_NEXT_SEGMENTS.get(String(sourceUrl || ""));
+  if (!entry) return;
+  const targets = entry.next
+    .map((value) => {
+      try {
+        return new URL(value);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .filter(isGetavPrefetchMediaUrl);
+  queueGetavPrefetchTargets(targets, request, env, fetchImpl, ctx);
 }
 
 function isHlsResponse(upstream, sourceUrl) {
@@ -2902,6 +2969,20 @@ async function proxyMediaResponse(
     headers.get(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER) === "1";
   headers.delete(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER);
   const upstreamType = String(headers.get("content-type") || "").toLowerCase();
+  if (
+    request.method === "GET" &&
+    kind === "segment" &&
+    upstream.status >= 200 &&
+    upstream.status < 300
+  ) {
+    scheduleGetavRollingPrefetch(
+      sourceUrl,
+      request,
+      env,
+      options.fetchImpl,
+      options.ctx,
+    );
+  }
   if (
     kind === "key" ||
     (encrypted && (!upstreamType || upstreamType.startsWith("font/")))
@@ -5660,7 +5741,7 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
   );
   const requiredCount = startIndex + limit;
   // 若请求指定了某个分类（ParentId），只在该分类里搜；否则跨四个分类汇总，
-  // 因为同一位演员 / 同一个标签的作品可能分散在“中文字幕/有码/无码/欧美”里。
+  // 因为同一位演员 / 同一个标签的作品可能分散在“中文字幕/有码/无码/FC2”里。
   const requestedParentId = query.get("ParentId") || "";
   const singleLibrary = LIBRARIES.find((lib) => lib.id === requestedParentId) || null;
   const libraryList = singleLibrary ? [singleLibrary] : LIBRARIES;
@@ -11998,9 +12079,19 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
         subtitles,
       );
       if (!mediaSources.length) {
-        return temporaryPlaybackResponse(
-          "Playback sources are not ready; retry the request",
+        const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
+        const playSessionId = crypto.randomUUID();
+        rememberPlaySession(
+          await playbackStateKey(env, playbackToken),
+          item.Id,
+          playSessionId,
         );
+        return jsonResponse({
+          PlaySessionId: playSessionId,
+          ItemId: item.Id,
+          MediaSources: sources,
+          MediaSourceCount: sources.length,
+        });
       }
       const playSessionId = crypto.randomUUID();
       // 记住这次播放用的会话号:之后“移除播放记录”才能认出哪些上报是残留。
@@ -12143,6 +12234,7 @@ export function resetEmbyCachesForTests() {
   MEDIA_SEGMENT_RANGE_CACHE.clear();
   GETAV_HLS_PREFETCH_IN_FLIGHT.clear();
   GETAV_HLS_PREFETCH_RECENT.clear();
+  GETAV_HLS_NEXT_SEGMENTS.clear();
   SUBTITLE_STREAM_TOKENS.clear();
   SUBTITLE_BODY_CACHE.clear();
   MEMORY_PLAYBACK_STATES.clear();

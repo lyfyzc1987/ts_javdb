@@ -2487,11 +2487,45 @@ test("advertises a non-empty virtual movie library", async () => {
       ["bbjavdb-chinese-playable", "中文字幕"],
       ["bbjavdb-censored", "有码"],
       ["bbjavdb-uncensored", "无码"],
-      ["bbjavdb-western", "欧美"],
+      ["bbjavdb-western", "FC2"],
     ],
   );
   assert.equal(countsPayload.MovieCount, 1000);
   assert.equal(countsPayload.ItemCount, 1000);
+});
+
+test("uses the FC2 upstream type for the FC2 library", async () => {
+  let upstreamUrl = "";
+  const response = await handleProxy(
+    new Request("https://clone.example/Items?ParentId=bbjavdb-western&Limit=1"),
+    {},
+    {},
+    async (url) => {
+      upstreamUrl = String(url);
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: {
+            movies: [{
+              id: "FC2-4989990",
+              number: "FC2-4989990",
+              title: "FC2 test movie",
+              can_play: true,
+            }],
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  const target = new URL(upstreamUrl);
+  assert.equal(response.status, 200);
+  assert.equal(target.searchParams.get("type"), "3");
+  assert.equal(target.searchParams.get("filter_by"), "can_play");
+  assert.equal(payload.Items[0].ParentId, "bbjavdb-western");
+  assert.match(payload.Items[0].Name, /FC2-4989990/);
 });
 
 test("returns Emby-compatible media folder and virtual folder queries", async () => {
@@ -6147,6 +6181,77 @@ test("prewarms the first GetAV HLS segments in the background", async () => {
   assert.equal(calls[0], manifestUrl);
   assert.deepEqual(calls.slice(1).sort(), segmentUrls.slice(0, 3).sort());
   assert.equal(maxActiveFetches, 2);
+});
+
+test("prewarms later GetAV HLS segments as playback advances", async () => {
+  const manifestUrl = "https://static.worldstatic.com/getav/rolling/index.m3u8";
+  const segmentUrls = Array.from(
+    { length: 8 },
+    (_, index) =>
+      `https://static.worldstatic.com/getav/rolling/seg-${index}.woff2?e=1`,
+  );
+  const manifest = [
+    "#EXTM3U",
+    ...segmentUrls.flatMap((segmentUrl) => {
+      const parsed = new URL(segmentUrl);
+      return [
+        "#EXTINF:6,",
+        parsed.pathname.split("/").pop() + parsed.search,
+      ];
+    }),
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const calls = [];
+  const backgroundTasks = [];
+  const context = {
+    waitUntil(task) {
+      backgroundTasks.push(task);
+      return task;
+    },
+  };
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    calls.push(target);
+    if (target === manifestUrl) {
+      return new Response(manifest, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    }
+    return new Response(new Uint8Array([0x47, 0, 0, 0]), {
+      headers: { "content-type": "video/mp2t" },
+    });
+  };
+
+  const manifestResponse = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(manifestUrl)}&hls=1&kind=manifest`,
+    ),
+    {},
+    context,
+    fetchImpl,
+  );
+  assert.equal(manifestResponse.status, 200);
+  await manifestResponse.text();
+  await Promise.all(backgroundTasks);
+
+  const callsAfterManifest = new Set(calls);
+  const segmentUrl = segmentUrls[1];
+  const segmentResponse = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(segmentUrl)}&hls=1&kind=segment&depth=1`,
+    ),
+    {},
+    context,
+    fetchImpl,
+  );
+  assert.equal(segmentResponse.status, 200);
+  await segmentResponse.arrayBuffer();
+  await Promise.all(backgroundTasks);
+
+  const rollingCalls = calls.filter((target) => !callsAfterManifest.has(target));
+  assert.ok(rollingCalls.includes(segmentUrls[3]));
+  assert.ok(rollingCalls.includes(segmentUrls[4]));
+  assert.equal(rollingCalls.includes(segmentUrls[5]), false);
 });
 
 test("does not prewarm HLS segments from non-GetAV hosts", async () => {
