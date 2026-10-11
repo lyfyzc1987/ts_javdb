@@ -111,7 +111,11 @@ const MEDIA_SUFFIXES = [
   ".innovationinfrastructure.space",
   ".silverlark.sbs",
 ];
-const GETAV_MEDIA_REFERER = "https://getav.net/";
+const GETAV_MEDIA_ORIGIN = "https://getav.net";
+const GETAV_MEDIA_REFERER = `${GETAV_MEDIA_ORIGIN}/`;
+// GetAV 的媒体 CDN 会拦截 Emby/curl 等客户端 UA，但接受稳定的浏览器 UA。
+// 这里不能透传客户端请求头，否则分片会变成 Cloudflare 403/1022 错误页。
+const GETAV_MEDIA_USER_AGENT = "Mozilla/5.0";
 const INLINE_HLS_CONTENT_TYPES = new Set([
   "application/mpegurl",
   "application/vnd.apple.mpegurl",
@@ -835,6 +839,51 @@ function responseLooksLikeTextDocument(bytes) {
     prefix.startsWith("{") || prefix.startsWith("[");
 }
 
+function mediaContentTypeLooksLikeErrorDocument(contentType) {
+  const normalized = String(contentType || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  return normalized === "text/html" ||
+    normalized === "application/xhtml+xml" ||
+    normalized === "application/json" ||
+    normalized.endsWith("+json");
+}
+
+function mediaPayloadLooksLikeErrorDocument(bytes, contentType = "") {
+  if (!bytes?.length) return false;
+  if (mediaContentTypeLooksLikeErrorDocument(contentType)) return true;
+
+  const prefix = new TextDecoder("utf-8", { fatal: false })
+    .decode(bytes.subarray(0, 2048))
+    .trimStart()
+    .toLowerCase();
+  if (!prefix) return false;
+  if (prefix.startsWith("<!doctype") || prefix.startsWith("<html")) {
+    return true;
+  }
+  if (
+    /(?:error\s*(?:code)?\s*[:#-]?\s*1022\b|\b1022\b.{0,80}(?:cloudflare|error)|cloudflare.{0,80}\b1022\b)/i
+      .test(prefix)
+  ) {
+    return true;
+  }
+  return /(?:access denied|forbidden|too many requests|rate limit(?:ed)?)/i
+    .test(prefix);
+}
+
+function mediaUpstreamInvalidResponse() {
+  return new Response("Upstream returned an invalid media response; retry", {
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "text/plain; charset=utf-8",
+      "retry-after": "1",
+    },
+  });
+}
+
 function parseHlsAttributeList(value) {
   const source = String(value || "");
   const attributes = {};
@@ -957,14 +1006,18 @@ function remoteHlsValidationBudget(deadline) {
 }
 
 async function fetchRemoteHlsResponse(url, fetchImpl, options = {}) {
+  const getavMedia = mediaProxyGetavMediaProfile(url);
   const headers = new Headers({
     accept: options.accept ||
       "application/vnd.apple.mpegurl,application/x-mpegurl,video/*,*/*;q=0.8",
-    "user-agent": "Mozilla/5.0",
+    "user-agent": getavMedia?.userAgent || "Mozilla/5.0",
   });
+  if (getavMedia?.origin) {
+    headers.set("origin", getavMedia.origin);
+  }
   headers.set(
     "referer",
-    mediaProxyRefererForSource(url, "https://www.javdb.com/"),
+    getavMedia?.referer || "https://www.javdb.com/",
   );
   if (options.range) {
     headers.set("range", `bytes=0-${REMOTE_MEDIA_PROBE_BYTES - 1}`);
@@ -1459,28 +1512,35 @@ function decodeInlineHls(value) {
   }
 }
 
-function mediaProxyRefererForSource(sourceUrl, fallbackReferer) {
+function mediaProxyGetavMediaProfile(sourceUrl) {
   try {
     const host = new URL(sourceUrl).hostname.toLowerCase();
-    // GetAV 的媒体 CDN 会对缺少站内 Referer 的请求返回 403。
+    // GetAV 的媒体 CDN 会对缺少站内 Referer、Origin 或非浏览器 UA 的请求返回 403。
     if (host === "worldstatic.com" || host.endsWith(".worldstatic.com")) {
-      return GETAV_MEDIA_REFERER;
+      return {
+        origin: GETAV_MEDIA_ORIGIN,
+        referer: GETAV_MEDIA_REFERER,
+        userAgent: GETAV_MEDIA_USER_AGENT,
+      };
     }
   } catch {}
-  return fallbackReferer;
+  return null;
 }
 
 function mediaProxyRequestHeaders(request, env, sourceUrl = "", options = {}) {
   const upstream = upstreamOrigin(env);
+  const getavMedia = mediaProxyGetavMediaProfile(sourceUrl);
   const headers = new Headers({
     accept: request.headers.get("accept") ||
       "application/vnd.apple.mpegurl,application/x-mpegurl,video/*,*/*;q=0.8",
-    origin: upstream,
-    "user-agent": request.headers.get("user-agent") || "Mozilla/5.0",
+    origin: getavMedia?.origin || upstream,
+    "user-agent": getavMedia?.userAgent ||
+      request.headers.get("user-agent") ||
+      "Mozilla/5.0",
   });
   headers.set(
     "referer",
-    mediaProxyRefererForSource(sourceUrl, `${upstream}/`),
+    getavMedia?.referer || `${upstream}/`,
   );
   // HLS 清单必须拿到完整文本，Range/条件请求可能只返回前缀或 304，
   // 后续就无法重写清单中的密钥和分片地址。
@@ -1575,6 +1635,35 @@ function parseMediaContentRange(value) {
     return null;
   }
   return { start, end, total };
+}
+
+function mediaRangeResponseMatchesRequest(rangeHeader, responseHeaders) {
+  const requestMatch = /^bytes=(\d*)-(\d*)$/i.exec(
+    String(rangeHeader || "").trim(),
+  );
+  if (!requestMatch || (!requestMatch[1] && !requestMatch[2])) {
+    return null;
+  }
+  const contentRange = parseMediaContentRange(
+    responseHeaders?.get("content-range") || "",
+  );
+  if (!contentRange) return false;
+  const expected = parseSingleByteRange(
+    rangeHeader,
+    contentRange.total ?? contentRange.end + 1,
+  );
+  if (!expected || expected.invalid || expected.unsatisfiable) return null;
+
+  const contentLength = Number(responseHeaders?.get("content-length"));
+  if (
+    Number.isSafeInteger(contentLength) &&
+    contentLength > 0 &&
+    contentLength !== contentRange.end - contentRange.start + 1
+  ) {
+    return false;
+  }
+  return expected.start === contentRange.start &&
+    expected.end === contentRange.end;
 }
 
 function mediaSegmentPrefixMetadata(
@@ -1760,6 +1849,10 @@ async function bufferMediaSegmentResponse(upstream, sourceUrl) {
   ).split(";")[0].trim().toLowerCase();
 
   const bytes = new Uint8Array(await upstream.arrayBuffer());
+  const errorDocument = mediaPayloadLooksLikeErrorDocument(
+    bytes,
+    originalContentType,
+  );
   const embeddedOffset = embeddedMpegTsOffset(bytes);
   const normalized = normalizedMediaSegmentBytes(bytes, originalContentType);
   let pathname = "";
@@ -1802,7 +1895,8 @@ async function bufferMediaSegmentResponse(upstream, sourceUrl) {
 
   // 只有完整的 200 响应才能作为本地断点续传缓存；真实图片、错误响应和
   // 上游自行返回的 206 仍原样返回，避免把 PNG 前缀当成完整视频分片。
-  const rangeable = upstream.ok &&
+  const rangeable = !errorDocument &&
+    upstream.ok &&
     upstream.status === 200 &&
     !(imageCandidate && !normalized.embedded);
   const cacheable = rangeable &&
@@ -1820,6 +1914,7 @@ async function bufferMediaSegmentResponse(upstream, sourceUrl) {
     },
     cacheable,
     embeddedOffset,
+    errorDocument,
     originalContentType,
   };
 }
@@ -1921,11 +2016,16 @@ function streamCompleteMediaSegmentResponse(upstream, cacheKey) {
   if (contentLength > MAX_CACHED_MEDIA_SEGMENT_BYTES) {
     return upstream;
   }
+  const contentType = upstream.headers.get("content-type") || "";
+  if (mediaContentTypeLooksLikeErrorDocument(contentType)) {
+    return mediaUpstreamInvalidResponse();
+  }
 
   const cacheBytes = new Uint8Array(contentLength);
   let cacheOffset = 0;
   let cacheComplete = true;
   let delivered = 0;
+  let inspectedPrefix = false;
   const reader = upstream.body.getReader();
   const body = new ReadableStream({
     async pull(controller) {
@@ -1960,6 +2060,17 @@ function streamCompleteMediaSegmentResponse(upstream, cacheKey) {
       const chunk = result.value instanceof Uint8Array
         ? result.value
         : new Uint8Array(result.value);
+      if (!inspectedPrefix) {
+        inspectedPrefix = true;
+        if (mediaPayloadLooksLikeErrorDocument(chunk, contentType)) {
+          cacheComplete = false;
+          try {
+            await reader.cancel();
+          } catch {}
+          controller.error(new Error("upstream media error document"));
+          return;
+        }
+      }
       delivered += chunk.byteLength;
       if (cacheComplete) {
         if (cacheOffset + chunk.byteLength <= cacheBytes.byteLength) {
@@ -2017,6 +2128,14 @@ function cachedMediaSegmentResponse(record, request) {
     statusText: "Partial Content",
     headers,
   });
+}
+
+function bufferedMediaResultResponse(result, request) {
+  if (result?.errorDocument) return mediaUpstreamInvalidResponse();
+  if (result?.record) {
+    return cachedMediaSegmentResponse(result.record, request);
+  }
+  return null;
 }
 
 // Range 缓存键：同一分片的不同 Range 分开缓存，互不影响。
@@ -2082,6 +2201,8 @@ function teeMediaRangeResponseBody(upstream, rangeKey, maxBytes) {
   const expectedBytes = expectedUpstreamBodyBytes(upstream.headers);
   let delivered = 0;
   let stored = false;
+  let inspectedPrefix = false;
+  const contentType = upstream.headers.get("content-type") || "";
   const store = () => {
     if (stored || !buffer || offset !== buffer.byteLength) return;
     stored = true;
@@ -2121,6 +2242,17 @@ function teeMediaRangeResponseBody(upstream, rangeKey, maxBytes) {
       const chunk = result.value instanceof Uint8Array
         ? result.value
         : new Uint8Array(result.value);
+      if (!inspectedPrefix) {
+        inspectedPrefix = true;
+        if (mediaPayloadLooksLikeErrorDocument(chunk, contentType)) {
+          buffer = null;
+          try {
+            await reader.cancel();
+          } catch {}
+          controller.error(new Error("upstream media error document"));
+          return;
+        }
+      }
       delivered += chunk.byteLength;
       if (buffer) {
         if (offset + chunk.byteLength <= buffer.byteLength) {
@@ -2293,20 +2425,48 @@ async function fetchMediaUpstreamResponse(
           if (response) return response;
         }
       }
-      const upstream = await fetchUpstreamWithRetry();
-      if (upstream.status === 206 && !upstream.headers.has("content-encoding")) {
-        return teeMediaRangeResponseBody(
-          upstream,
-          rangeKey,
-          MAX_CACHED_MEDIA_SEGMENT_RANGE_BYTES,
+      let upstream = await fetchUpstreamWithRetry();
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (
+          upstream.status !== 206 ||
+          upstream.headers.has("content-encoding")
+        ) {
+          return upstream;
+        }
+        if (
+          mediaContentTypeLooksLikeErrorDocument(
+            upstream.headers.get("content-type") || "",
+          )
+        ) {
+          try {
+            await upstream.body?.cancel();
+          } catch {}
+          return mediaUpstreamInvalidResponse();
+        }
+        const rangeMatches = mediaRangeResponseMatchesRequest(
+          rangeHeader,
+          upstream.headers,
         );
+        if (rangeMatches !== false) {
+          return teeMediaRangeResponseBody(
+            upstream,
+            rangeKey,
+            MAX_CACHED_MEDIA_SEGMENT_RANGE_BYTES,
+          );
+        }
+        try {
+          await upstream.body?.cancel();
+        } catch {}
+        if (attempt > 0) return mediaUpstreamInvalidResponse();
+        upstream = await fetchUpstreamWithRetry();
       }
-      return upstream;
+      return mediaUpstreamInvalidResponse();
     }
     const upstream = await fetchUpstreamWithRetry();
     const response = streamCompleteMediaSegmentResponse(upstream, cacheKey);
     if (response) return response;
     const result = await bufferMediaSegmentResponse(upstream, sourceUrl);
+    if (result?.errorDocument) return mediaUpstreamInvalidResponse();
     if (result?.record) {
       if (result.cacheable) {
         MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, result.record);
@@ -2317,7 +2477,7 @@ async function fetchMediaUpstreamResponse(
 
   const cacheEmbeddedTsResult = (result, upstreamContentRange = "") => {
     if (!result?.record) return result;
-    if (result.cacheable) {
+    if (result.cacheable && !result.errorDocument) {
       MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, result.record);
     }
     if (result.embeddedOffset >= 0) {
@@ -2351,9 +2511,8 @@ async function fetchMediaUpstreamResponse(
   const requestedRangeHeader = request.headers.get("range");
   if (!requestedRangeHeader) {
     const result = await bufferFullEmbeddedTsResponse();
-    if (result?.record) {
-      return cachedMediaSegmentResponse(result.record, request);
-    }
+    const response = bufferedMediaResultResponse(result, request);
+    if (response) return response;
     return fetchUpstreamWithRetry();
   }
 
@@ -2413,18 +2572,16 @@ async function fetchMediaUpstreamResponse(
         ),
         probe.headers.get("content-range") || "",
       );
-      if (result?.record) {
-        return cachedMediaSegmentResponse(result.record, request);
-      }
+      const response = bufferedMediaResultResponse(result, request);
+      if (response) return response;
     }
   }
 
   const range = embeddedTsVirtualRange(requestedRangeHeader, metadata);
   if (!range || range.invalid) {
     const result = await bufferFullEmbeddedTsResponse();
-    if (result?.record) {
-      return cachedMediaSegmentResponse(result.record, request);
-    }
+    const response = bufferedMediaResultResponse(result, request);
+    if (response) return response;
     return fetchUpstreamWithRetry();
   }
   if (range.unsatisfiable) {
@@ -2487,9 +2644,8 @@ async function fetchMediaUpstreamResponse(
       await bufferMediaSegmentResponse(mappedUpstream, sourceUrl),
       mappedUpstream.headers.get("content-range") || "",
     );
-    if (result?.record) {
-      return cachedMediaSegmentResponse(result.record, request);
-    }
+    const response = bufferedMediaResultResponse(result, request);
+    if (response) return response;
   } else {
     try {
       await mappedUpstream.body?.cancel();
@@ -2497,9 +2653,8 @@ async function fetchMediaUpstreamResponse(
   }
 
   const result = await bufferFullEmbeddedTsResponse();
-  if (result?.record) {
-    return cachedMediaSegmentResponse(result.record, request);
-  }
+  const response = bufferedMediaResultResponse(result, request);
+  if (response) return response;
   return fetchUpstreamWithRetry();
 }
 
@@ -2764,7 +2919,6 @@ function registerGetavSegmentSequence(segmentUrls, now) {
 
 async function warmGetavSegment(
   target,
-  request,
   env,
   fetchImpl,
   deadline,
@@ -2779,9 +2933,9 @@ async function warmGetavSegment(
       method: "GET",
       headers: new Headers({
         accept: "video/*,application/octet-stream,*/*;q=0.8",
-        origin: upstreamOrigin(env),
+        origin: GETAV_MEDIA_ORIGIN,
         referer: GETAV_MEDIA_REFERER,
-        "user-agent": request.headers.get("user-agent") || "Mozilla/5.0",
+        "user-agent": GETAV_MEDIA_USER_AGENT,
       }),
       redirect: "follow",
       signal: controller.signal,
@@ -2845,7 +2999,6 @@ function queueGetavPrefetchTargets(
       if (index >= queuedTargets.length) return;
       await warmGetavSegment(
         queuedTargets[index],
-        request,
         env,
         fetchImpl,
         deadline,
@@ -3555,7 +3708,7 @@ const RESOLVER_SOURCE_TARGET_COUNT = 4;
 const SELF_HOSTED_PAGE_TIMEOUT_MS = 9000;
 const SELF_HOSTED_PAGE_USER_AGENT = "Mozilla/5.0";
 const JAVTIFUL_ORIGIN = "https://javtiful.com";
-const GETAV_ORIGIN = "https://getav.net";
+const GETAV_ORIGIN = GETAV_MEDIA_ORIGIN;
 const JINA_READER_ORIGIN = "https://r.jina.ai";
 const SELF_HOSTED_VARIANT_LIMIT = 8;
 

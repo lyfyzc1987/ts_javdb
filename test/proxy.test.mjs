@@ -6153,7 +6153,9 @@ test("prewarms the first GetAV HLS segments in the background", async () => {
       });
     }
     assert.equal(init.method, "GET");
+    assert.equal(init.headers.get("origin"), "https://getav.net");
     assert.equal(init.headers.get("referer"), "https://getav.net/");
+    assert.equal(init.headers.get("user-agent"), "Mozilla/5.0");
     assert.equal(init.headers.get("range"), null);
     activeFetches += 1;
     maxActiveFetches = Math.max(maxActiveFetches, activeFetches);
@@ -6543,6 +6545,194 @@ test("passes a media Range request through to the upstream and returns the parti
     new Uint8Array(await response.arrayBuffer()),
     partialBytes,
   );
+});
+
+test("retries a mismatched media Range response and caches only the correct bytes", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/range-mismatch.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const requestedRange = "bytes=4-7";
+  const expectedBytes = Uint8Array.from([4, 5, 6, 7]);
+  let upstreamFetches = 0;
+
+  const upstream = async () => {
+    upstreamFetches += 1;
+    if (upstreamFetches === 1) {
+      return new Response(Uint8Array.from([0, 0, 0, 0]), {
+        status: 206,
+        headers: {
+          "content-length": "4",
+          "content-range": "bytes 0-3/20",
+          "content-type": "video/mp2t",
+        },
+      });
+    }
+    return new Response(expectedBytes, {
+      status: 206,
+      headers: {
+        "content-length": String(expectedBytes.length),
+        "content-range": "bytes 4-7/20",
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const first = await handleProxy(
+    new Request(proxyUrl, { headers: { range: requestedRange } }),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(first.status, 206);
+  assert.equal(first.headers.get("content-range"), "bytes 4-7/20");
+  assert.deepEqual(new Uint8Array(await first.arrayBuffer()), expectedBytes);
+  assert.equal(upstreamFetches, 2);
+
+  const second = await handleProxy(
+    new Request(proxyUrl, { headers: { range: requestedRange } }),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(second.status, 206);
+  assert.deepEqual(new Uint8Array(await second.arrayBuffer()), expectedBytes);
+  assert.equal(upstreamFetches, 2, "correct Range bytes should be cached");
+});
+
+test("rejects a persistently mismatched media Range without poisoning the cache", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/range-mismatch-persistent.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  let upstreamFetches = 0;
+
+  const upstream = async () => {
+    upstreamFetches += 1;
+    return new Response(Uint8Array.from([0, 0, 0, 0]), {
+      status: 206,
+      headers: {
+        "content-length": "4",
+        "content-range": "bytes 0-3/20",
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const first = await handleProxy(
+    new Request(proxyUrl, { headers: { range: "bytes=4-7" } }),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(first.status, 502);
+  assert.equal(upstreamFetches, 2);
+
+  const second = await handleProxy(
+    new Request(proxyUrl, { headers: { range: "bytes=4-7" } }),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(second.status, 502);
+  assert.equal(upstreamFetches, 4, "invalid bytes must never be cached");
+});
+
+test("does not cache an HTML media error page", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/html-error.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const errorBytes = new TextEncoder().encode(
+    "<!doctype html><title>Error 1022</title><h1>Cloudflare error</h1>",
+  );
+  const mediaBytes = Uint8Array.from([0x47, 0, 0, 0]);
+  let upstreamFetches = 0;
+
+  const upstream = async () => {
+    upstreamFetches += 1;
+    if (upstreamFetches === 1) {
+      return new Response(errorBytes, {
+        status: 200,
+        headers: {
+          "content-length": String(errorBytes.length),
+          "content-type": "text/html; charset=utf-8",
+        },
+      });
+    }
+    return new Response(mediaBytes, {
+      status: 200,
+      headers: {
+        "content-length": String(mediaBytes.length),
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const first = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(first.status, 502);
+
+  const second = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(second.status, 200);
+  assert.deepEqual(new Uint8Array(await second.arrayBuffer()), mediaBytes);
+  assert.equal(upstreamFetches, 2);
+});
+
+test("does not cache a disguised media error document", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/disguised-error.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const errorBytes = new TextEncoder().encode(
+    "Error 1022: Cloudflare rate limit",
+  );
+  const mediaBytes = Uint8Array.from([0x47, 0, 0, 0]);
+  let upstreamFetches = 0;
+
+  const upstream = async () => {
+    upstreamFetches += 1;
+    if (upstreamFetches === 1) {
+      return new Response(errorBytes, {
+        status: 200,
+        headers: {
+          "content-length": String(errorBytes.length),
+          "content-type": "application/octet-stream",
+        },
+      });
+    }
+    return new Response(mediaBytes, {
+      status: 200,
+      headers: {
+        "content-length": String(mediaBytes.length),
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const first = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(first.status, 200);
+  await assert.rejects(first.arrayBuffer(), /media error document/);
+
+  const second = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(second.status, 200);
+  assert.deepEqual(new Uint8Array(await second.arrayBuffer()), mediaBytes);
+  assert.equal(upstreamFetches, 2);
 });
 
 test("serves a repeated identical media Range request from the range cache without a second upstream fetch", async () => {
@@ -7428,6 +7618,7 @@ test("uses the GetAV Referer for static.worldstatic.com media and keeps hotlink 
         headers: {
           range: "bytes=0-3",
           "if-none-match": "etag-test",
+          "user-agent": "curl/8.10.1",
         },
       },
     ),
@@ -7443,8 +7634,8 @@ test("uses the GetAV Referer for static.worldstatic.com media and keeps hotlink 
   );
 
   assert.equal(requestHeaders.get("referer"), "https://getav.net/");
-  assert.equal(requestHeaders.get("origin"), UPSTREAM);
-  assert.ok(requestHeaders.get("user-agent"));
+  assert.equal(requestHeaders.get("origin"), "https://getav.net");
+  assert.equal(requestHeaders.get("user-agent"), "Mozilla/5.0");
   assert.equal(requestHeaders.get("range"), "bytes=0-3");
   assert.equal(requestHeaders.get("if-none-match"), "etag-test");
   assert.equal(response.status, 200);
@@ -7456,6 +7647,7 @@ test("keeps Referer for non-worldstatic media hosts", async () => {
   const response = await handleProxy(
     new Request(
       `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}`,
+      { headers: { "user-agent": "Emby/4.8.0.0" } },
     ),
     {},
     {},
@@ -7469,6 +7661,7 @@ test("keeps Referer for non-worldstatic media hosts", async () => {
   );
 
   assert.equal(requestHeaders.get("referer"), `${UPSTREAM}/`);
+  assert.equal(requestHeaders.get("user-agent"), "Emby/4.8.0.0");
   assert.equal(response.status, 200);
 });
 
