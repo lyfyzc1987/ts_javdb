@@ -2685,6 +2685,7 @@ test("maps full-video resolution into Emby playback info", async () => {
   assert.equal(payload.MediaSources[0].MediaStreams[1].Type, "Audio");
   assert.equal(payload.MediaSources[0].MediaStreams[1].Codec, "aac");
   assert.equal(payload.MediaSources[0].MediaStreams[2].Language, "chi");
+  assert.equal(payload.MediaSources[0].MediaStreams[2].Title, "字幕 1");
   assert.match(payload.MediaSources[0].MediaStreams[2].DeliveryUrl, /\/Subtitles\/2\/Stream\.srt/);
 });
 
@@ -8324,6 +8325,10 @@ test("aggregates only exact-code subtitles and skips SubtitleCat when Xunlei has
   assert.equal(subtitleStreams.length, 2);
   assert.equal(payload.MediaSources[0].DefaultSubtitleStreamIndex, 2);
   assert.equal(requests.some((target) => target.includes("subtitlecat.com")), false);
+  assert.deepEqual(
+    subtitleStreams.map((stream) => stream.Title),
+    ["迅雷 · RCTD-740 xunlei zh-CN", "字幕 1"],
+  );
 
   const downloadedUrls = [];
   for (const stream of subtitleStreams) {
@@ -8440,6 +8445,7 @@ test("falls back to exact SubtitleCat results when Xunlei and upstream are empty
 
   assert.equal(response.status, 200);
   assert.equal(subtitleStreams.length, 1);
+  assert.match(subtitleStreams[0].Title, /^SubtitleCat · /);
   assert.equal(
     requests.includes("https://subtitlecat.com/subs/100/RCTD-740-zh-CN.html"),
     true,

@@ -6798,6 +6798,39 @@ function subtitleCodec(subtitle) {
   return /^[a-z0-9]+$/.test(value) ? value : "srt";
 }
 
+function cleanSubtitleTitle(value) {
+  return String(value || "")
+    .replace(/\bdownload\b/gi, " ")
+    .replace(/\.(?:srt|ass|ssa|vtt)\s*$/i, "")
+    .replace(/[（(]\s*(?:网友上传|上传|未知)\s*[）)]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function subtitleSourceLabel(source) {
+  if (source === "xunlei") return "迅雷";
+  if (source === "subtitlecat") return "SubtitleCat";
+  return "";
+}
+
+function subtitleDisplayTitle(subtitle, ordinal) {
+  const source = String(subtitle?.source || "upstream");
+  if (source === "upstream") {
+    return `字幕 ${ordinal}`;
+  }
+
+  const sourceLabel = subtitleSourceLabel(source);
+  const name = cleanSubtitleTitle(subtitle?.name || subtitle?.extraName);
+  const meaningfulName = name && !/^[a-f0-9]{24,}$/i.test(name);
+
+  if (meaningfulName) {
+    return sourceLabel ? `${sourceLabel} · ${name}` : name;
+  }
+  return sourceLabel
+    ? `${sourceLabel} 字幕 ${ordinal}`
+    : `字幕 ${ordinal}`;
+}
+
 const SUBTITLE_AGGREGATOR_FETCH_TIMEOUT_MS = 5000;
 const SUBTITLE_MAX_TRACKS = 8;
 const SUBTITLE_CAT_ORIGIN = "https://subtitlecat.com";
@@ -7141,11 +7174,17 @@ async function resolveSubtitles(movie, env, fetchImpl) {
     subtitles = exactSubtitleCandidates(subtitleCatCandidates, code);
   }
 
-  // 字幕标题不再显示上传者（如“网友上传”），统一改成“字幕 1、字幕 2…”这类序号
-  return subtitles.map((subtitle, index) => ({
-    ...subtitle,
-    title: `字幕 ${index + 1}`,
-  }));
+  // 原站字幕保持“字幕 N”；迅雷 / SubtitleCat 显示来源和原始名称，避免混淆。
+  const sourceCounts = new Map();
+  return subtitles.map((subtitle) => {
+    const source = String(subtitle.source || "upstream");
+    const ordinal = (sourceCounts.get(source) || 0) + 1;
+    sourceCounts.set(source, ordinal);
+    return {
+      ...subtitle,
+      title: subtitleDisplayTitle(subtitle, ordinal),
+    };
+  });
 }
 
 // 播放源 / 字幕解析结果缓存：解析服务冷启动很慢，缓存后再次点开、详情页预解析、
