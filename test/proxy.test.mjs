@@ -8207,6 +8207,265 @@ test("keeps waiting when the public resolver fails fast and GetAV lines are stil
   );
 });
 
+test("aggregates only exact-code subtitles and skips SubtitleCat when Xunlei has matches", async () => {
+  const requests = [];
+  const exactUpstreamUrl = "https://subtitle.example/RCTD-740-upstream-zh-CN.srt";
+  const exactXunleiUrl = "https://subtitle.example/RCTD-740-xunlei-zh-CN.srt";
+  const wrongUrls = [
+    "https://subtitle.example/RCTD-340-wrong.srt",
+    "https://subtitle.example/RCTD-740aaa-micro-fix.srt",
+  ];
+  const env = { SUBTITLE_AGGREGATOR: "true" };
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    requests.push(target);
+    if (target.includes("/v4/movies/42")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: {
+            movie: {
+              id: 42,
+              number: "RCTD-740",
+              title: "RCTD-740 Subtitle aggregation",
+              can_play: true,
+              has_cnsub: true,
+            },
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes(`${RESOLVER}/api/v/resolve?code=RCTD-740`)) {
+      return new Response(
+        JSON.stringify({
+          variants: [{
+            variant: "original",
+            sourceUrl: "https://fast-stream.jav.si/video/rctd-740.mp4",
+            sourceType: "video/mp4",
+          }],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("/api/subtitle?name=RCTD-740")) {
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          data: [
+            {
+              cid: "upstream-exact",
+              url: exactUpstreamUrl,
+              ext: "srt",
+              name: "RCTD-740 upstream zh-CN",
+            },
+            {
+              cid: "upstream-wrong",
+              url: wrongUrls[0],
+              ext: "srt",
+              name: "RCTD-340 wrong movie",
+            },
+            {
+              cid: "upstream-suffix",
+              url: wrongUrls[1],
+              ext: "srt",
+              name: "RCTD-740aaa微修",
+            },
+          ],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.startsWith("https://api-shoulei-ssl.xunlei.com/oracle/subtitle")) {
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          data: [
+            {
+              cid: "xunlei-exact",
+              url: exactXunleiUrl,
+              ext: "srt",
+              name: "RCTD-740 xunlei zh-CN",
+            },
+            {
+              cid: "xunlei-wrong",
+              url: "https://subtitle.example/RCTD-7400-wrong.srt",
+              ext: "srt",
+              name: "RCTD-7400 wrong movie",
+            },
+          ],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("subtitlecat.com")) {
+      throw new Error(`SubtitleCat should not be requested: ${target}`);
+    }
+    if ([exactUpstreamUrl, exactXunleiUrl].includes(target)) {
+      return new Response(
+        "1\r\n00:00:01,000 --> 00:00:02,000\r\n精确字幕\r\n",
+        { headers: { "content-type": "text/plain; charset=utf-8" } },
+      );
+    }
+    throw new Error(`Unexpected subtitle aggregation request: ${target}`);
+  };
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42?api_key=bbjavdb-guest"),
+    env,
+    {},
+    fetchImpl,
+  );
+  const payload = await response.json();
+  const subtitleStreams = payload.MediaSources[0].MediaStreams
+    .filter((stream) => stream.Type === "Subtitle");
+
+  assert.equal(response.status, 200);
+  assert.equal(subtitleStreams.length, 2);
+  assert.equal(payload.MediaSources[0].DefaultSubtitleStreamIndex, 2);
+  assert.equal(requests.some((target) => target.includes("subtitlecat.com")), false);
+
+  const downloadedUrls = [];
+  for (const stream of subtitleStreams) {
+    const downloaded = await handleProxy(
+      new Request(new URL(stream.DeliveryUrl, "https://clone.example")),
+      env,
+      {},
+      async (url) => {
+        downloadedUrls.push(String(url));
+        return new Response(
+          "1\r\n00:00:01,000 --> 00:00:02,000\r\n精确字幕\r\n",
+          { headers: { "content-type": "text/plain; charset=utf-8" } },
+        );
+      },
+    );
+    assert.equal(downloaded.status, 200);
+  }
+  assert.deepEqual(
+    new Set(downloadedUrls),
+    new Set([exactXunleiUrl, exactUpstreamUrl]),
+  );
+  assert.equal(downloadedUrls.some((target) => wrongUrls.includes(target)), false);
+});
+
+test("falls back to exact SubtitleCat results when Xunlei and upstream are empty", async () => {
+  const requests = [];
+  const exactSubtitleCatUrl =
+    "https://subtitlecat.com/subs/100/RCTD-740-zh-CN.srt";
+  const env = { SUBTITLE_AGGREGATOR: "true" };
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    requests.push(target);
+    if (target.includes("/v4/movies/42")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: {
+            movie: {
+              id: 42,
+              number: "RCTD-740",
+              title: "RCTD-740 SubtitleCat fallback",
+              can_play: true,
+              has_cnsub: true,
+            },
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes(`${RESOLVER}/api/v/resolve?code=RCTD-740`)) {
+      return new Response(
+        JSON.stringify({
+          variants: [{
+            variant: "original",
+            sourceUrl: "https://fast-stream.jav.si/video/rctd-740.mp4",
+            sourceType: "video/mp4",
+          }],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("/api/subtitle?name=RCTD-740")) {
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.startsWith("https://api-shoulei-ssl.xunlei.com/oracle/subtitle")) {
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target === "https://subtitlecat.com/index.php?search=RCTD-740") {
+      return new Response(
+        [
+          "<html><body>",
+          '<a href="subs/99/RCTD-340-wrong.html">RCTD-340 wrong movie</a>',
+          '<a href="subs/100/RCTD-740-zh-CN.html">RCTD-740 zh-CN</a>',
+          "</body></html>",
+        ].join(""),
+        { headers: { "content-type": "text/html; charset=utf-8" } },
+      );
+    }
+    if (target === "https://subtitlecat.com/subs/100/RCTD-740-zh-CN.html") {
+      return new Response(
+        [
+          "<html><body>",
+          '<a href="/subs/100/RCTD-740-en.srt">Download English</a>',
+          '<a href="/subs/100/RCTD-740-zh-CN.srt">Download 简体中文</a>',
+          "</body></html>",
+        ].join(""),
+        { headers: { "content-type": "text/html; charset=utf-8" } },
+      );
+    }
+    if (target === exactSubtitleCatUrl) {
+      return new Response(
+        "1\r\n00:00:01,000 --> 00:00:02,000\r\nSubtitleCat 精确字幕\r\n",
+        { headers: { "content-type": "text/plain; charset=utf-8" } },
+      );
+    }
+    throw new Error(`Unexpected SubtitleCat fallback request: ${target}`);
+  };
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42?api_key=bbjavdb-guest"),
+    env,
+    {},
+    fetchImpl,
+  );
+  const payload = await response.json();
+  const subtitleStreams = payload.MediaSources[0].MediaStreams
+    .filter((stream) => stream.Type === "Subtitle");
+
+  assert.equal(response.status, 200);
+  assert.equal(subtitleStreams.length, 1);
+  assert.equal(
+    requests.includes("https://subtitlecat.com/subs/100/RCTD-740-zh-CN.html"),
+    true,
+  );
+  assert.equal(
+    requests.includes("https://subtitlecat.com/subs/99/RCTD-340-wrong.html"),
+    false,
+  );
+
+  let downloadedUrl = "";
+  const downloaded = await handleProxy(
+    new Request(new URL(subtitleStreams[0].DeliveryUrl, "https://clone.example")),
+    env,
+    {},
+    async (url) => {
+      downloadedUrl = String(url);
+      return new Response(
+        "1\r\n00:00:01,000 --> 00:00:02,000\r\nSubtitleCat 精确字幕\r\n",
+        { headers: { "content-type": "text/plain; charset=utf-8" } },
+      );
+    },
+  );
+  assert.equal(downloaded.status, 200);
+  assert.equal(downloadedUrl, exactSubtitleCatUrl);
+});
+
 test("serves the advertised Chinese subtitle stream", async () => {
   const subtitleText = "1\r\n00:00:01,000 --> 00:00:02,000\r\n你好\r\n";
   let subtitleFileUrl;

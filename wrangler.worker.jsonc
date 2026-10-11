@@ -8,6 +8,7 @@
     "UPSTREAM_ORIGIN": "https://catembylegacy.fastcdn.dpdns.org",
     "EMBY_SERVER_VERSION": "4.8.0.0",
     "EMBY_GUEST_ACCESS": "true",
+    "SUBTITLE_AGGREGATOR": "true",
     "PLAYBACK_DEPLOY_TAG": "worker"
   },
   "d1_databases": [

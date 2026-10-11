@@ -167,7 +167,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v25";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-11-getav-rolling-fc2-39";
+const SERVER_BUILD_ID = "2026-10-11-subtitle-aggregator-41";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -6798,12 +6798,263 @@ function subtitleCodec(subtitle) {
   return /^[a-z0-9]+$/.test(value) ? value : "srt";
 }
 
-async function resolveSubtitles(movie, env, fetchImpl) {
-  const code = movieNumber(movie) || movie.id || movie.title;
-  if (!code) {
+const SUBTITLE_AGGREGATOR_FETCH_TIMEOUT_MS = 5000;
+const SUBTITLE_MAX_TRACKS = 8;
+const SUBTITLE_CAT_ORIGIN = "https://subtitlecat.com";
+const XUNLEI_SUBTITLE_ENDPOINT =
+  "https://api-shoulei-ssl.xunlei.com/oracle/subtitle";
+
+function subtitleAggregatorEnabled(env) {
+  const value = env?.SUBTITLE_AGGREGATOR;
+  if (value === true || value === 1) return true;
+  return /^(?:1|true|yes|on)$/i.test(String(value || "").trim());
+}
+
+function subtitleCodeVariants(code) {
+  const normalized = normalizeNumberText(code).trim().toUpperCase();
+  if (!normalized) return [];
+  const values = new Set([normalized]);
+  const compact = normalized.replace(/[^A-Z0-9]/g, "");
+  const compactPair = compact.match(/^([A-Z]{2,8})(\d{2,6})$/);
+  if (compactPair) {
+    values.add(`${compactPair[1]}-${compactPair[2]}`);
+  }
+  // 上游常把 FC2 写成 FC2-PPV-4989990，而项目内部番号通常是 FC2-4989990。
+  const fc2 = normalized.match(/^FC2(?:[-_\s]?PPV)?[-_\s]?(\d{4,8})$/);
+  if (fc2) {
+    values.add(`FC2-${fc2[1]}`);
+    values.add(`FC2-PPV-${fc2[1]}`);
+  }
+  return [...values];
+}
+
+function subtitleTextContainsCode(text, code) {
+  const haystack = normalizeNumberText(text).toUpperCase();
+  if (!haystack) return false;
+  return subtitleCodeVariants(code).some((variant) => {
+    const matcher = movieNumberMatcher(variant);
+    if (!matcher) return false;
+    const match = matcher.exec(haystack);
+    if (!match) return false;
+    const before = match.index > 0 ? haystack[match.index - 1] : "";
+    const afterIndex = match.index + match[0].length;
+    const after = afterIndex < haystack.length ? haystack[afterIndex] : "";
+    return !/[A-Z0-9]/.test(before) && !/[A-Z0-9]/.test(after);
+  });
+}
+
+function subtitleCandidateFromRow(row, source, extra = {}) {
+  const value = String(row?.url || row?.downloadUrl || extra.url || "");
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (!["http:", "https:"].includes(url.protocol)) {
+    return null;
+  }
+  const normalizedUrl = url.toString();
+  const name = String(row?.name || extra.name || "");
+  const extraName = String(row?.extra_name || row?.extraName || "");
+  return {
+    id: String(row?.cid || row?.gcid || normalizedUrl),
+    url: normalizedUrl,
+    codec: subtitleCodec(row),
+    name,
+    extraName,
+    source,
+  };
+}
+
+function subtitleCandidateScore(candidate, code) {
+  const haystack = `${candidate.name} ${candidate.extraName} ${candidate.url}`;
+  let score = 0;
+  if (candidate.source === "xunlei") score += 400;
+  else if (candidate.source === "upstream") score += 300;
+  else if (candidate.source === "subtitlecat") score += 200;
+  if (/zh[-_]?cn|zhcn|simplified|简体/i.test(haystack)) score += 120;
+  else if (/zh|cn|chinese|中文|中字/i.test(haystack)) score += 80;
+  if (/\.srt(?:\?|$)/i.test(candidate.url)) score += 40;
+  for (const variant of subtitleCodeVariants(code)) {
+    const matcher = movieNumberMatcher(variant);
+    if (matcher && new RegExp(`${matcher.source}\\.srt`, "i").test(candidate.url)) {
+      score += 60;
+      break;
+    }
+  }
+  if (/(?:微修|修改|机翻|翻译版|繁中|繁体|uncensored|leak)/i.test(haystack)) {
+    score -= 30;
+  }
+  return score;
+}
+
+function exactSubtitleCandidates(candidates, code) {
+  const seen = new Set();
+  return candidates
+    .filter((candidate) => {
+      const haystack = `${candidate.name} ${candidate.extraName} ${candidate.url}`;
+      return subtitleTextContainsCode(haystack, code);
+    })
+    .sort((left, right) =>
+      subtitleCandidateScore(right, code) - subtitleCandidateScore(left, code)
+    )
+    .filter((candidate) => {
+      const key = candidate.url || candidate.id;
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, SUBTITLE_MAX_TRACKS);
+}
+
+async function fetchSubtitleAggregatorText(url, fetchImpl, accept) {
+  try {
+    const response = await fetchWithTimeout(
+      fetchImpl,
+      url,
+      {
+        headers: {
+          accept,
+          "user-agent": "Mozilla/5.0",
+        },
+        redirect: "follow",
+      },
+      SUBTITLE_AGGREGATOR_FETCH_TIMEOUT_MS,
+    );
+    if (!response?.ok || response.status === 204) {
+      return "";
+    }
+    return await response.text();
+  } catch {
+    return "";
+  }
+}
+
+async function fetchXunleiSubtitleCandidates(code, fetchImpl) {
+  const target = new URL(XUNLEI_SUBTITLE_ENDPOINT);
+  target.searchParams.set("name", code);
+  const text = await fetchSubtitleAggregatorText(
+    target.toString(),
+    fetchImpl,
+    "application/json,text/plain,*/*;q=0.8",
+  );
+  if (!text) return [];
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
     return [];
   }
+  if (payload?.code !== undefined && Number(payload.code) !== 0) {
+    return [];
+  }
+  return (Array.isArray(payload?.data) ? payload.data : [])
+    .map((row) => subtitleCandidateFromRow(row, "xunlei"))
+    .filter(Boolean);
+}
 
+function decodeSubtitleHtml(value) {
+  return String(value || "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function stripSubtitleHtml(value) {
+  return decodeSubtitleHtml(
+    String(value || "")
+      .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " "),
+  ).replace(/\s+/g, " ").trim();
+}
+
+function extractSubtitleHtmlLinks(html) {
+  const links = [];
+  const anchorPattern = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = anchorPattern.exec(String(html || "")))) {
+    const attributes = match[1] || "";
+    const hrefMatch = attributes.match(
+      /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i,
+    );
+    const href = decodeSubtitleHtml(
+      hrefMatch?.[1] || hrefMatch?.[2] || hrefMatch?.[3] || "",
+    ).trim();
+    if (!href) continue;
+    links.push({
+      href,
+      text: stripSubtitleHtml(match[2]),
+    });
+  }
+  return links;
+}
+
+async function fetchSubtitleCatCandidates(code, fetchImpl) {
+  const searchUrl = new URL("/index.php", SUBTITLE_CAT_ORIGIN);
+  searchUrl.searchParams.set("search", code);
+  const searchHtml = await fetchSubtitleAggregatorText(
+    searchUrl.toString(),
+    fetchImpl,
+    "text/html,application/xhtml+xml",
+  );
+  if (!searchHtml) return [];
+
+  const detailUrls = [];
+  const seenDetails = new Set();
+  for (const link of extractSubtitleHtmlLinks(searchHtml)) {
+    let detailUrl;
+    try {
+      detailUrl = new URL(link.href, SUBTITLE_CAT_ORIGIN);
+    } catch {
+      continue;
+    }
+    if (!detailUrl.pathname.startsWith("/subs/")) continue;
+    const absolute = detailUrl.toString();
+    if (seenDetails.has(absolute)) continue;
+    if (!subtitleTextContainsCode(`${link.text} ${absolute}`, code)) continue;
+    seenDetails.add(absolute);
+    detailUrls.push({ url: absolute, title: link.text });
+    if (detailUrls.length >= 3) break;
+  }
+
+  const details = await Promise.all(detailUrls.map(async (detail) => {
+    const html = await fetchSubtitleAggregatorText(
+      detail.url,
+      fetchImpl,
+      "text/html,application/xhtml+xml",
+    );
+    if (!html) return null;
+    const links = extractSubtitleHtmlLinks(html)
+      .filter((link) =>
+        /\.srt(?:\?|$)/i.test(link.href) || /download\.php/i.test(link.href)
+      );
+    const preferred = links.find((link) =>
+      /zh-CN|zh_CN|simplified|简体/i.test(`${link.href} ${link.text}`)
+    ) || links.find((link) =>
+      /zh|cn|chinese|中文/i.test(`${link.href} ${link.text}`)
+    );
+    if (!preferred) return null;
+    let subtitleUrl;
+    try {
+      subtitleUrl = new URL(preferred.href, detail.url).toString();
+    } catch {
+      return null;
+    }
+    return subtitleCandidateFromRow({
+      url: subtitleUrl,
+      name: `${detail.title} ${preferred.text}`,
+      ext: "srt",
+    }, "subtitlecat");
+  }));
+  return details.filter(Boolean);
+}
+
+async function resolveLegacySubtitles(code, env, fetchImpl) {
   const payload = await upstreamJson(
     `/api/subtitle?name=${encodeURIComponent(code)}`,
     env,
@@ -6817,7 +7068,7 @@ async function resolveSubtitles(movie, env, fetchImpl) {
   const subtitles = [];
   const seen = new Set();
   for (const subtitle of rows) {
-    if (subtitles.length >= 8) {
+    if (subtitles.length >= SUBTITLE_MAX_TRACKS) {
       break;
     }
     const value = String(subtitle?.url || "");
@@ -6842,6 +7093,54 @@ async function resolveSubtitles(movie, env, fetchImpl) {
       codec: subtitleCodec(subtitle),
     });
   }
+  return subtitles;
+}
+
+async function resolveSubtitles(movie, env, fetchImpl) {
+  const code = movieNumber(movie) || movie.id || movie.title;
+  if (!code) {
+    return [];
+  }
+
+  if (!subtitleAggregatorEnabled(env)) {
+    const legacy = await resolveLegacySubtitles(code, env, fetchImpl);
+    return legacy.map((subtitle, index) => ({
+      ...subtitle,
+      title: `字幕 ${index + 1}`,
+    }));
+  }
+
+  const [upstreamResult, xunleiResult] = await Promise.allSettled([
+    upstreamJson(
+      `/api/subtitle?name=${encodeURIComponent(code)}`,
+      env,
+      fetchImpl,
+    ),
+    fetchXunleiSubtitleCandidates(code, fetchImpl),
+  ]);
+
+  const upstreamRows = upstreamResult.status === "fulfilled" &&
+    (upstreamResult.value?.code === undefined ||
+      Number(upstreamResult.value.code) === 0) &&
+    Array.isArray(upstreamResult.value?.data)
+    ? upstreamResult.value.data
+    : [];
+  const upstreamCandidates = upstreamRows
+    .map((row) => subtitleCandidateFromRow(row, "upstream"))
+    .filter(Boolean);
+  const xunleiCandidates = xunleiResult.status === "fulfilled"
+    ? xunleiResult.value
+    : [];
+
+  let subtitles = exactSubtitleCandidates(
+    [...xunleiCandidates, ...upstreamCandidates],
+    code,
+  );
+  if (!subtitles.length) {
+    const subtitleCatCandidates = await fetchSubtitleCatCandidates(code, fetchImpl);
+    subtitles = exactSubtitleCandidates(subtitleCatCandidates, code);
+  }
+
   // 字幕标题不再显示上传者（如“网友上传”），统一改成“字幕 1、字幕 2…”这类序号
   return subtitles.map((subtitle, index) => ({
     ...subtitle,
@@ -7899,7 +8198,9 @@ async function resolveSubtitlesCached(movie, env, fetchImpl) {
   if (!code) {
     return resolveSubtitles(movie, env, fetchImpl);
   }
-  const key = `${upstreamOrigin(env)}|${code}`;
+  // Include the deployment build in the cache key so a subtitle-quality fix
+  // takes effect immediately instead of serving the previous cached tracks.
+  const key = `${SERVER_BUILD_ID}|${upstreamOrigin(env)}|${code}`;
   return RESOLVE_SUBTITLE_CACHE.fetch(key, async () => {
     const shared = await edgeCacheRead(EDGE_NAMESPACE_SUBTITLE, key);
     if (shared !== undefined) {
