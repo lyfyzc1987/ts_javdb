@@ -134,6 +134,10 @@ const GETAV_DIRECT_USER_AGENTS = new Set([
   "stagefright",
 ]);
 const GETAV_REDIRECT_ROUTE = "/getav";
+// 已验证支持跨域、Range 请求且不依赖 Referer/UA 的直连媒体走这个短链。
+// 目前只开放 Javtiful 的 fast-stream MP4，避免把需要改写 HLS 清单或
+// 剥掉图片外壳的分片误判成可直连源。
+const DIRECT_MEDIA_REDIRECT_ROUTE = "/direct";
 const INLINE_HLS_CONTENT_TYPES = new Set([
   "application/mpegurl",
   "application/vnd.apple.mpegurl",
@@ -186,10 +190,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // （含 D1 持久层，键里含 sources-v4x）都必须失效。
 // v24/v42：HLS 子资源（分片/子清单/密钥）改用“任意公网域名”白名单，并补齐
 // 上游会轮换的 CDN 域名——旧解析结果里那些被 403 的分片地址必须整体失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v27";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v28";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-12-getav-302-45";
+const SERVER_BUILD_ID = "2026-10-12-direct-46";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -552,6 +556,30 @@ function safeMediaUrl(value, env, options = {}) {
   }
 
   return null;
+}
+
+function directMediaRedirectProfile(sourceUrl, sourceType = "") {
+  try {
+    const url = new URL(String(sourceUrl || ""));
+    if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "fast-stream.jav.si") {
+      return null;
+    }
+    const type = String(sourceType || "").toLowerCase();
+    if (/mpegurl|m3u8/.test(type) || url.pathname.toLowerCase().endsWith(".m3u8")) {
+      return null;
+    }
+    if (!/video\/mp4|application\/mp4/.test(type) &&
+        !url.pathname.toLowerCase().endsWith(".mp4")) {
+      return null;
+    }
+    return { url };
+  } catch {
+    return null;
+  }
+}
+
+function isDirectMediaSourceUrl(sourceUrl, sourceType = "") {
+  return Boolean(directMediaRedirectProfile(sourceUrl, sourceType));
 }
 
 function sourceUrlValue(value) {
@@ -6817,11 +6845,13 @@ function parseJavtifulWatchConfig(html) {
     if (!sourceUrl) continue;
     const quality = Math.max(0, Number(source?.size) || 0);
     const qualityLabel = quality > 0 ? `${quality}P` : `线路 ${index + 1}`;
+    const sourceType = /mpegurl|m3u8/i.test(String(source?.type || ""))
+      ? "application/vnd.apple.mpegurl"
+      : "video/mp4";
     variants.push({
       sourceUrl,
-      sourceType: /mpegurl|m3u8/i.test(String(source?.type || ""))
-        ? "application/vnd.apple.mpegurl"
-        : "video/mp4",
+      sourceType,
+      directRedirect: isDirectMediaSourceUrl(sourceUrl, sourceType),
       label: `Javtiful ${qualityLabel}`,
       variant: `javtiful_${quality || index + 1}`,
       title: String(config?.videoTitle || "").trim(),
@@ -9071,13 +9101,33 @@ function mediaSource(
     url.searchParams.set("api_key", token);
     return url;
   };
+  const buildDirectRedirectUrl = () => {
+    const url = new URL(
+      publicRoutePath(
+        requestUrl,
+        `${DIRECT_MEDIA_REDIRECT_ROUTE}/${encodeURIComponent(item.Id)}`,
+      ),
+      requestUrl,
+    );
+    url.searchParams.set("source", video.sourceUrl);
+    url.searchParams.set("sourceType", video.sourceType || "video/mp4");
+    url.searchParams.set("mediaSourceId", mediaSourceId);
+    url.searchParams.set("api_key", token);
+    return url;
+  };
+  const useDirectRedirect =
+    video.directRedirect === true &&
+    Boolean(video.sourceUrl) &&
+    isDirectMediaSourceUrl(video.sourceUrl, video.sourceType);
   const useGetavRedirect =
     Boolean(video.sourceUrl) &&
     isGetavMediaSourceUrl(video.sourceUrl) &&
     getavClientAllowsDirectRedirect(clientUserAgent);
-  const streamUrl = useGetavRedirect
-    ? buildGetavRedirectUrl()
-    : buildProxyStreamUrl(streamExtension);
+  const streamUrl = useDirectRedirect
+    ? buildDirectRedirectUrl()
+    : useGetavRedirect
+      ? buildGetavRedirectUrl()
+      : buildProxyStreamUrl(streamExtension);
   const subtitleStreams = subtitles.map((subtitle, index) => {
     const streamIndex = index + 2;
     const deliveryUrl = new URL(
@@ -12116,10 +12166,38 @@ function getavRedirectResponse(request, env, requestUrl) {
   });
 }
 
+// /direct/<id>?source=<MP4> 只用于已经确认允许跨域直连的上游。路由本身
+// 不发起上游请求，也不会把任意 URL 变成开放重定向：主机、协议和媒体类型
+// 都必须通过 directMediaRedirectProfile 的白名单校验。
+function directMediaRedirectResponse(request, env, requestUrl) {
+  const sourceValue = requestUrl.searchParams.get("source") ||
+    requestUrl.searchParams.get("sourceUrl") ||
+    "";
+  const sourceType = String(requestUrl.searchParams.get("sourceType") || "");
+  const sourceUrl = safeMediaUrl(sourceValue, env);
+  if (
+    !sourceUrl ||
+    !directMediaRedirectProfile(sourceUrl.toString(), sourceType)
+  ) {
+    return errorResponse(400, "Direct MP4 source URL is required");
+  }
+
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: sourceUrl.toString(),
+      "cache-control": "no-store",
+      "access-control-allow-origin": "*",
+    },
+  });
+}
+
 function isHandledPath(path) {
   return (
     path === GETAV_REDIRECT_ROUTE ||
     path.startsWith(`${GETAV_REDIRECT_ROUTE}/`) ||
+    path === DIRECT_MEDIA_REDIRECT_ROUTE ||
+    path.startsWith(`${DIRECT_MEDIA_REDIRECT_ROUTE}/`) ||
     path === "/System/Info/Public" ||
     path === "/System/Info" ||
     path === "/System/Endpoint" ||
@@ -12544,6 +12622,12 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
 
   if (path === GETAV_REDIRECT_ROUTE || path.startsWith(`${GETAV_REDIRECT_ROUTE}/`)) {
     return getavRedirectResponse(request, env, url);
+  }
+  if (
+    path === DIRECT_MEDIA_REDIRECT_ROUTE ||
+    path.startsWith(`${DIRECT_MEDIA_REDIRECT_ROUTE}/`)
+  ) {
+    return directMediaRedirectResponse(request, env, url);
   }
 
   const deviceFailure = await deviceBindingFailure(request, url, env, path);

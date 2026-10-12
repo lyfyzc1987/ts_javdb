@@ -298,7 +298,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v27",
+    version: "item-dto-v28",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -3846,6 +3846,16 @@ test("merges one public resolver source with two Javtiful qualities", async () =
     payload.MediaSources.map((source) => source.Name),
     ["原版", "Javtiful 1080P", "Javtiful 720P", "MemoJav 302"],
   );
+  const javtifulSources = payload.MediaSources.filter((source) =>
+    source.Name.startsWith("Javtiful ")
+  );
+  assert.equal(javtifulSources.length, 2);
+  for (const source of javtifulSources) {
+    const path = new URL(source.Path);
+    assert.equal(path.pathname, "/direct/42");
+    assert.match(path.searchParams.get("source"), /^https:\/\/fast-stream\.jav\.si\//);
+    assert.equal(path.searchParams.get("sourceType"), "video/mp4");
+  }
 });
 
 test("merges public resolver sources with GetAV qualities when the CDN requires its Referer", async () => {
@@ -4181,6 +4191,54 @@ test("GetAV short links reject non-GetAV media URLs", async () => {
   );
 
   assert.equal(response.status, 400);
+});
+
+test("direct short links only redirect verified MP4 sources", async () => {
+  const upstreamUrl = "https://fast-stream.jav.si/rctd-740/javtiful-1080.mp4";
+  const shortUrl =
+    `https://clone.example/direct/42?source=${encodeURIComponent(upstreamUrl)}` +
+    "&sourceType=video%2Fmp4&mediaSourceId=test";
+
+  const directResponse = await handleProxy(
+    new Request(shortUrl, {
+      headers: { range: "bytes=0-1023" },
+    }),
+    {},
+    {},
+    () => {
+      throw new Error("fetch must not be called");
+    },
+  );
+  assert.equal(directResponse.status, 302);
+  assert.equal(directResponse.headers.get("location"), upstreamUrl);
+
+  const invalidHostResponse = await handleProxy(
+    new Request(
+      "https://clone.example/direct/42?source=" +
+        encodeURIComponent("https://example.com/video.mp4") +
+        "&sourceType=video%2Fmp4",
+    ),
+    {},
+    {},
+    () => {
+      throw new Error("fetch must not be called");
+    },
+  );
+  assert.equal(invalidHostResponse.status, 400);
+
+  const invalidTypeResponse = await handleProxy(
+    new Request(
+      "https://clone.example/direct/42?source=" +
+        encodeURIComponent("https://fast-stream.jav.si/live/master.m3u8") +
+        "&sourceType=application%2Fvnd.apple.mpegurl",
+    ),
+    {},
+    {},
+    () => {
+      throw new Error("fetch must not be called");
+    },
+  );
+  assert.equal(invalidTypeResponse.status, 400);
 });
 
 test("keeps a public source when self-hosted supplement times out", async () => {
