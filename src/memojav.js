@@ -1,21 +1,30 @@
-// MemoJav 番号 → 永久短链 → 302 直达上游 HLS。
+// MemoJav 番号 → 永久短链 → 动态解析播放源。
 //
 // 设计目标与 MemoJavstrm 一致：播放器（Emby / VLC / PotPlayer）请求本服务
-// 的短链时，默认返回 302，让客户端一跳直达上游 m3u8；Worker 只处理这一次
-// 重定向请求，清单和分片都不经过 Worker，实现"零流量"。
+// 的短链时，默认返回 302，让客户端一跳直达上游；Worker 只处理这一次
+// 重定向请求，清单和分片都不经过 Worker，实现“零流量”。
 //
 // 路由挂在独立的 /memo/ 前缀下，避免和现有 Emby / 站点代理路由冲突：
 //
-//   GET /memo/<番号>            → 302 到上游 master.m3u8（默认，零流量）
-//   GET /memo/<番号>?json=1     → 返回解析结果 JSON（调试）
-//   GET /memo/<番号>?refresh=1  → 绕过解析缓存强制重新探测
-//   GET /memo/<番号>?proxy=1    → 反向代理 HLS 清单并改写为走本服务
-//   GET /memo/<番号>?web=1      → 浏览器播放页（同源代理，仅预览用）
-//   GET /memo/<番号>/<分片>     → proxy 模式下的分片 / init.mp4 转发
+//   GET /memo/<番号>              → 302 到第一条真实播放源（默认，零流量）
+//   GET /memo/<番号>?sources=1    → 返回上游真实播放源列表（HLS / MP4 清晰度）
+//   GET /memo/<番号>?source=<id>  → 302 到指定播放源
+//   GET /memo/<番号>?json=1       → 返回解析结果 JSON（调试）
+//   GET /memo/<番号>?refresh=1    → 绕过解析缓存强制重新探测
+//   GET /memo/<番号>?proxy=1      → 反向代理 HLS 清单并改写为走本服务
+//   GET /memo/<番号>?web=1        → 浏览器播放页（同源代理，仅预览用）
+//   GET /memo/<番号>/<分片>       → proxy 模式下的分片 / init.mp4 转发
+//
+// 上游（2026-10-12 实测）：
+//   https://memojav.org/hls/get_video_info.php?id=<番号>&sig=...&sts=...
+//   - 这是详情页播放器真正使用的接口，返回 hls 或 mp4；
+//   - mp4 原生提供 1080p / 720p / 360p 三条清晰度（url=m37/m22/m18）；
+//   - hls 上游当前只有一条 master.m3u8，不能伪造出并不存在的清晰度，
+//     因此真实线路只给一条，另外补一条明确标注的代理兜底源。
 
 export const MEMOJAV_ROUTE_PREFIX = "/memo/";
 
-export const MEMOJAV_BUILD_ID = "2026-10-12-memojav-shortlink-1";
+export const MEMOJAV_BUILD_ID = "2026-10-12-memojav-multisource-2";
 
 // 上游媒体域名。video10 是 2026-09 实测唯一可用的域名；其余留作候选，
 // 按顺序探测，命中第一个真正返回 HLS 清单的域名。
@@ -26,6 +35,17 @@ const DEFAULT_CACHE_TTL_SECONDS = 600;
 // 未命中的负缓存时长（秒）：新上架番号能较快出现，又不会被 404 打穿上游。
 const NEGATIVE_CACHE_TTL_SECONDS = 60;
 const MEMORY_CACHE_MAX_ENTRIES = 512;
+
+const INFO_ORIGIN = "https://memojav.org";
+const INFO_PATH = "/hls/get_video_info.php";
+const INFO_REFERER_PREFIX = "https://memojav.org/embed/";
+
+// 上游 mp4 播放器把同一地址按 `=m37/=m22/=m18` 后缀切成三档清晰度。
+const MP4_QUALITIES = [
+  { id: "mp4-1080", suffix: "m37", height: 1080, name: "MemoJav 1080P" },
+  { id: "mp4-720", suffix: "m22", height: 720, name: "MemoJav 720P" },
+  { id: "mp4-360", suffix: "m18", height: 360, name: "MemoJav 360P" },
+];
 
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -74,6 +94,14 @@ function cacheTtlSeconds(env) {
 
 function buildId(env) {
   return String(env?.MEMOJAV_BUILD_ID || MEMOJAV_BUILD_ID);
+}
+
+/** 是否默认附加“代理兜底源”。MEMOJAV_INCLUDE_PROXY_SOURCE=false 可关闭。 */
+export function memoIncludeProxySource(env) {
+  const raw = String(env?.MEMOJAV_INCLUDE_PROXY_SOURCE ?? "true")
+    .trim()
+    .toLowerCase();
+  return raw !== "false" && raw !== "0" && raw !== "off" && raw !== "no";
 }
 
 function isAllowedMemoHost(hostname, env) {
@@ -185,11 +213,159 @@ async function writeResolveCache(key, info, env, ctx) {
   await put;
 }
 
+function base64Encode(value) {
+  if (typeof btoa === "function") return btoa(value);
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(value, "binary").toString("base64");
+  }
+  throw new Error("base64 encoder unavailable");
+}
+
 /**
- * 探测番号：逐个候选域名请求 master.m3u8，必须拿到真正的 HLS 清单才算命中。
- * 命中返回 { ok:true, host, url, checkedAt }，否则返回 { ok:false, status }。
+ * 复刻上游 /static/main.js 的 video_sig()：
+ *   sig = btoa(timestamp) 的第 8~17 位（共 10 位）
+ *   sts = 1 + Σ(charCode(sig[i]) * i * 1743)
  */
-export async function resolveMemoSource(code, env = {}, fetchImpl = fetch) {
+export function memoVideoSignature(nowMs = Date.now()) {
+  const encoded = base64Encode(String(nowMs));
+  const sig = encoded.slice(-12, -2);
+  let sts = 1;
+  for (let index = 0; index < sig.length; index += 1) {
+    sts += sig.charCodeAt(index) * index * 1743;
+  }
+  return { sig, sts };
+}
+
+function decodeComponent(value) {
+  try {
+    return decodeURIComponent(String(value || ""));
+  } catch {
+    return String(value || "");
+  }
+}
+
+function hostFromUrl(raw) {
+  try {
+    return new URL(raw).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function hlsSource(url, checkedAt) {
+  return {
+    id: "hls",
+    name: "MemoJav 302",
+    kind: "hls",
+    container: "m3u8",
+    height: 0,
+    url,
+    checkedAt,
+  };
+}
+
+function mp4Sources(baseUrl, checkedAt) {
+  return MP4_QUALITIES.map((quality) => ({
+    id: quality.id,
+    name: quality.name,
+    kind: "mp4",
+    container: "mp4",
+    height: quality.height,
+    url: `${baseUrl}=${quality.suffix}`,
+    checkedAt,
+  }));
+}
+
+/** 解析 get_video_info.php 的响应（前面可能带 `for(;;);` 反 JSON 劫持前缀）。 */
+export function parseMemoVideoInfo(text, checkedAt = new Date().toISOString()) {
+  const raw = String(text || "").replace(/^\s*for\s*\(;;\);\s*/i, "");
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!payload || payload.success !== true) return null;
+  const type = String(payload.type || "").toLowerCase();
+  const url = decodeComponent(payload.url);
+  if (!url) return null;
+  if (type === "hls") {
+    return {
+      ok: true,
+      type: "hls",
+      provider: "memojav-api",
+      host: hostFromUrl(url),
+      url,
+      sources: [hlsSource(url, checkedAt)],
+      checkedAt,
+    };
+  }
+  if (type === "mp4") {
+    const sources = mp4Sources(url, checkedAt);
+    return {
+      ok: true,
+      type: "mp4",
+      provider: "memojav-api",
+      host: hostFromUrl(sources[0].url),
+      url: sources[0].url,
+      sources,
+      checkedAt,
+    };
+  }
+  return null;
+}
+
+/** 给 HLS 结果补一条明确标注的代理兜底源（不伪造清晰度）。 */
+function addProxyFallback(info, env) {
+  if (!memoIncludeProxySource(env) || !info || !info.ok) return info;
+  if (info.type !== "hls" || !Array.isArray(info.sources) || !info.sources.length) {
+    return info;
+  }
+  if (info.sources.some((source) => source.id === "hls-proxy")) return info;
+  const primary = info.sources.find((source) => source.id === "hls") || info.sources[0];
+  info.sources.push({
+    id: "hls-proxy",
+    name: "MemoJav 代理",
+    kind: "hls",
+    container: "m3u8",
+    height: primary.height || 0,
+    url: primary.url,
+    proxy: true,
+    fallback: true,
+    checkedAt: info.checkedAt,
+  });
+  return info;
+}
+
+async function resolveMemoInfo(code, env, fetchImpl = fetch) {
+  const checkedAt = new Date().toISOString();
+  const signature = memoVideoSignature();
+  const infoUrl =
+    `${INFO_ORIGIN}${INFO_PATH}?id=${encodeURIComponent(code)}` +
+    `&sig=${encodeURIComponent(signature.sig)}&sts=${encodeURIComponent(String(signature.sts))}`;
+  try {
+    const response = await fetchImpl(infoUrl, {
+      method: "GET",
+      headers: {
+        "user-agent": BROWSER_UA,
+        accept: "*/*",
+        referer: `${INFO_REFERER_PREFIX}${encodeURIComponent(code)}`,
+      },
+    });
+    if (response.ok) {
+      const info = parseMemoVideoInfo(await response.text(), checkedAt);
+      if (info) return addProxyFallback(info, env);
+    }
+  } catch {
+    // 接口失败时继续走旧版媒体域名探测，保证已上架 HLS 仍可播放。
+  }
+  return null;
+}
+
+/**
+ * 兼容旧直链探测：逐个候选域名请求 master.m3u8，必须拿到真正的 HLS 清单才算命中。
+ */
+async function resolveLegacySource(code, env, fetchImpl = fetch) {
   const list = mediaHosts(env);
   let lastStatus = 404;
   for (const host of list) {
@@ -211,12 +387,19 @@ export async function resolveMemoSource(code, env = {}, fetchImpl = fetch) {
           head = "";
         }
         if (/#EXTM3U/i.test(head)) {
-          return {
-            ok: true,
-            host,
-            url,
-            checkedAt: new Date().toISOString(),
-          };
+          const checkedAt = new Date().toISOString();
+          return addProxyFallback(
+            {
+              ok: true,
+              type: "hls",
+              provider: "legacy-host",
+              host,
+              url,
+              sources: [hlsSource(url, checkedAt)],
+              checkedAt,
+            },
+            env,
+          );
         }
         lastStatus = 502;
       } else {
@@ -229,8 +412,20 @@ export async function resolveMemoSource(code, env = {}, fetchImpl = fetch) {
   return { ok: false, status: lastStatus };
 }
 
+/**
+ * 解析番号对应的全部真实播放源。
+ * 返回 { ok, type, provider, host, url, sources:[{id,name,kind,container,height,url,proxy?}], checkedAt }
+ */
+export async function resolveMemoSource(code, env = {}, fetchImpl = fetch) {
+  const info = await resolveMemoInfo(code, env, fetchImpl);
+  if (info && info.ok) return info;
+  return resolveLegacySource(code, env, fetchImpl);
+}
+
 async function resolveCached(code, env, ctx, fetchImpl, refresh) {
-  const key = `${buildId(env)}|${mediaHosts(env).join(",")}|${code}`;
+  const key =
+    `${buildId(env)}|${mediaHosts(env).join(",")}|` +
+    `${memoIncludeProxySource(env) ? "proxy" : "direct"}|${code}`;
   const cached = await readResolveCache(key, env, refresh);
   if (cached) return cached;
   const info = await resolveMemoSource(code, env, fetchImpl);
@@ -238,9 +433,40 @@ async function resolveCached(code, env, ctx, fetchImpl, refresh) {
   return info;
 }
 
+/**
+ * 给 Emby / 其他内部调用使用的缓存解析入口。
+ * 复用 /memo/ 路由同一份缓存，避免详情页、PlaybackInfo 和播放请求重复探测上游。
+ */
+export async function resolveMemoSourceCached(
+  code,
+  env = {},
+  ctx = {},
+  fetchImpl = fetch,
+  refresh = false,
+) {
+  const normalized = normalizeCode(code);
+  if (!normalized) return { ok: false, status: 400 };
+  return resolveCached(normalized, env, ctx, fetchImpl, refresh);
+}
+
+/** 从解析结果里挑一条源；空请求默认第一条真实源。 */
+export function selectMemoSource(info, requested) {
+  const sources = Array.isArray(info?.sources) ? info.sources : [];
+  if (!sources.length) return null;
+  const raw = String(requested || "").trim().toLowerCase();
+  if (!raw) return sources[0];
+  return (
+    sources.find((source) => String(source.id || "").toLowerCase() === raw) ||
+    sources.find((source) => String(source.height || "") === raw) ||
+    sources.find((source) => String(source.name || "").toLowerCase() === raw) ||
+    sources[0]
+  );
+}
+
 /** 把清单里的相对 URI 改写成走本服务代理的绝对 URL。 */
-export function rewriteMemoPlaylist(text, code, origin) {
+export function rewriteMemoPlaylist(text, code, origin, sourceId = "") {
   const base = `${origin}${MEMOJAV_ROUTE_PREFIX}${code}`;
+  const sourceQuery = sourceId ? `&source=${encodeURIComponent(sourceId)}` : "";
   const fix = (raw) => {
     const value = String(raw || "").trim();
     if (!value) return raw;
@@ -262,7 +488,7 @@ export function rewriteMemoPlaylist(text, code, origin) {
       .split("/")
       .map((segment) => encodeURIComponent(segment))
       .join("/");
-    return `${base}/${proxied}?proxy=1&p=1${query}${hash}`;
+    return `${base}/${proxied}?proxy=1&p=1${sourceQuery}${query}${hash}`;
   };
   return String(text || "")
     .split(/\r?\n/)
@@ -308,9 +534,11 @@ async function proxyMemoRequest(target, request, env, fetchImpl) {
   });
 }
 
-function playerHtml(code, origin) {
+function playerHtml(code, origin, selected) {
   const shortLink = `${origin}${MEMOJAV_ROUTE_PREFIX}${code}`;
-  const proxyLink = `${shortLink}?proxy=1`;
+  const sourceQuery = selected?.id ? `&source=${encodeURIComponent(selected.id)}` : "";
+  const proxyLink = `${shortLink}?proxy=1${sourceQuery}`;
+  const isMp4 = selected?.kind === "mp4";
   const safeCode = code.replace(/[<>&"]/g, "");
   return `<!doctype html>
 <html lang="zh-CN">
@@ -346,7 +574,7 @@ code{background:#171a21;border:1px solid #232833;padding:2px 6px;border-radius:5
   </div>
   <div class="bar">
     <a class="btn" href="${shortLink}" target="_blank" rel="noreferrer">302 短链（外部播放器）</a>
-    <a class="btn" href="${proxyLink}" target="_blank" rel="noreferrer">原始 m3u8</a>
+    <a class="btn" href="${proxyLink}" target="_blank" rel="noreferrer">代理播放源</a>
     <a class="btn" href="${MEMOJAV_ROUTE_PREFIX}">接口说明</a>
   </div>
   <div class="note">
@@ -360,10 +588,10 @@ var v=document.getElementById('v'), st=document.getElementById('st');
 function fail(m){ st.textContent=m; st.className='status err'; }
 function hide(){ st.className='status hide'; }
 function start(Hls){
-  if (v.canPlayType('application/vnd.apple.mpegurl')) {
+  if (${isMp4 ? "true" : "v.canPlayType('application/vnd.apple.mpegurl')"}) {
     v.src=SRC;
     v.addEventListener('loadedmetadata', hide);
-    v.addEventListener('error', function(){ fail('原生 HLS 播放失败，请改用 302 短链。'); });
+    v.addEventListener('error', function(){ fail('原生播放失败，请改用 302 短链。'); });
     return;
   }
   if (Hls && Hls.isSupported()) {
@@ -383,20 +611,46 @@ var CDNS=['https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js','https://unpkg
 </html>`;
 }
 
+function sourceListPayload(info, code) {
+  return {
+    ok: true,
+    code,
+    type: info.type,
+    provider: info.provider,
+    checkedAt: info.checkedAt,
+    host: info.host,
+    url: info.url,
+    sources: (info.sources || []).map((source) => ({
+      id: source.id,
+      name: source.name,
+      kind: source.kind,
+      container: source.container,
+      height: source.height || 0,
+      url: source.url,
+      proxy: Boolean(source.proxy),
+      fallback: Boolean(source.fallback),
+    })),
+  };
+}
+
 function usageResponse(origin, env) {
   return jsonResponse({
     ok: true,
     service: "memojav-shortlink",
     buildId: buildId(env),
     usage: {
-      [`GET ${MEMOJAV_ROUTE_PREFIX}<番号>`]: "302 重定向到上游 m3u8（默认，零流量）",
+      [`GET ${MEMOJAV_ROUTE_PREFIX}<番号>`]: "302 重定向到第一条真实播放源（默认，零流量）",
+      [`GET ${MEMOJAV_ROUTE_PREFIX}<番号>?sources=1`]: "返回上游真实播放源列表（HLS / MP4 清晰度）",
+      [`GET ${MEMOJAV_ROUTE_PREFIX}<番号>?source=<id>`]: "302 重定向到指定播放源",
       [`GET ${MEMOJAV_ROUTE_PREFIX}<番号>?json=1`]: "返回解析结果 JSON",
       [`GET ${MEMOJAV_ROUTE_PREFIX}<番号>?refresh=1`]: "绕过缓存强制重新解析",
-      [`GET ${MEMOJAV_ROUTE_PREFIX}<番号>?proxy=1`]: "HLS 反向代理（清单+分片经本服务）",
+      [`GET ${MEMOJAV_ROUTE_PREFIX}<番号>?proxy=1`]: "HLS / MP4 反向代理（清单+分片经本服务）",
       [`GET ${MEMOJAV_ROUTE_PREFIX}<番号>?web=1`]: "浏览器播放页（同源代理预览）",
     },
     example: `${origin}${MEMOJAV_ROUTE_PREFIX}ROE-552`,
     upstream: mediaHosts(env).map((host) => `https://${host}/stream/<番号>/master.m3u8`),
+    infoApi: `${INFO_ORIGIN}${INFO_PATH}`,
+    includeProxySource: memoIncludeProxySource(env),
     cacheTtlSeconds: cacheTtlSeconds(env),
   });
 }
@@ -440,9 +694,12 @@ export async function handleMemoJav(
 
   const segment = parts.length > 1 ? parts.slice(1).join("/") : "";
   const asJson = incoming.searchParams.get("json") === "1";
+  const asSources = incoming.searchParams.get("sources") === "1";
   const refresh = incoming.searchParams.get("refresh") === "1";
   const proxy = incoming.searchParams.get("proxy") === "1";
   const web = incoming.searchParams.get("web") === "1";
+  const requestedSource =
+    incoming.searchParams.get("source") || incoming.searchParams.get("quality") || "";
 
   const info = await resolveCached(code, env, ctx, fetchImpl, refresh);
   if (!info || !info.ok) {
@@ -460,6 +717,15 @@ export async function handleMemoJav(
     );
   }
 
+  const selected = selectMemoSource(info, requestedSource);
+  if (!selected) {
+    return jsonResponse({ error: "no playable source", code }, 502);
+  }
+
+  if (asSources) {
+    return jsonResponse(sourceListPayload(info, code));
+  }
+
   if (proxy && segment) {
     const safe = safeSegment(segment);
     if (!safe) return jsonResponse({ error: "invalid segment" }, 400);
@@ -472,15 +738,22 @@ export async function handleMemoJav(
   }
 
   if (asJson) {
-    return jsonResponse({ ok: true, code, host: info.host, url: info.url, proxy });
+    return jsonResponse({
+      ...sourceListPayload(info, code),
+      selectedSourceId: selected.id,
+      proxy,
+    });
   }
 
   if (web) {
-    return htmlResponse(playerHtml(code, incoming.origin));
+    return htmlResponse(playerHtml(code, incoming.origin, selected));
   }
 
   if (proxy) {
-    const upstream = await fetchImpl(info.url, {
+    if (selected.kind === "mp4" || selected.container === "mp4") {
+      return proxyMemoRequest(selected.url, request, env, fetchImpl);
+    }
+    const upstream = await fetchImpl(selected.url, {
       method: "GET",
       headers: new Headers({
         "user-agent": request.headers.get("user-agent") || BROWSER_UA,
@@ -494,7 +767,7 @@ export async function handleMemoJav(
       );
     }
     const text = await upstream.text();
-    return new Response(rewriteMemoPlaylist(text, code, incoming.origin), {
+    return new Response(rewriteMemoPlaylist(text, code, incoming.origin, selected.id), {
       status: 200,
       headers: {
         "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
@@ -504,10 +777,26 @@ export async function handleMemoJav(
     });
   }
 
+  // 默认：302 零流量重定向。代理兜底源 302 回本服务的代理入口。
+  if (selected.proxy) {
+    const proxyUrl = new URL(
+      `${incoming.origin}${MEMOJAV_ROUTE_PREFIX}${encodeURIComponent(code)}`,
+    );
+    proxyUrl.searchParams.set("proxy", "1");
+    proxyUrl.searchParams.set("source", selected.id);
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: proxyUrl.toString(),
+        "cache-control": "no-store",
+        "access-control-allow-origin": "*",
+      },
+    });
+  }
   return new Response(null, {
     status: 302,
     headers: {
-      location: info.url,
+      location: selected.url,
       "cache-control": `public, max-age=${cacheTtlSeconds(env)}`,
       "access-control-allow-origin": "*",
     },

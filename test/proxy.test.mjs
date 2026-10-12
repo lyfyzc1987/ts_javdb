@@ -5562,7 +5562,7 @@ test("loads Javtiful MP4 qualities in order and probes each stream", async () =>
     payload.MediaSources.map((source) =>
       source.MediaStreams.find((stream) => stream.Type === "Video").Height
     ),
-    [1080, 720, 1080],
+    [1080, 720, undefined],
   );
   assert.equal(calls.filter((target) => target === fullHdUrl).length, 1);
   assert.equal(calls.filter((target) => target === hdUrl).length, 1);
@@ -5674,7 +5674,7 @@ test("loads all GetAV qualities through parallel page requests", async () => {
     payload.MediaSources.map((source) =>
       source.MediaStreams.find((stream) => stream.Type === "Video").Height
     ),
-    [2160, 1080, 720, 480, 2160],
+    [2160, 1080, 720, 480, undefined],
   );
 });
 
@@ -9597,36 +9597,46 @@ function memoPlaylistResponse(body = "#EXTM3U\n#EXT-X-VERSION:7\ninit.mp4\n") {
   });
 }
 
+function memoInfoResponse(type, url) {
+  return new Response(
+    `for (;;);${JSON.stringify({
+      type,
+      url: encodeURIComponent(url),
+      success: true,
+    })}`,
+    {
+      status: 200,
+      headers: { "content-type": "text/html; charset=utf-8" },
+    },
+  );
+}
+
 test("memo short link returns a 302 to the upstream m3u8 without proxying", async () => {
   const calls = [];
+  const upstreamUrl = "https://video10.memojav.net/stream/ROE-552/master.m3u8";
   const response = await handleProxy(
     new Request("https://clone.example/memo/roe-552.strm"),
     {},
     {},
     async (url, init) => {
       calls.push({ url, init });
-      return memoPlaylistResponse();
+      return memoInfoResponse("hls", upstreamUrl);
     },
   );
 
   assert.equal(response.status, 302);
-  assert.equal(
-    response.headers.get("location"),
-    "https://video10.memojav.net/stream/ROE-552/master.m3u8",
-  );
+  assert.equal(response.headers.get("location"), upstreamUrl);
   assert.equal(calls.length, 1);
-  assert.equal(
-    calls[0].url,
-    "https://video10.memojav.net/stream/ROE-552/master.m3u8",
-  );
+  assert.match(calls[0].url, /^https:\/\/memojav\.org\/hls\/get_video_info\.php\?/);
 });
 
 test("memo json debug endpoint reports the resolved upstream", async () => {
+  const upstreamUrl = "https://video10.memojav.net/stream/ROE-552/master.m3u8";
   const response = await handleProxy(
     new Request("https://clone.example/memo/ROE-552?json=1"),
     {},
     {},
-    async () => memoPlaylistResponse(),
+    async () => memoInfoResponse("hls", upstreamUrl),
   );
 
   assert.equal(response.status, 200);
@@ -9634,9 +9644,83 @@ test("memo json debug endpoint reports the resolved upstream", async () => {
   assert.equal(payload.ok, true);
   assert.equal(payload.code, "ROE-552");
   assert.equal(payload.host, "video10.memojav.net");
+  assert.equal(payload.url, upstreamUrl);
+  assert.deepEqual(
+    payload.sources.map((source) => source.id),
+    ["hls", "hls-proxy"],
+  );
+});
+
+test("memo sources endpoint exposes real MP4 qualities and selects one", async () => {
+  const baseUrl = "https://video10.memojav.net/download/ROE-552.mp4";
+  const infoUrl = "https://memojav.org/hls/get_video_info.php";
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    if (String(url).startsWith(infoUrl)) {
+      return memoInfoResponse("mp4", baseUrl);
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  const listResponse = await handleProxy(
+    new Request("https://clone.example/memo/ROE-552?sources=1"),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(listResponse.status, 200);
+  const list = await listResponse.json();
+  assert.deepEqual(
+    list.sources.map((source) => [source.id, source.height, source.url]),
+    [
+      ["mp4-1080", 1080, `${baseUrl}=m37`],
+      ["mp4-720", 720, `${baseUrl}=m22`],
+      ["mp4-360", 360, `${baseUrl}=m18`],
+    ],
+  );
+
+  const selectedResponse = await handleProxy(
+    new Request("https://clone.example/memo/ROE-552?source=mp4-720&refresh=1"),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(selectedResponse.status, 302);
+  assert.equal(selectedResponse.headers.get("location"), `${baseUrl}=m22`);
+  assert.equal(calls.length, 2);
+});
+
+test("memo sources endpoint can omit the optional proxy fallback", async () => {
+  const upstreamUrl = "https://video10.memojav.net/stream/ROE-552/master.m3u8";
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/ROE-552?sources=1"),
+    { MEMOJAV_INCLUDE_PROXY_SOURCE: "false" },
+    {},
+    async () => memoInfoResponse("hls", upstreamUrl),
+  );
+
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.deepEqual(
+    payload.sources.map((source) => source.id),
+    ["hls"],
+  );
+});
+
+test("memo proxy fallback redirects to the same-origin proxy endpoint", async () => {
+  const upstreamUrl = "https://video10.memojav.net/stream/ROE-552/master.m3u8";
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/ROE-552?source=hls-proxy"),
+    {},
+    {},
+    async () => memoInfoResponse("hls", upstreamUrl),
+  );
+
+  assert.equal(response.status, 302);
   assert.equal(
-    payload.url,
-    "https://video10.memojav.net/stream/ROE-552/master.m3u8",
+    response.headers.get("location"),
+    "https://clone.example/memo/ROE-552?proxy=1&source=hls-proxy",
   );
 });
 
@@ -9665,14 +9749,19 @@ test("memo short link reports 404 when every upstream host misses", async () => 
 });
 
 test("memo proxy mode rewrites playlist URIs through the short link", async () => {
+  const upstreamUrl = "https://video10.memojav.net/stream/ROE-552/master.m3u8";
   const response = await handleProxy(
     new Request("https://clone.example/memo/ROE-552?proxy=1"),
     {},
     {},
-    async () =>
-      memoPlaylistResponse(
+    async (url) => {
+      if (String(url).startsWith("https://memojav.org/hls/get_video_info.php")) {
+        return memoInfoResponse("hls", upstreamUrl);
+      }
+      return memoPlaylistResponse(
         "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:8.3,\nmaster0.m4s\n",
-      ),
+      );
+    },
   );
 
   assert.equal(response.status, 200);
@@ -9680,16 +9769,17 @@ test("memo proxy mode rewrites playlist URIs through the short link", async () =
   const body = await response.text();
   assert.match(
     body,
-    /URI="https:\/\/clone\.example\/memo\/ROE-552\/init\.mp4\?proxy=1&p=1"/,
+    /URI="https:\/\/clone\.example\/memo\/ROE-552\/init\.mp4\?proxy=1&p=1&source=hls"/,
   );
   assert.match(
     body,
-    /https:\/\/clone\.example\/memo\/ROE-552\/master0\.m4s\?proxy=1&p=1/,
+    /https:\/\/clone\.example\/memo\/ROE-552\/master0\.m4s\?proxy=1&p=1&source=hls/,
   );
 });
 
 test("memo proxy mode forwards segment Range requests to upstream", async () => {
   const calls = [];
+  const upstreamUrl = "https://video10.memojav.net/stream/ROE-552/master.m3u8";
   const response = await handleProxy(
     new Request(
       "https://clone.example/memo/ROE-552/master0.m4s?proxy=1&p=1",
@@ -9699,8 +9789,8 @@ test("memo proxy mode forwards segment Range requests to upstream", async () => 
     {},
     async (url, init) => {
       calls.push({ url, init });
-      if (url.includes("master.m3u8")) {
-        return memoPlaylistResponse();
+      if (String(url).startsWith("https://memojav.org/hls/get_video_info.php")) {
+        return memoInfoResponse("hls", upstreamUrl);
       }
       return new Response(new Uint8Array(100), {
         status: 206,
@@ -9723,12 +9813,15 @@ test("memo proxy mode forwards segment Range requests to upstream", async () => 
 });
 
 test("memo proxy mode rejects a path traversal segment", async () => {
+  const upstreamUrl = "https://video10.memojav.net/stream/ROE-552/master.m3u8";
   const response = await handleProxy(
     new Request("https://clone.example/memo/ROE-552/..%2F..%2Fetc%2Fpasswd?proxy=1"),
     {},
     {},
     async (url) => {
-      if (url.includes("master.m3u8")) return memoPlaylistResponse();
+      if (String(url).startsWith("https://memojav.org/hls/get_video_info.php")) {
+        return memoInfoResponse("hls", upstreamUrl);
+      }
       throw new Error("segment fetch must not be called");
     },
   );

@@ -1,3 +1,5 @@
+import { resolveMemoSourceCached } from "./memojav.js";
+
 const DEFAULT_API_ORIGIN = "https://jdforrepam.com/api";
 const DEFAULT_UPSTREAM_ORIGIN = "https://catembylegacy.fastcdn.dpdns.org";
 const DEFAULT_RESOLVER_ORIGIN = "https://catembylegacy.fastcdn.dpdns.org";
@@ -171,7 +173,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v26";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-12-memojav-shortlink-43";
+const SERVER_BUILD_ID = "2026-10-12-memojav-multisource-44";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -9140,31 +9142,25 @@ function mediaSourceIdForIndex(itemId, index) {
   ].join("-");
 }
 
-// MemoJav 302 直连源：Path/DirectStreamUrl 直接指向 /memo/<番号>。
-// 播放器请求这个裸短链时服务端只回 302，清单和分片都直达上游，
+// MemoJav 直连源：Path/DirectStreamUrl 直接指向 /memo/<番号>。
+// 播放器请求这个短链时服务端只回 302，清单和分片都直达上游，
 // 不经过 /Videos/{id}/stream，也不产生 /emby-media/ 反代流量。
-function memoJavMediaSource(item, requestUrl, token, video, subtitles = [], movie = null) {
-  const code = movieResolveCode(movie || item.movie || item);
-  const normalizedCode = String(code || "").trim().toUpperCase();
-  if (!normalizedCode || !/^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(normalizedCode)) {
-    return null;
-  }
-  const memoUrl = new URL(
-    publicRoutePath(requestUrl, `/memo/${encodeURIComponent(normalizedCode)}`),
-    requestUrl,
-  );
-  memoUrl.searchParams.set("api_key", token);
-  const directUrl = `${memoUrl.pathname}${memoUrl.search}`;
-  const height = Number(video?.quality || 0);
-  const bitrate = estimatedMediaBitrate(true, height);
-  const runtimeTicks = Math.max(
-    0,
-    Number(video?.RunTimeTicks) || Number(item?.RunTimeTicks) || 0,
-  );
-  const sizeSeconds = runtimeTicks > 0 ? runtimeTicks / 10_000_000 : 3600;
-  const size = Math.max(1, Math.round((sizeSeconds * bitrate) / 8));
-  const width = height > 0 ? Math.round((height * 16) / 9 / 2) * 2 : undefined;
-  const subtitleStreams = subtitles.map((subtitle, index) => {
+//
+// 上游能给出多少条真实播放源，这里就生成多少条 MediaSource：
+//   - mp4 资源：1080P / 720P / 360P 三条真实清晰度；
+//   - hls 资源：上游只有一条 master.m3u8，另外补一条明确标注的
+//     “MemoJav 代理”兜底源（走本服务反代），不伪造清晰度。
+// 解析失败或超时时退回一条裸短链（与旧行为一致），保证播放按钮始终存在。
+const MEMOJAV_FALLBACK_SOURCE = {
+  id: "",
+  name: "MemoJav 302",
+  kind: "hls",
+  container: "m3u8",
+  height: 0,
+};
+
+function memoJavSubtitleStreams(item, requestUrl, token, subtitles) {
+  return subtitles.map((subtitle, index) => {
     const streamIndex = index + 2;
     const deliveryUrl = new URL(
       publicRoutePath(
@@ -9193,67 +9189,110 @@ function memoJavMediaSource(item, requestUrl, token, video, subtitles = [], movi
       DeliveryUrl: `${deliveryUrl.pathname}${deliveryUrl.search}`,
     };
   });
-  return {
-    Id: `${item.Id}-memojav-302`,
-    MediaSourceId: `${item.Id}-memojav-302`,
-    Name: "MemoJav 302",
-    Path: memoUrl.toString(),
-    DirectStreamUrl: directUrl,
-    Protocol: "Http",
-    Type: "Default",
-    Container: "m3u8",
-    VideoType: "VideoFile",
-    IsRemote: true,
-    SupportsDirectPlay: true,
-    SupportsDirectStream: true,
-    SupportsTranscoding: false,
-    SupportsProbing: false,
-    RequiresOpening: false,
-    RequiresClosing: false,
-    RequiredHttpHeaders: {},
-    RunTimeTicks: item.RunTimeTicks,
-    Bitrate: bitrate,
-    Size: size,
-    DefaultAudioStreamIndex: 1,
-    DefaultSubtitleStreamIndex: subtitleStreams[0]?.Index,
-    MediaStreams: [
-      {
-        Type: "Video",
-        Codec: "h264",
-        DisplayTitle: height > 0 ? `${height}p H264 SDR` : "H264 SDR",
-        IsDefault: true,
-        IsForced: false,
-        IsExternal: false,
-        Index: 0,
-        Width: width,
-        Height: height || undefined,
-        BitRate: bitrate,
-        AspectRatio: "16:9",
-        VideoRange: "SDR",
-        VideoRangeType: "SDR",
-        IsInterlaced: false,
-        IsAVC: true,
-        IsAnamorphic: false,
-        TimeBase: "1/10000000",
-      },
-      {
-        Type: "Audio",
-        Codec: "aac",
-        CodecTag: "mp4a",
-        Language: "und",
-        DisplayLanguage: "Undetermined",
-        DisplayTitle: "AAC stereo",
-        IsDefault: true,
-        IsForced: false,
-        IsExternal: false,
-        Index: 1,
-        Channels: 2,
-        ChannelLayout: "stereo",
-        SampleRate: 48000,
-      },
-      ...subtitleStreams,
-    ],
-  };
+}
+
+function memoJavMediaSources(
+  item,
+  requestUrl,
+  token,
+  video,
+  subtitles = [],
+  movie = null,
+  info = null,
+) {
+  const code = movieResolveCode(movie || item.movie || item);
+  const normalizedCode = String(code || "").trim().toUpperCase();
+  if (!normalizedCode || !/^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(normalizedCode)) {
+    return [];
+  }
+  const resolved =
+    Array.isArray(info?.sources) && info.sources.length
+      ? info.sources
+      : [MEMOJAV_FALLBACK_SOURCE];
+  const subtitleStreams = memoJavSubtitleStreams(item, requestUrl, token, subtitles);
+  return resolved.map((entry) => {
+    const memoUrl = new URL(
+      publicRoutePath(requestUrl, `/memo/${encodeURIComponent(normalizedCode)}`),
+      requestUrl,
+    );
+    memoUrl.searchParams.set("api_key", token);
+    if (entry.id) memoUrl.searchParams.set("source", entry.id);
+    if (entry.proxy) memoUrl.searchParams.set("proxy", "1");
+    const directUrl = `${memoUrl.pathname}${memoUrl.search}`;
+    const height = Number(entry.height || 0);
+    const bitrate = estimatedMediaBitrate(true, height);
+    const runtimeTicks = Math.max(
+      0,
+      Number(video?.RunTimeTicks) || Number(item?.RunTimeTicks) || 0,
+    );
+    const sizeSeconds = runtimeTicks > 0 ? runtimeTicks / 10_000_000 : 3600;
+    const size = Math.max(1, Math.round((sizeSeconds * bitrate) / 8));
+    const width = height > 0 ? Math.round((height * 16) / 9 / 2) * 2 : undefined;
+    const sourceKey = String(entry.id || "302").replace(/[^a-z0-9-]/gi, "");
+    const mediaSourceId = `${item.Id}-memojav-${sourceKey || "302"}`;
+    const isMp4 = entry.kind === "mp4" || entry.container === "mp4";
+    return {
+      Id: mediaSourceId,
+      MediaSourceId: mediaSourceId,
+      Name: entry.name || "MemoJav 302",
+      Path: memoUrl.toString(),
+      DirectStreamUrl: directUrl,
+      Protocol: "Http",
+      Type: "Default",
+      Container: entry.container || (isMp4 ? "mp4" : "m3u8"),
+      VideoType: "VideoFile",
+      IsRemote: true,
+      SupportsDirectPlay: true,
+      SupportsDirectStream: true,
+      SupportsTranscoding: false,
+      SupportsProbing: false,
+      RequiresOpening: false,
+      RequiresClosing: false,
+      RequiredHttpHeaders: {},
+      RunTimeTicks: item.RunTimeTicks,
+      Bitrate: bitrate,
+      Size: size,
+      DefaultAudioStreamIndex: 1,
+      DefaultSubtitleStreamIndex: subtitleStreams[0]?.Index,
+      MediaStreams: [
+        {
+          Type: "Video",
+          Codec: "h264",
+          DisplayTitle: height > 0 ? `${height}p H264 SDR` : "H264 SDR",
+          IsDefault: true,
+          IsForced: false,
+          IsExternal: false,
+          Index: 0,
+          Width: width,
+          Height: height || undefined,
+          BitRate: bitrate,
+          AspectRatio: "16:9",
+          VideoRange: "SDR",
+          VideoRangeType: "SDR",
+          IsInterlaced: false,
+          IsAVC: true,
+          IsAnamorphic: false,
+          TimeBase: "1/10000000",
+        },
+        {
+          Type: "Audio",
+          Codec: "aac",
+          CodecTag: "mp4a",
+          Language: "und",
+          DisplayLanguage: "Undetermined",
+          DisplayTitle: "AAC stereo",
+          IsDefault: true,
+          IsForced: false,
+          IsExternal: false,
+          Index: 1,
+          Channels: 2,
+          ChannelLayout: "stereo",
+          SampleRate: 48000,
+        },
+        ...subtitleStreams,
+      ],
+    };
+  });
 }
 
 function mediaSourceVariantIndex(itemId, mediaSourceId, variantCount = 0) {
@@ -9291,11 +9330,47 @@ function selectedPlaybackVideo(video, itemId, requestUrl) {
   };
 }
 
-function mediaSourcesForVideo(item, requestUrl, token, video, subtitles = []) {
-  return mediaSourcesForMovie(item, requestUrl, token, video, subtitles, null);
+// MemoJav 源解析的墙钟预算。命中缓存时几乎是 0 开销；冷缓存时最多等这么久，
+// 超时就退回裸短链（302 到上游第一条），绝不因为一个附加源拖垮详情页。
+const MEMOJAV_EMBY_RESOLVE_BUDGET_MS = 2500;
+
+async function resolveMemoSourcesForMovie(movie, env, fetchImpl, budgetMs, ctx) {
+  const code = movieResolveCode(movie);
+  const normalizedCode = String(code || "").trim().toUpperCase();
+  if (!normalizedCode || !/^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(normalizedCode)) {
+    return null;
+  }
+  const task = Promise.resolve(
+    resolveMemoSourceCached(normalizedCode, env, ctx, fetchImpl),
+  ).catch(() => null);
+  const budget = Math.max(0, Number(budgetMs) || 0);
+  const info = budget > 0 ? await settledWithin(task, budget) : await task;
+  if (info && info.ok) return info;
+  // 预算耗尽就把它交给响应生命周期继续跑完并写缓存，下一次重拉直接命中。
+  keepAliveBounded(task, ctx, Math.max(1000, budget));
+  return null;
 }
 
-function mediaSourcesForMovie(item, requestUrl, token, video, subtitles = [], movie = null) {
+async function mediaSourcesForVideo(
+  item,
+  requestUrl,
+  token,
+  video,
+  subtitles = [],
+  memo = {},
+) {
+  return mediaSourcesForMovie(item, requestUrl, token, video, subtitles, null, memo);
+}
+
+async function mediaSourcesForMovie(
+  item,
+  requestUrl,
+  token,
+  video,
+  subtitles = [],
+  movie = null,
+  memo = {},
+) {
   const variants = playbackVariants(video);
   const sources = variants.map((variant, index) =>
     mediaSource(
@@ -9310,8 +9385,26 @@ function mediaSourcesForMovie(item, requestUrl, token, video, subtitles = [], mo
       subtitles,
       mediaSourceIdForIndex(item.Id, index),
     ));
-  const memoSource = memoJavMediaSource(item, requestUrl, token, video, subtitles, movie);
-  if (memoSource) {
+  let memoInfo = null;
+  if (memo && memo.env) {
+    memoInfo = await resolveMemoSourcesForMovie(
+      movie || item.movie || item,
+      memo.env,
+      memo.fetchImpl,
+      memo.budgetMs,
+      memo.ctx,
+    );
+  }
+  const memoSources = memoJavMediaSources(
+    item,
+    requestUrl,
+    token,
+    video,
+    subtitles,
+    movie,
+    memoInfo,
+  );
+  for (const memoSource of memoSources) {
     sources.push(memoSource);
   }
   return sources;
@@ -9818,13 +9911,22 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     refreshDetailBackdropTags(item, movie);
     return itemJsonResponse(item, request, { pendingSources: true });
   }
-  const mediaSources = mediaSourcesForMovie(
+  const mediaSources = await mediaSourcesForMovie(
     item,
     request.url,
     playbackToken,
     video,
     subtitles,
     movie,
+    {
+      env,
+      fetchImpl,
+      ctx,
+      budgetMs: Math.min(
+        MEMOJAV_EMBY_RESOLVE_BUDGET_MS,
+        remainingRequestMs(requestDeadline, MEMOJAV_EMBY_RESOLVE_BUDGET_MS),
+      ),
+    },
   );
   const source = mediaSources[0];
   item.Path = source.Path;
@@ -13073,13 +13175,22 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
           MediaSourceCount: sources.length,
         });
       }
-      const mediaSources = mediaSourcesForMovie(
+      const mediaSources = await mediaSourcesForMovie(
         item,
         request.url,
         playbackToken,
         video,
         subtitles,
         movie,
+        {
+          env,
+          fetchImpl,
+          ctx,
+          budgetMs: Math.min(
+            MEMOJAV_EMBY_RESOLVE_BUDGET_MS,
+            remainingRequestMs(requestDeadline, MEMOJAV_EMBY_RESOLVE_BUDGET_MS),
+          ),
+        },
       );
       if (!mediaSources.length) {
         const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
