@@ -298,7 +298,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v29",
+    version: "item-dto-v32",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -1584,8 +1584,8 @@ test("resolves a movie number through exact search and exposes all playback sour
   assert.equal(response.status, 200);
   assert.equal(payload.Id, "NQ7Mdg");
   assert.equal(payload.Name, "RCTD-740 Exact result");
-  assert.equal(payload.MediaSourceCount, 5);
-  assert.equal(payload.MediaSources.length, 5);
+  assert.equal(payload.MediaSourceCount, 4);
+  assert.equal(payload.MediaSources.length, 4);
   assert.equal(
     calls.some((target) => target.includes("/v4/movies/RCTD-740")),
     true,
@@ -1653,8 +1653,8 @@ test("returns a retryable detail response while cold resolution continues", asyn
   );
   const secondPayload = await second.json();
   assert.equal(second.status, 200);
-  assert.equal(secondPayload.MediaSourceCount, 5);
-  assert.equal(secondPayload.MediaSources.length, 5);
+  assert.equal(secondPayload.MediaSourceCount, 4);
+  assert.equal(secondPayload.MediaSources.length, 4);
   assert.equal(
     new Set(secondPayload.MediaSources.map((source) => source.Name)).size,
     secondPayload.MediaSources.length,
@@ -1755,7 +1755,7 @@ test("keeps unverified multi-source HLS lines when validation budget expires", a
   const payload = await response.json();
 
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 5);
+  assert.equal(payload.MediaSources.length, 4);
   assert.equal(
     new Set(payload.MediaSources.map((source) => source.Name)).size,
     payload.MediaSources.length,
@@ -1841,7 +1841,7 @@ test("keeps an oversized inline HLS line without scanning the whole manifest", a
   const payload = await response.json();
 
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 2);
+  assert.equal(payload.MediaSources.length, 1);
   assert.ok(payload.MediaSources[0].Size > 0);
   // 前缀里的分片探测量必须受预算限制，绝不能与 2 万条分片成正比。
   assert.ok(segmentProbes <= 4);
@@ -1900,7 +1900,7 @@ test("returns a placeholder playback session while PlaybackInfo resolution conti
   const secondPayload = await second.json();
   assert.equal(second.status, 200);
   assert.ok(secondPayload.PlaySessionId);
-  assert.equal(secondPayload.MediaSources.length, 5);
+  assert.equal(secondPayload.MediaSources.length, 4);
 });
 
 test("keeps a playable on-demand placeholder instead of PlayAccess=None when resolution completes empty", async () => {
@@ -2074,7 +2074,7 @@ test("strips parsing-state text from every media source response boundary", asyn
   assert.equal(detail.status, 200);
   assert.deepEqual(
     detailPayload.MediaSources.map((source) => source.Name),
-    ["自动线路", "线路 2", "MemoJav 302"],
+    ["自动线路", "线路 2"],
   );
   assert.doesNotMatch(JSON.stringify(detailPayload), /解析中/);
 
@@ -2091,7 +2091,7 @@ test("strips parsing-state text from every media source response boundary", asyn
   assert.equal(playback.status, 200);
   assert.deepEqual(
     playbackPayload.MediaSources.map((source) => source.Name),
-    ["自动线路", "线路 2", "MemoJav 302"],
+    ["自动线路", "线路 2"],
   );
   assert.doesNotMatch(JSON.stringify(playbackPayload), /解析中/);
 });
@@ -2812,8 +2812,8 @@ test("keeps every playback source uniquely addressable across repeated reads", a
 
   const first = await readSources();
   const second = await readSources();
-  assert.equal(first.length, 4);
-  assert.equal(second.length, 4);
+  assert.equal(first.length, 3);
+  assert.equal(second.length, 3);
 
   for (const field of ["Id", "MediaSourceId", "Path", "DirectStreamUrl"]) {
     assert.equal(new Set(first.map((source) => source[field])).size, first.length);
@@ -2824,9 +2824,6 @@ test("keeps every playback source uniquely addressable across repeated reads", a
   }
   for (const source of first) {
     assert.equal(source.Id, source.MediaSourceId);
-    if (source.Name === "MemoJav 302") {
-      continue;
-    }
     const streamUrl = new URL(source.Path);
     assert.equal(streamUrl.searchParams.get("mediaSourceId"), source.Id);
     assert.match(source.DirectStreamUrl, new RegExp(`mediaSourceId=${source.Id}`));
@@ -2884,11 +2881,11 @@ test("keeps same-name sources from distinct URLs and removes exact duplicates", 
 
   const payload = await response.json();
   const sources = payload.MediaSources;
-  assert.equal(sources.length, 3);
+  assert.equal(sources.length, 2);
   assert.match(sources[0].Path, /source-a\.mp4/);
   assert.match(sources[1].Path, /source-b\.mp4/);
-  assert.equal(new Set(sources.map((source) => source.Id)).size, 3);
-  assert.equal(new Set(sources.map((source) => source.Name)).size, 3);
+  assert.equal(new Set(sources.map((source) => source.Id)).size, 2);
+  assert.equal(new Set(sources.map((source) => source.Name)).size, 2);
 });
 
 test("keeps late GetAV sources after early pseudo-HLS variants", async () => {
@@ -2921,15 +2918,12 @@ test("keeps late GetAV sources after early pseudo-HLS variants", async () => {
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 3);
+  assert.equal(payload.MediaSources.length, 2);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["getav_raw_4k", "getav_raw_1080p", "MemoJav 302"],
+    ["getav_raw_4k", "getav_raw_1080p"],
   );
   for (const source of payload.MediaSources) {
-    if (source.Name === "MemoJav 302") {
-      continue;
-    }
     assert.match(source.Path, /fast-stream\.jav\.si/);
     assert.doesNotMatch(source.Path, /googleusercontent/);
   }
@@ -3029,15 +3023,14 @@ test("keeps extensionless Google Drive HLS and embedded TS .image HLS", async ()
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 5);
+  assert.equal(payload.MediaSources.length, 4);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
     [
-      "fcjav_original",
-      "压缩版 · 1",
+      "fcjav 原版",
+      "fcjav 去码版",
       "javgg_original",
-      "压缩版 · 2",
-      "MemoJav 302",
+      "去码版",
     ],
   );
   assert.equal(
@@ -3045,12 +3038,97 @@ test("keeps extensionless Google Drive HLS and embedded TS .image HLS", async ()
     payload.MediaSources.length,
   );
   for (const source of payload.MediaSources) {
-    if (source.Name === "MemoJav 302") {
-      continue;
-    }
     assert.equal(source.Container, "m3u8");
     assert.match(source.Path, /\/Videos\/42\/stream\.m3u8/);
   }
+});
+
+test("prefixes fcjav bare original/reducing labels with the provider name", async () => {
+  // 线上 RCTD-740 的真实 payload：fcjav 两条线路只给裸标签（"原版" / "去码版"），
+  // 提供方只写在 variant 前缀里。不补前缀时客户端会看到两条没有来源的名字，
+  // 和 javgg / GetAV 混在一起分不清；这里必须显示成 "fcjav 原版 / fcjav 去码版"。
+  const fcjavOriginalSegment =
+    "https://fast-stream.jav.si/rctd-740/fcjav-original-seg-1.ts";
+  const fcjavReducedSegment =
+    "https://fast-stream.jav.si/rctd-740/fcjav-reduced-seg-1.ts";
+  const fcjavOriginalPlaylist = [
+    "#EXTM3U",
+    "#EXT-X-TARGETDURATION:10",
+    "#EXTINF:10,",
+    fcjavOriginalSegment,
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const fcjavReducedPlaylist = [
+    "#EXTM3U",
+    "#EXT-X-TARGETDURATION:10",
+    "#EXTINF:10,",
+    fcjavReducedSegment,
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const fcjavOriginalSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(fcjavOriginalPlaylist)}`;
+  const fcjavReducedSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(fcjavReducedPlaylist)}`;
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve`)) {
+        return new Response(
+          JSON.stringify({
+            variants: [
+              {
+                variant: "fcjav_original",
+                label: "原版",
+                sourceUrl: fcjavOriginalSource,
+                sourceType: "application/vnd.apple.mpegurl",
+                quality: 720,
+              },
+              {
+                variant: "fcjav_reducing_mosaic",
+                label: "去码版",
+                sourceUrl: fcjavReducedSource,
+                sourceType: "application/vnd.apple.mpegurl",
+                quality: 1080,
+              },
+            ],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === fcjavOriginalSegment || target === fcjavReducedSegment) {
+        return new Response(new Uint8Array([0x47, 0, 0, 0]), {
+          status: 206,
+          headers: { "content-type": "application/octet-stream" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    payload.MediaSources.map((source) => source.Name),
+    ["fcjav 原版", "fcjav 去码版"],
+  );
 });
 
 test("drops .image pseudo-HLS sources when the body is a real PNG", async () => {
@@ -3317,15 +3395,14 @@ test("keeps four RCTD-740 playback sources including GG font-path HLS variants",
   assert.equal(response.headers.get("cache-control"), "no-store");
   assert.equal(response.headers.get("expires"), "0");
   assert.equal(response.headers.get("pragma"), "no-cache");
-  assert.equal(payload.MediaSources.length, 5);
+  assert.equal(payload.MediaSources.length, 4);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
     [
-      "原版 4K (GetAV)",
-      "原版 1080P (GetAV)",
-      "原版 (服务器GG)",
-      "去码版 (服务器GG)",
-      "MemoJav 302",
+      "GetAV 原版 4K",
+      "GetAV 原版 1080P",
+      "服务器GG 原版",
+      "服务器GG 去码版",
     ],
   );
   assert.equal(
@@ -3418,7 +3495,7 @@ test("keeps AES-128 HLS sources whose encrypted segments use font paths", async 
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 2);
+  assert.equal(payload.MediaSources.length, 1);
   assert.equal(payload.MediaSources[0].Name, "RCTD-740");
   assert.equal(payload.MediaSources[0].Container, "m3u8");
   assert.equal(calls.includes(keyUrl), true);
@@ -3571,7 +3648,7 @@ test("keeps a remote HLS source only after a playable segment probe", async () =
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 2);
+  assert.equal(payload.MediaSources.length, 1);
   assert.equal(payload.MediaSources[0].Container, "m3u8");
   assert.deepEqual(
     calls.filter((target) => [masterUrl, childUrl, segmentUrl].includes(target)),
@@ -3633,7 +3710,7 @@ test("probes ordinary remote MP4 resolver sources before advertising them", asyn
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 2);
+  assert.equal(payload.MediaSources.length, 1);
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
 });
 
@@ -3755,7 +3832,7 @@ test("keeps a valid root-relative resolver source while starting self-hosted sup
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 2);
+  assert.equal(payload.MediaSources.length, 1);
   assert.equal(calls.includes(sourceUrl), true);
   assert.equal(calls.some((target) => /javtiful\.com/.test(target)), true);
   assert.equal(calls.some((target) => /getav\.net|r\.jina\.ai/.test(target)), true);
@@ -3844,7 +3921,7 @@ test("merges one public resolver source with two Javtiful qualities", async () =
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["原版", "Javtiful 1080P", "Javtiful 720P", "MemoJav 302"],
+    ["原版", "Javtiful 1080P", "Javtiful 720P"],
   );
   const javtifulSources = payload.MediaSources.filter((source) =>
     source.Name.startsWith("Javtiful ")
@@ -3980,8 +4057,8 @@ test("merges public resolver sources with GetAV qualities when the CDN requires 
     new URL(source.Path).searchParams.get("source")
   );
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 5);
-  assert.equal(new Set(sourceUrls).size, 5);
+  assert.equal(payload.MediaSources.length, 4);
+  assert.equal(new Set(sourceUrls).size, 4);
   assert.equal(sourceUrls.filter((source) => source === getav4kUrl).length, 1);
   assert.equal(sourceUrls.filter((source) => source === getav1080Url).length, 1);
 });
@@ -4100,7 +4177,7 @@ test("GetAV sources use 302 for compatible players and proxy fallback for okhttp
   assert.equal(embyGetavSources.length, 2);
   assert.deepEqual(
     embyGetavSources.map((source) => source.Name).sort(),
-    ["原版 1080P (GetAV)", "原版 720P (GetAV)"],
+    ["GetAV 原版 1080P", "GetAV 原版 720P"],
   );
   assert.deepEqual(
     embyGetavSources
@@ -4306,7 +4383,7 @@ test("keeps a public source when self-hosted supplement times out", async () => 
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 2);
+  assert.equal(payload.MediaSources.length, 1);
   assert.match(payload.MediaSources[0].Path, /public\.mp4/);
 });
 
@@ -4420,7 +4497,7 @@ test("does not persist a thin GetAV result while supplement is pending", async (
     fetchImpl,
   );
   const firstPayload = await firstResponse.json();
-  assert.equal(firstPayload.MediaSources.length, 3);
+  assert.equal(firstPayload.MediaSources.length, 2);
   assert.equal(
     [...db.rows.keys()].some((key) =>
       key.startsWith("video-persist-v1\u0000")
@@ -4441,14 +4518,13 @@ test("does not persist a thin GetAV result while supplement is pending", async (
     fetchImpl,
   );
   const secondPayload = await secondResponse.json();
-  assert.equal(secondPayload.MediaSources.length, 7);
+  assert.equal(secondPayload.MediaSources.length, 6);
   assert.deepEqual(
     secondPayload.MediaSources.slice(0, 6).map((source) =>
       new URL(source.Path).searchParams.get("source")
     ),
     [...publicUrls, ...getavUrls],
   );
-  assert.equal(secondPayload.MediaSources[6].Name, "MemoJav 302");
 });
 
 test("publishes early public lines instead of a pending placeholder when a slow resolver still merges", async () => {
@@ -4566,7 +4642,7 @@ test("publishes early public lines instead of a pending placeholder when a slow 
     ),
     false,
   );
-  assert.equal(payload.MediaSourceCount, 3);
+  assert.equal(payload.MediaSourceCount, 2);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
@@ -4683,7 +4759,7 @@ test("shows the first self-hosted line on the detail screen while both resolver 
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ),
-    [fullHdUrl, hdUrl, null],
+    [fullHdUrl, hdUrl],
   );
 });
 
@@ -4772,12 +4848,12 @@ test("keeps self-hosted and public snapshots together so the detail screen never
   assert.equal(response.status, 200);
   // 两条链路各 2 条互补线路：合并后的首屏快照必须保留全部 4 条，不能因为
   // “后到的那份线路更少”就退回 2 条。
-  assert.equal(payload.MediaSourceCount, 5);
+  assert.equal(payload.MediaSourceCount, 4);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...javtifulUrls, ...publicUrls, null].sort(),
+    [...javtifulUrls, ...publicUrls].sort(),
   );
 });
 
@@ -4884,12 +4960,12 @@ test("does not answer the first screen with a single line while more lines are s
     false,
   );
   // 关键断言：首屏是 7 条，不是自建链路先到的那 2 条。
-  assert.equal(payload.MediaSourceCount, allUrls.length + 1);
+  assert.equal(payload.MediaSourceCount, allUrls.length);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...allUrls, null].sort(),
+    [...allUrls].sort(),
   );
 });
 
@@ -4998,12 +5074,12 @@ test("waits for the slow public batch instead of answering with the first self-h
     false,
   );
   // 关键断言：首屏是 7 条，不是自建链路先到的那 2 条。
-  assert.equal(payload.MediaSourceCount, allUrls.length + 1);
+  assert.equal(payload.MediaSourceCount, allUrls.length);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...allUrls, null].sort(),
+    [...allUrls].sort(),
   );
 });
 
@@ -5112,12 +5188,12 @@ test("waits within the bounded first-screen grace for a public batch that still 
     false,
   );
   // 关键断言 1：首屏是两批合并后的完整线路，不是先到的自建那 3 条。
-  assert.equal(payload.MediaSourceCount, allUrls.length + 1);
+  assert.equal(payload.MediaSourceCount, allUrls.length);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...allUrls, null].sort(),
+    [...allUrls].sort(),
   );
   // 关键断言 2：等到了公共批次（3 秒），但被补时窗口约束住，没有拖到 9 秒上限。
   assert.ok(elapsed < 4500, `first screen took ${elapsed}ms`);
@@ -5206,12 +5282,12 @@ test("answers with the self-hosted lines once the first-screen grace expires", a
   assert.equal(response.status, 200);
   assert.equal(payload.PlayAccess, "Full");
   // 首屏是自建那 3 条真实线路，而不是“自动线路”占位源。
-  assert.equal(payload.MediaSourceCount, selfHostedUrls.length + 1);
+  assert.equal(payload.MediaSourceCount, selfHostedUrls.length);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...selfHostedUrls, null].sort(),
+    [...selfHostedUrls].sort(),
   );
   // 关键断言：补时窗口一过就答复，没有死等到 9 秒上限。
   assert.ok(elapsed >= 4500, `first screen returned too early at ${elapsed}ms`);
@@ -5313,12 +5389,12 @@ test("waits through the extended cold-start window when the public batch complet
   const payload = await response.json();
   assert.equal(response.status, 200);
   assert.equal(payload.PlayAccess, "Full");
-  assert.equal(payload.MediaSourceCount, allUrls.length + 1);
+  assert.equal(payload.MediaSourceCount, allUrls.length);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...allUrls, null].sort(),
+    [...allUrls].sort(),
   );
 });
 
@@ -5398,12 +5474,8 @@ test("keeps inline HLS lines on the first screen when every upstream line is a d
     ),
     false,
   );
-  assert.equal(payload.MediaSourceCount, 4);
+  assert.equal(payload.MediaSourceCount, 3);
   for (const source of payload.MediaSources) {
-    if (source.Name === "MemoJav 302") {
-      assert.equal(source.DirectStreamUrl, "/memo/RCTD-740?api_key=bbjavdb-guest");
-      continue;
-    }
     assert.equal(source.Container, "m3u8");
     assert.match(source.DirectStreamUrl, /\/Videos\/42\/stream\.m3u8/);
     assert.doesNotMatch(source.DirectStreamUrl, /source=/);
@@ -5487,7 +5559,7 @@ test("does not persist a thin result after the supplement finishes below target"
   );
 
   const payload = await response.json();
-  assert.equal(payload.MediaSources.length, 3);
+  assert.equal(payload.MediaSources.length, 2);
   assert.equal(
     [...db.rows.keys()].some((key) =>
       key.startsWith("video-persist-v1\u0000")
@@ -5618,7 +5690,7 @@ test("drops pseudo-HLS supplements and keeps validated self-hosted lines", async
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name).sort(),
-    ["原版", "Javtiful 720P", "原版 4K (GetAV)", "MemoJav 302"].sort(),
+    ["原版", "Javtiful 720P", "GetAV 原版 4K"].sort(),
   );
   assert.equal(calls.includes(pseudoImageUrl), false);
 });
@@ -5734,7 +5806,7 @@ test("deduplicates exact cross-source URLs but keeps distinct URLs", async () =>
     new URL(source.Path).searchParams.get("source")
   );
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 4);
+  assert.equal(payload.MediaSources.length, 3);
   assert.equal(sourceUrls.filter((source) => source === sharedUrl).length, 1);
   assert.equal(sourceUrls.includes(publicUrl), true);
   assert.equal(sourceUrls.includes(getavUrl), true);
@@ -5821,13 +5893,13 @@ test("loads Javtiful MP4 qualities in order and probes each stream", async () =>
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["Javtiful 1080P", "Javtiful 720P", "MemoJav 302"],
+    ["Javtiful 1080P", "Javtiful 720P"],
   );
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       source.MediaStreams.find((stream) => stream.Type === "Video").Height
     ),
-    [1080, 720, undefined],
+    [1080, 720],
   );
   assert.equal(calls.filter((target) => target === fullHdUrl).length, 1);
   assert.equal(calls.filter((target) => target === hdUrl).length, 1);
@@ -5928,18 +6000,17 @@ test("loads all GetAV qualities through parallel page requests", async () => {
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
     [
-      "原版 4K (GetAV)",
-      "原版 1080P (GetAV)",
-      "原版 720P (GetAV)",
-      "原版 480P (GetAV)",
-      "MemoJav 302",
+      "GetAV 原版 4K",
+      "GetAV 原版 1080P",
+      "GetAV 原版 720P",
+      "GetAV 原版 480P",
     ],
   );
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       source.MediaStreams.find((stream) => stream.Type === "Video").Height
     ),
-    [2160, 1080, 720, 480, undefined],
+    [2160, 1080, 720, 480],
   );
 });
 
@@ -6122,7 +6193,7 @@ test("embeds a directly streamable media source in movie details", async () => {
 
   const payload = await response.json();
   assert.equal(payload.PlayAccess, "Full");
-  assert.equal(payload.MediaSourceCount, 2);
+  assert.equal(payload.MediaSourceCount, 1);
   assert.match(payload.Path, /\/Videos\/42\/stream\.mp4/);
   assert.equal(payload.MediaSources[0].MediaStreams[1].Type, "Audio");
   assert.equal(payload.MediaSources[0].DefaultSubtitleStreamIndex, 2);
@@ -8733,7 +8804,7 @@ test("keeps the inline GG HLS line next to the self-hosted MP4 on the first scre
     false,
   );
   // 关键断言：内联 HLS 没有被当成不可用线路丢掉，首屏是 2 条。
-  assert.equal(payload.MediaSourceCount, 3);
+  assert.equal(payload.MediaSourceCount, 2);
   const hls = payload.MediaSources.find((source) => source.Container === "m3u8");
   const mp4 = payload.MediaSources.find((source) => source.Container === "mp4");
   assert.ok(hls, "expected the inline GG HLS line on the first screen");
@@ -8863,7 +8934,7 @@ test("keeps waiting when the public resolver fails fast and GetAV lines are stil
     false,
   );
   // 关键断言：没有停在“自建链路第一条”的半成品上，3 条都在首屏。
-  assert.equal(payload.MediaSourceCount, 4);
+  assert.equal(payload.MediaSourceCount, 3);
   const names = payload.MediaSources.map((source) => String(source.Name));
   assert.equal(names.includes("Javtiful 720P"), true);
   assert.equal(

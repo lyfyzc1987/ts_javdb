@@ -190,10 +190,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // （含 D1 持久层，键里含 sources-v4x）都必须失效。
 // v24/v42：HLS 子资源（分片/子清单/密钥）改用“任意公网域名”白名单，并补齐
 // 上游会轮换的 CDN 域名——旧解析结果里那些被 403 的分片地址必须整体失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v29";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v32";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-12-hls-direct-47";
+const SERVER_BUILD_ID = "2026-10-12-provider-labels-50";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -1481,13 +1481,60 @@ async function validatedVideoVariants(
   return playable;
 }
 
+// 上游有些线路（目前只有 fcjav）只给 "原版 / 去码版" 这类裸标签，提供方只写
+// 在 variant 前缀里（fcjav_original / fcjav_reducing_mosaic）。客户端按名称
+// 展示时这几条就和其它提供方的线路混在一起，分不清来源。这里把 variant 里的
+// 提供方提取出来，补成 "fcjav 原版 / fcjav 去码版"。
+// 只认 fcjav：其它提供方（GetAV / 服务器GG）的线路本身就带提供方标签，若从
+// variant 前缀再补一次会变成 "服务器GG javgg 原版" 这种重复前缀。
+const KNOWN_VARIANT_PROVIDERS = new Set([
+  "fcjav",
+]);
+
+function providerNameFromVariant(value) {
+  const variant = String(value || "").trim();
+  const match = variant.match(/^([a-z][a-z0-9-]*)_/i);
+  if (!match) return "";
+  const provider = match[1].toLowerCase();
+  return KNOWN_VARIANT_PROVIDERS.has(provider) ? match[1] : "";
+}
+
+function sourceLabelHasProvider(label, provider) {
+  const value = String(label || "").trim();
+  if (!value) return false;
+  if (new RegExp(`[（(]\\s*${provider}\\s*[）)]`, "i").test(value)) return true;
+  return value.toLowerCase().startsWith(`${provider.toLowerCase()} `);
+}
+
+function providerPrefixedLabel(label, variant) {
+  const provider = providerNameFromVariant(variant);
+  const value = String(label || "").trim();
+  if (!provider || !value || sourceLabelHasProvider(value, provider)) {
+    return value;
+  }
+  return `${provider} ${value}`;
+}
+
+function variantDescriptorLabel(variant, provider) {
+  const value = String(variant || "").trim();
+  if (!value) return "";
+  const descriptor = provider
+    ? value.slice(provider.length + 1).trim() || value
+    : value;
+  if (descriptor === "original") return "原版";
+  if (/reduc|mosaic/i.test(descriptor)) return "去码版";
+  if (/compress|small/i.test(descriptor)) return "压缩版";
+  return descriptor;
+}
+
 function videoVariantLabel(source, index, total) {
   const label = String(source?.label || "").trim();
-  if (label) return label;
+  const prefixed = providerPrefixedLabel(label, source?.variant);
+  if (prefixed) return prefixed;
   const variant = String(source?.variant || "").trim();
-  if (variant === "original") return "原版";
-  if (/reduc|mosaic|compress|small/i.test(variant)) return "压缩版";
-  if (variant) return variant;
+  const provider = providerNameFromVariant(variant);
+  const descriptor = variantDescriptorLabel(variant, provider);
+  if (descriptor) return provider ? `${provider} ${descriptor}` : descriptor;
   return `线路 ${index + 1}`;
 }
 
@@ -6703,7 +6750,10 @@ function videoFromResolverPayloads(payloads, movie, code, env) {
           : item.sourceType || item.source_type || item.mimeType ||
             item.mime_type || "video/mp4",
         inlinePlaylist,
-        label: String(item.label || item.displayName || "").trim(),
+        label: providerPrefixedLabel(
+          String(item.label || item.displayName || "").trim(),
+          item.variant || item.name || item.id,
+        ),
         variant: item.variant || item.name || item.id,
         title: movieDisplayName(movie) || code,
         quality: Number(item.quality || item.height || 0),
@@ -9064,14 +9114,33 @@ function estimatedMediaBitrate(isHls, height) {
   return isHls ? 4_000_000 : 3_000_000;
 }
 
+// 统一“提供方 + 清晰度/版本”的显示顺序。上游把提供方写在括号里
+// （如 “原版 4K (GetAV)”“去码版 (服务器GG)”），在客户端列表里顺序不统一、
+// 长短也不一致；这里统一改成提供方在前的形式：
+//   “原版 4K (GetAV)”      → “GetAV 原版 4K”
+//   “去码版 (服务器GG)”    → “服务器GG 去码版”
+// 已经是提供方在前的名称（MemoJav 1080P / Javtiful 720P）原样保留。
+function providerFirstSourceName(value) {
+  const name = String(value || "").trim();
+  if (!name) return "";
+  const match = name.match(/^(.*?)\s*[（(]\s*([^（()）]+?)\s*[）)]\s*$/);
+  if (!match) return name;
+  const descriptor = match[1].trim();
+  const provider = match[2].trim();
+  if (!descriptor || !provider) return name;
+  return `${provider} ${descriptor}`;
+}
+
 // “解析中”是过渡状态，不应作为媒体信息显示。无论名称来自实时解析、旧缓存
 // 还是上游异常数据，都在 DTO 出口统一移除，保证客户端不会首屏看到该字样。
 function mediaSourceDisplayName(value, fallback) {
-  const clean = (input) => String(input || "")
-    .replace(/[（(]\s*解析中\s*[）)]/g, "")
-    .replace(/解析中/g, "")
-    .replace(/\s{2,}/g, " ")
-    .trim();
+  const clean = (input) => providerFirstSourceName(
+    String(input || "")
+      .replace(/[（(]\s*解析中\s*[）)]/g, "")
+      .replace(/解析中/g, "")
+      .replace(/\s{2,}/g, " ")
+      .trim(),
+  );
   return clean(value) || clean(fallback) || "自动线路";
 }
 
@@ -9208,7 +9277,7 @@ function mediaSource(
     Id: mediaSourceId,
     MediaSourceId: mediaSourceId,
     Name: mediaSourceDisplayName(
-      video.sourceName || video.title,
+      providerPrefixedLabel(video.sourceName || video.title, video.variant),
       item.Name,
     ),
     Path: streamUrl.toString(),
@@ -9313,14 +9382,9 @@ function mediaSourceIdForIndex(itemId, index) {
 //   - mp4 资源：1080P / 720P / 360P 三条真实清晰度；
 //   - hls 资源：上游只有一条 master.m3u8，另外补一条明确标注的
 //     “MemoJav 代理”兜底源（走本服务反代），不伪造清晰度。
-// 解析失败或超时时退回一条裸短链（与旧行为一致），保证播放按钮始终存在。
-const MEMOJAV_FALLBACK_SOURCE = {
-  id: "",
-  name: "MemoJav 302",
-  kind: "hls",
-  container: "m3u8",
-  height: 0,
-};
+// 解析失败或超时时不再补“MemoJav 302”这种占位死源（上游返回 404 时
+// 客户端点开会一直转圈），直接不产出 MemoJav 线路；详情页仍由公共解析器
+// 和 GetAV 线路兜底，全部拿不到时再走“自动线路”占位。
 
 function memoJavSubtitleStreams(item, requestUrl, token, subtitles) {
   return subtitles.map((subtitle, index) => {
@@ -9368,10 +9432,10 @@ function memoJavMediaSources(
   if (!normalizedCode || !/^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(normalizedCode)) {
     return [];
   }
-  const resolved =
-    Array.isArray(info?.sources) && info.sources.length
-      ? info.sources
-      : [MEMOJAV_FALLBACK_SOURCE];
+  // 解析失败 / 超时 / 上游 404 时不再插入占位死源：没有真实线路就不产出
+  // MemoJav 条目，避免客户端点开一条永远转圈的“MemoJav 302”。
+  const resolved = Array.isArray(info?.sources) ? info.sources : [];
+  if (!resolved.length) return [];
   const subtitleStreams = memoJavSubtitleStreams(item, requestUrl, token, subtitles);
   return resolved.map((entry) => {
     const memoUrl = new URL(
@@ -9391,13 +9455,13 @@ function memoJavMediaSources(
     const sizeSeconds = runtimeTicks > 0 ? runtimeTicks / 10_000_000 : 3600;
     const size = Math.max(1, Math.round((sizeSeconds * bitrate) / 8));
     const width = height > 0 ? Math.round((height * 16) / 9 / 2) * 2 : undefined;
-    const sourceKey = String(entry.id || "302").replace(/[^a-z0-9-]/gi, "");
-    const mediaSourceId = `${item.Id}-memojav-${sourceKey || "302"}`;
+    const sourceKey = String(entry.id || "line").replace(/[^a-z0-9-]/gi, "");
+    const mediaSourceId = `${item.Id}-memojav-${sourceKey || "line"}`;
     const isMp4 = entry.kind === "mp4" || entry.container === "mp4";
     return {
       Id: mediaSourceId,
       MediaSourceId: mediaSourceId,
-      Name: entry.name || "MemoJav 302",
+      Name: providerFirstSourceName(entry.name) || "MemoJav",
       Path: memoUrl.toString(),
       DirectStreamUrl: directUrl,
       Protocol: "Http",
