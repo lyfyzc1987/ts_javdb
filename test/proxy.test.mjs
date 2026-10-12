@@ -298,7 +298,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v26",
+    version: "item-dto-v27",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -3974,6 +3974,213 @@ test("merges public resolver sources with GetAV qualities when the CDN requires 
   assert.equal(new Set(sourceUrls).size, 5);
   assert.equal(sourceUrls.filter((source) => source === getav4kUrl).length, 1);
   assert.equal(sourceUrls.filter((source) => source === getav1080Url).length, 1);
+});
+
+test("GetAV sources use 302 for compatible players and proxy fallback for okhttp", async () => {
+  const getavUrl = "https://static.worldstatic.com/rctd-740/1080/index.txt";
+  const getav720Url = "https://static.worldstatic.com/rctd-740/720/index.txt";
+  const readerUrl = "https://r.jina.ai/https://getav.net/zh/videos/rctd-740";
+  const pageUrl = "https://getav.net/zh/videos/rctd-740";
+  const manifest = [
+    "#EXTM3U",
+    "#EXT-X-TARGETDURATION:6",
+    "#EXTINF:6,",
+    "segment.ts",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const fetchImpl = async (url, init = {}) => {
+    const target = String(url);
+    if (target.includes("/v4/movies/42")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: { movie: { id: 42, number: "RCTD-740", title: "RCTD-740 Test" } },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes(`${RESOLVER}/api/v/resolve?code=RCTD-740`)) {
+      return new Response(
+        JSON.stringify({
+          variants: [{
+            variant: "getav_raw_1080p",
+            label: "原版 1080P (GetAV)",
+            sourceUrl: getavUrl,
+            sourceType: "application/vnd.apple.mpegurl",
+            quality: 1080,
+          }, {
+            variant: "getav_raw_720p",
+            label: "原版 720P (GetAV)",
+            sourceUrl: getav720Url,
+            sourceType: "application/vnd.apple.mpegurl",
+            quality: 720,
+          }],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target === "https://javtiful.com/zh/search?q=RCTD-740") {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target === readerUrl || target === pageUrl) {
+      return new Response(
+        `<html><title>RCTD-740 Test | GetAV</title>${JSON.stringify({
+          videoSources: [{
+            movieId: "RCTD-740",
+            type: "raw_1080p",
+            url: getavUrl,
+            quality: 1080,
+          }, {
+            movieId: "RCTD-740",
+            type: "raw_720p",
+            url: getav720Url,
+            quality: 720,
+          }],
+        })}</html>`,
+        { headers: { "content-type": "text/html" } },
+      );
+    }
+    if (target === getavUrl || target === getav720Url) {
+      return new Response(manifest, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    }
+    if (target.endsWith("/segment.ts")) {
+      return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+        status: 206,
+        headers: { "content-type": "video/mp2t" },
+      });
+    }
+    if (target.includes("memojav.org/hls/get_video_info.php")) {
+      return new Response("not found", { status: 404 });
+    }
+    if (target.includes("/api/subtitle?name=RCTD-740")) {
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const playbackInfo = (userAgent) => handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+      headers: { "user-agent": userAgent },
+    }),
+    {
+      RESOLVER_MERGE_BUDGET_MS: 50,
+      SELF_HOSTED_MERGE_BUDGET_MS: 50,
+      REMOTE_HLS_VALIDATION_BUDGET_MS: 1000,
+    },
+    {},
+    fetchImpl,
+  );
+
+  const embyResponse = await playbackInfo("Emby/4.8.0.0");
+  assert.equal(embyResponse.status, 200);
+  const embyPayload = await embyResponse.json();
+  const embyGetavSources = embyPayload.MediaSources.filter((source) =>
+    [getavUrl, getav720Url].includes(
+      new URL(source.Path).searchParams.get("source"),
+    )
+  );
+  assert.equal(embyGetavSources.length, 2);
+  assert.deepEqual(
+    embyGetavSources.map((source) => source.Name).sort(),
+    ["原版 1080P (GetAV)", "原版 720P (GetAV)"],
+  );
+  assert.deepEqual(
+    embyGetavSources
+      .map((source) => source.MediaStreams[0].Height)
+      .sort((left, right) => left - right),
+    [720, 1080],
+  );
+  for (const source of embyGetavSources) {
+    assert.equal(new URL(source.Path).pathname, "/getav/42");
+    assert.equal(
+      new URL(source.DirectStreamUrl, "https://clone.example").pathname,
+      "/getav/42",
+    );
+  }
+
+  resetEmbyCachesForTests();
+  const okhttpResponse = await playbackInfo("okhttp/4.12.0");
+  assert.equal(okhttpResponse.status, 200);
+  const okhttpPayload = await okhttpResponse.json();
+  const okhttpGetavSources = okhttpPayload.MediaSources.filter((source) =>
+    [getavUrl, getav720Url].includes(
+      new URL(source.Path).searchParams.get("source"),
+    )
+  );
+  assert.equal(okhttpGetavSources.length, 2);
+  for (const source of okhttpGetavSources) {
+    assert.equal(
+      new URL(source.Path).pathname,
+      "/Videos/42/stream.m3u8",
+    );
+  }
+});
+
+test("GetAV short links redirect compatible players and proxy incompatible ones", async () => {
+  const upstreamUrl = "https://static.worldstatic.com/rctd-740/1080/index.txt";
+  const shortUrl =
+    `https://clone.example/getav/42?source=${encodeURIComponent(upstreamUrl)}` +
+    "&sourceType=application%2Fvnd.apple.mpegurl&mediaSourceId=test";
+
+  const directResponse = await handleProxy(
+    new Request(shortUrl, {
+      headers: { "user-agent": "Infuse-Direct/7.8" },
+    }),
+    {},
+    {},
+    () => {
+      throw new Error("fetch must not be called");
+    },
+  );
+  assert.equal(directResponse.status, 302);
+  assert.equal(directResponse.headers.get("location"), upstreamUrl);
+
+  const fallbackResponse = await handleProxy(
+    new Request(shortUrl, {
+      headers: { "user-agent": "okhttp/4.12.0" },
+    }),
+    {},
+    {},
+    () => {
+      throw new Error("fetch must not be called");
+    },
+  );
+  assert.equal(fallbackResponse.status, 302);
+  const fallbackUrl = new URL(fallbackResponse.headers.get("location"));
+  assert.equal(fallbackUrl.origin, "https://clone.example");
+  assert.equal(fallbackUrl.pathname, "/emby-media/");
+  assert.equal(fallbackUrl.searchParams.get("url"), upstreamUrl);
+  assert.equal(fallbackUrl.searchParams.get("depth"), "0");
+  assert.equal(fallbackUrl.searchParams.get("hls"), "1");
+  assert.equal(
+    fallbackUrl.searchParams.get("sourceType"),
+    "application/vnd.apple.mpegurl",
+  );
+  assert.equal(fallbackUrl.searchParams.get("kind"), "manifest");
+});
+
+test("GetAV short links reject non-GetAV media URLs", async () => {
+  const response = await handleProxy(
+    new Request(
+      "https://clone.example/getav/42?source=" +
+        encodeURIComponent("https://fast-stream.jav.si/not-getav.mp4"),
+    ),
+    {},
+    {},
+    () => {
+      throw new Error("fetch must not be called");
+    },
+  );
+
+  assert.equal(response.status, 400);
 });
 
 test("keeps a public source when self-hosted supplement times out", async () => {

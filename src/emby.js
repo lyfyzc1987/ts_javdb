@@ -115,9 +115,25 @@ const MEDIA_SUFFIXES = [
 ];
 const GETAV_MEDIA_ORIGIN = "https://getav.net";
 const GETAV_MEDIA_REFERER = `${GETAV_MEDIA_ORIGIN}/`;
-// GetAV 的媒体 CDN 会拦截 Emby/curl 等客户端 UA，但接受稳定的浏览器 UA。
-// 这里不能透传客户端请求头，否则分片会变成 Cloudflare 403/1022 错误页。
+// GetAV 的媒体 CDN 会拦截 okhttp/curl 等客户端 UA，但接受浏览器 UA 以及
+// VLC/Emby/Infuse/ExoPlayer/Lavf 等播放器 UA。代理兜底时必须统一使用稳定的
+// 浏览器 UA，否则分片会变成 Cloudflare 403/1022 错误页。
 const GETAV_MEDIA_USER_AGENT = "Mozilla/5.0";
+// 只有上游 CDN 明确接受的 UA 才允许走 302 直链，实现零 Worker 媒体流量。
+// 其余 UA（okhttp/curl/未知客户端）继续走同源代理，避免上游 403。
+const GETAV_DIRECT_USER_AGENTS = new Set([
+  "mozilla",
+  "vlc",
+  "lavf",
+  "emby",
+  "infuse",
+  "exoplayer",
+  "exoplayerlib",
+  "libmpv",
+  "mpv",
+  "stagefright",
+]);
+const GETAV_REDIRECT_ROUTE = "/getav";
 const INLINE_HLS_CONTENT_TYPES = new Set([
   "application/mpegurl",
   "application/vnd.apple.mpegurl",
@@ -170,10 +186,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // （含 D1 持久层，键里含 sources-v4x）都必须失效。
 // v24/v42：HLS 子资源（分片/子清单/密钥）改用“任意公网域名”白名单，并补齐
 // 上游会轮换的 CDN 域名——旧解析结果里那些被 403 的分片地址必须整体失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v26";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v27";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-12-memojav-multisource-44";
+const SERVER_BUILD_ID = "2026-10-12-getav-302-45";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -1517,7 +1533,7 @@ function decodeInlineHls(value) {
 function mediaProxyGetavMediaProfile(sourceUrl) {
   try {
     const host = new URL(sourceUrl).hostname.toLowerCase();
-    // GetAV 的媒体 CDN 会对缺少站内 Referer、Origin 或非浏览器 UA 的请求返回 403。
+    // GetAV 的媒体 CDN 会对不兼容的 User-Agent 返回 403。
     if (host === "worldstatic.com" || host.endsWith(".worldstatic.com")) {
       return {
         origin: GETAV_MEDIA_ORIGIN,
@@ -1527,6 +1543,26 @@ function mediaProxyGetavMediaProfile(sourceUrl) {
     }
   } catch {}
   return null;
+}
+
+function isGetavMediaSourceUrl(sourceUrl) {
+  return Boolean(mediaProxyGetavMediaProfile(sourceUrl));
+}
+
+// 302 直链无法替客户端改写 User-Agent，因此只有上游 CDN 明确接受的首段
+// UA（浏览器 / VLC / Emby / Infuse / ExoPlayer / Lavf）才走直链。okhttp、
+// curl、空 UA 或未知播放器统一回退到同源代理，代理侧会改成 Mozilla/5.0。
+function getavClientAllowsDirectRedirect(userAgent) {
+  const normalized = String(userAgent || "").trim().toLowerCase();
+  if (!normalized) return false;
+  // 播放器 UA 不一定是首段产品名，例如：
+  //   "Infuse-Direct/7.8" / "ExoPlayerLib/1.5.1"
+  // 因此按产品 token 匹配，而不是只看 UA 的第一个斜杠前片段。
+  const products = normalized.match(/[a-z0-9][a-z0-9._-]*/g) || [];
+  return products.some((product) => {
+    if (GETAV_DIRECT_USER_AGENTS.has(product)) return true;
+    return product === "infuse-direct";
+  });
 }
 
 function mediaProxyRequestHeaders(request, env, sourceUrl = "", options = {}) {
@@ -8963,7 +8999,15 @@ function mediaSourceDisplayName(value, fallback) {
   return clean(value) || clean(fallback) || "自动线路";
 }
 
-function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = item.Id) {
+function mediaSource(
+  item,
+  requestUrl,
+  token,
+  video,
+  subtitles = [],
+  sourceId = item.Id,
+  clientUserAgent = "",
+) {
   const isHls = Boolean(
     video.inlinePlaylist ||
       /mpegurl|m3u8/i.test(video.sourceType || video.sourceUrl),
@@ -8993,7 +9037,7 @@ function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = 
   const size = Number.isFinite(explicitSize) && explicitSize > 0
     ? Math.round(explicitSize)
     : Math.max(1, Math.round((sizeSeconds * bitrate) / 8));
-  const buildStreamUrl = (extension) => {
+  const buildProxyStreamUrl = (extension) => {
     const url = new URL(
       publicRoutePath(
         requestUrl,
@@ -9010,7 +9054,30 @@ function mediaSource(item, requestUrl, token, video, subtitles = [], sourceId = 
     }
     return url;
   };
-  const streamUrl = buildStreamUrl(streamExtension);
+  // GetAV 的 CDN 在兼容 UA 下可以直接 302 到真实地址，媒体流量不经过
+  // Worker；不兼容的 UA 继续使用 /Videos/{id}/stream 代理路径，由代理侧
+  // 统一改写请求头。同一条清晰度只会生成一个 MediaSource，避免重复源。
+  const buildGetavRedirectUrl = () => {
+    const url = new URL(
+      publicRoutePath(
+        requestUrl,
+        `${GETAV_REDIRECT_ROUTE}/${encodeURIComponent(item.Id)}`,
+      ),
+      requestUrl,
+    );
+    url.searchParams.set("source", video.sourceUrl);
+    url.searchParams.set("sourceType", video.sourceType || "video/mp4");
+    url.searchParams.set("mediaSourceId", mediaSourceId);
+    url.searchParams.set("api_key", token);
+    return url;
+  };
+  const useGetavRedirect =
+    Boolean(video.sourceUrl) &&
+    isGetavMediaSourceUrl(video.sourceUrl) &&
+    getavClientAllowsDirectRedirect(clientUserAgent);
+  const streamUrl = useGetavRedirect
+    ? buildGetavRedirectUrl()
+    : buildProxyStreamUrl(streamExtension);
   const subtitleStreams = subtitles.map((subtitle, index) => {
     const streamIndex = index + 2;
     const deliveryUrl = new URL(
@@ -9358,8 +9425,18 @@ async function mediaSourcesForVideo(
   video,
   subtitles = [],
   memo = {},
+  clientUserAgent = "",
 ) {
-  return mediaSourcesForMovie(item, requestUrl, token, video, subtitles, null, memo);
+  return mediaSourcesForMovie(
+    item,
+    requestUrl,
+    token,
+    video,
+    subtitles,
+    null,
+    memo,
+    clientUserAgent,
+  );
 }
 
 async function mediaSourcesForMovie(
@@ -9370,6 +9447,7 @@ async function mediaSourcesForMovie(
   subtitles = [],
   movie = null,
   memo = {},
+  clientUserAgent = "",
 ) {
   const variants = playbackVariants(video);
   const sources = variants.map((variant, index) =>
@@ -9384,6 +9462,7 @@ async function mediaSourcesForMovie(
       },
       subtitles,
       mediaSourceIdForIndex(item.Id, index),
+      clientUserAgent,
     ));
   let memoInfo = null;
   if (memo && memo.env) {
@@ -9421,7 +9500,13 @@ async function mediaSourcesForMovie(
 // “自动线路（解析中）”字样，播放按钮仍然保留（走取流接口现场解析）。
 const PENDING_MEDIA_SOURCE_NAME = "自动线路";
 
-function pendingMediaSources(item, requestUrl, token, subtitles = []) {
+function pendingMediaSources(
+  item,
+  requestUrl,
+  token,
+  subtitles = [],
+  clientUserAgent = "",
+) {
   return [
     mediaSource(
       item,
@@ -9430,6 +9515,7 @@ function pendingMediaSources(item, requestUrl, token, subtitles = []) {
       { sourceName: PENDING_MEDIA_SOURCE_NAME },
       subtitles,
       item.Id,
+      clientUserAgent,
     ),
   ];
 }
@@ -9809,6 +9895,16 @@ function trackResolution(promise) {
   return { tracked, record };
 }
 
+// 播放源 DTO 生成时要看客户端 UA：只有上游 GetAV CDN 接受的 UA 才给 302
+// 短链，其余 UA 继续走代理，避免播放器拿到 403 的直链。
+function clientUserAgent(request) {
+  try {
+    return String(request?.headers?.get?.("user-agent") || "");
+  } catch {
+    return "";
+  }
+}
+
 async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   // 演员条目：Id 为 person:<演员名> 时直接返回 Person 对象，不当作影片回源。
   const personNameFromId = personNameFromItemId(id);
@@ -9885,6 +9981,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   }
 
   const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
+  const requestUserAgent = clientUserAgent(request);
 
   if (!video) {
     // 不论是「解析还在后台继续」「上游临时失败」还是「解析已经跑完但这一轮
@@ -9900,7 +9997,13 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     // 再转发；PlayAccess 保持 Full；ETag 带 20 秒时间桶（pendingSources），
     // 客户端最迟 20 秒后重进详情页就会重新拉取，上游恢复或新片源上线时能自动
     // 变成真实线路，也不会再清空本地播放记录。
-    const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
+    const sources = pendingMediaSources(
+      item,
+      request.url,
+      playbackToken,
+      subtitles,
+      requestUserAgent,
+    );
     item.MediaSources = sources;
     item.MediaStreams = sources[0].MediaStreams;
     item.MediaSourceCount = sources.length;
@@ -9927,6 +10030,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
         remainingRequestMs(requestDeadline, MEMOJAV_EMBY_RESOLVE_BUDGET_MS),
       ),
     },
+    requestUserAgent,
   );
   const source = mediaSources[0];
   item.Path = source.Path;
@@ -11959,8 +12063,63 @@ async function streamResponse(id, request, env, fetchImpl, token, ctx = null) {
   }
 }
 
+// /getav/<id>?source=<真实地址> 是 GetAV 的“MemoJav 式”短链：
+//   - 兼容 UA（浏览器/VLC/Emby/Infuse/ExoPlayer/Lavf）直接 302 到上游，
+//     HLS 清单和分片都不经过 Worker，实现零媒体流量；
+//   - 不兼容 UA（okhttp/curl/未知客户端）302 回同源 /emby-media/ 代理，
+//     由代理统一改写 User-Agent/Referer，避免上游 403。
+// 路由本身不做解析，真实地址由 MediaSource 构造时带过来，因此没有额外回源。
+function getavRedirectResponse(request, env, requestUrl) {
+  const sourceValue = requestUrl.searchParams.get("source") ||
+    requestUrl.searchParams.get("sourceUrl") ||
+    "";
+  const sourceUrl = safeMediaUrl(sourceValue, env);
+  if (!sourceUrl || !isGetavMediaSourceUrl(sourceUrl.toString())) {
+    return errorResponse(400, "GetAV source URL is required");
+  }
+
+  const userAgent = clientUserAgent(request);
+  if (getavClientAllowsDirectRedirect(userAgent)) {
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: sourceUrl.toString(),
+        "cache-control": "no-store",
+        "access-control-allow-origin": "*",
+      },
+    });
+  }
+
+  // 代理兜底：保持和 /Videos/{id}/stream 完全相同的上游请求头与 HLS 重写逻辑，
+  // 只把入口换成 /emby-media/。
+  const proxyUrl = new URL(
+    publicRoutePath(requestUrl, "/emby-media/"),
+    requestUrl,
+  );
+  proxyUrl.searchParams.set("url", sourceUrl.toString());
+  proxyUrl.searchParams.set("depth", "0");
+  proxyUrl.searchParams.set("hls", "1");
+  const sourceType = String(requestUrl.searchParams.get("sourceType") || "");
+  if (sourceType) {
+    proxyUrl.searchParams.set("sourceType", sourceType);
+  }
+  if (isHlsManifestSource(sourceUrl.toString(), sourceType)) {
+    proxyUrl.searchParams.set("kind", "manifest");
+  }
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: proxyUrl.toString(),
+      "cache-control": "no-store",
+      "access-control-allow-origin": "*",
+    },
+  });
+}
+
 function isHandledPath(path) {
   return (
+    path === GETAV_REDIRECT_ROUTE ||
+    path.startsWith(`${GETAV_REDIRECT_ROUTE}/`) ||
     path === "/System/Info/Public" ||
     path === "/System/Info" ||
     path === "/System/Endpoint" ||
@@ -12381,6 +12540,10 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
         "access-control-allow-headers": "*",
       },
     });
+  }
+
+  if (path === GETAV_REDIRECT_ROUTE || path.startsWith(`${GETAV_REDIRECT_ROUTE}/`)) {
+    return getavRedirectResponse(request, env, url);
   }
 
   const deviceFailure = await deviceBindingFailure(request, url, env, path);
@@ -13114,6 +13277,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       );
       const item = mapMovie(movie, request.url, env);
       const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
+      const requestUserAgent = clientUserAgent(request);
       const subtitleResolution = trackResolution(
         resolveSubtitlesCached(movie, env, fetchImpl).catch(() => []),
       );
@@ -13161,7 +13325,13 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
         // 弹 “Connection timeout, try again later”，并把本地播放记录/进度条
         // 一起清掉。占位线路的 Path 不带 source 参数，播放时由 /Videos/{id}/stream
         // 现场解析真实地址并转发，所以生成播放会话是安全的。
-        const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
+        const sources = pendingMediaSources(
+          item,
+          request.url,
+          playbackToken,
+          subtitles,
+          requestUserAgent,
+        );
         const playSessionId = crypto.randomUUID();
         rememberPlaySession(
           await playbackStateKey(env, playbackToken),
@@ -13191,9 +13361,16 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
             remainingRequestMs(requestDeadline, MEMOJAV_EMBY_RESOLVE_BUDGET_MS),
           ),
         },
+        requestUserAgent,
       );
       if (!mediaSources.length) {
-        const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);
+        const sources = pendingMediaSources(
+          item,
+          request.url,
+          playbackToken,
+          subtitles,
+          requestUserAgent,
+        );
         const playSessionId = crypto.randomUUID();
         rememberPlaySession(
           await playbackStateKey(env, playbackToken),
