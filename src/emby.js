@@ -190,10 +190,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // （含 D1 持久层，键里含 sources-v4x）都必须失效。
 // v24/v42：HLS 子资源（分片/子清单/密钥）改用“任意公网域名”白名单，并补齐
 // 上游会轮换的 CDN 域名——旧解析结果里那些被 403 的分片地址必须整体失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v28";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v29";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-12-direct-46";
+const SERVER_BUILD_ID = "2026-10-12-hls-direct-47";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -3246,6 +3246,47 @@ function rewriteHlsTagUris(line, baseUrl, requestUrl, depth) {
   );
 }
 
+// 判定一个 HLS 分片 URI 是否必须经过 Worker 代理。
+// 普通的 .ts / .m4s / .mp4 分片可以直连上游，实现零 Worker 媒体流量。
+// 以下三类必须代理：
+//   1) .image 伪 HLS 分片（PNG 外壳需要剥离，否则花屏/跳段）
+//   2) 字体文件（可能同时用作 AES-128 密钥或加密分片，需要解码）
+//   3) 图片文件（可能是伪装成图片的伪 HLS 数据）
+function hlsSegmentShouldProxy(url) {
+  const pathname = url.pathname.toLowerCase();
+  return HLS_FONT_RESOURCE_PATTERN.test(pathname) ||
+    HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname) ||
+    HLS_IMAGE_RESOURCE_PATTERN.test(pathname);
+}
+
+function hlsSegmentDirectUrl(line, baseUrl, requestUrl, depth, encrypted) {
+  let target;
+  try {
+    target = new URL(line, baseUrl);
+  } catch {
+    return hlsProxyUrl(line, baseUrl, requestUrl, depth, {
+      hls: true,
+      kind: "segment",
+      encrypted,
+    });
+  }
+  if (target.protocol !== "https:" && target.protocol !== "http:") {
+    return hlsProxyUrl(line, baseUrl, requestUrl, depth, {
+      hls: true,
+      kind: "segment",
+      encrypted,
+    });
+  }
+  if (hlsSegmentShouldProxy(target)) {
+    return hlsProxyUrl(line, baseUrl, requestUrl, depth, {
+      hls: true,
+      kind: "segment",
+      encrypted,
+    });
+  }
+  return target.toString();
+}
+
 function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth) {
   const source = String(playlist || "");
   if (!source.trimStart().startsWith("#EXTM3U")) {
@@ -3277,11 +3318,16 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth) {
     }
     const kind = nextUriKind || "segment";
     nextUriKind = "";
-    output.push(hlsProxyUrl(line, baseUrl, requestUrl, depth, {
-      hls: true,
-      kind,
-      encrypted,
-    }));
+    if (kind === "segment") {
+      output.push(hlsSegmentDirectUrl(line, baseUrl, requestUrl, depth, encrypted));
+    } else {
+      // 子清单（master -> variant）仍走代理，便于继续重写子清单。
+      output.push(hlsProxyUrl(line, baseUrl, requestUrl, depth, {
+        hls: true,
+        kind,
+        encrypted,
+      }));
+    }
   }
   return output.join("\n");
 }

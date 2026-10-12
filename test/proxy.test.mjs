@@ -298,7 +298,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v28",
+    version: "item-dto-v29",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -6283,11 +6283,7 @@ test("serves inline HLS variants through a short Emby stream URL", async () => {
   assert.equal(stream.status, 200);
   assert.match(stream.headers.get("content-type"), /application\/vnd\.apple\.mpegurl/);
   const rewritten = await stream.text();
-  assert.match(
-    rewritten,
-    /\/emby-media\/\?url=https%3A%2F%2Fmedia\.example%2Fsegment\.ts(?:&|&amp;|$)/,
-  );
-  assert.doesNotMatch(rewritten, /^https:\/\/media\.example\/segment\.ts/m);
+  assert.match(rewritten, /^https:\/\/media\.example\/segment\.ts$/m);
 });
 
 test("rewrites master and child HLS manifests through the local media proxy", async () => {
@@ -6359,10 +6355,43 @@ test("rewrites master and child HLS manifests through the local media proxy", as
   assert.equal(childResponse.status, 200);
   assert.equal(new Headers(childRequestHeaders).get("range"), null);
   const rewrittenChild = await childResponse.text();
-  for (const target of [keyUrl, initUrl, segmentUrl]) {
-    assert.ok(rewrittenChild.includes(encodeURIComponent(target)), target);
-  }
+  assert.ok(rewrittenChild.includes(encodeURIComponent(keyUrl)), keyUrl);
+  assert.ok(rewrittenChild.includes(encodeURIComponent(initUrl)), initUrl);
+  assert.ok(rewrittenChild.includes(segmentUrl), segmentUrl);
   assert.deepEqual(calls, [masterUrl, videoChildUrl]);
+});
+
+test("rewrites normal HLS segments as direct upstream URLs", async () => {
+  const manifestUrl = "https://fast-stream.jav.si/live/index.m3u8";
+  const segmentUrl = "https://fast-stream.jav.si/live/segments/one.ts?token=abc";
+  const pseudoUrl = "https://fast-stream.jav.si/live/segments/two.image";
+  const playlist = [
+    "#EXTM3U",
+    "#EXTINF:6,",
+    "segments/one.ts?token=abc",
+    "#EXTINF:6,",
+    "segments/two.image",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(manifestUrl)}&hls=1&kind=manifest`,
+    ),
+    {},
+    {},
+    async () => new Response(playlist, {
+      headers: { "content-type": "application/vnd.apple.mpegurl" },
+    }),
+  );
+  assert.equal(response.status, 200);
+  const rewritten = await response.text();
+  assert.ok(rewritten.includes(segmentUrl), segmentUrl);
+  assert.ok(rewritten.includes(encodeURIComponent(pseudoUrl)), pseudoUrl);
+  assert.match(
+    rewritten,
+    /\/emby-media\/\?url=https%3A%2F%2Ffast-stream\.jav\.si%2Flive%2Fsegments%2Ftwo\.image/,
+  );
 });
 
 test("rewrites a 206 HLS manifest for an explicit manifest request", async () => {
@@ -9254,7 +9283,7 @@ test("serves Emby master/main HLS aliases instead of 404", async () => {
     assert.equal(response.status, 200, `${alias} should not 404`);
     const body = await response.text();
     assert.match(body, /#EXTM3U/);
-    assert.match(body, /emby-media/);
+    assert.match(body, /https:\/\/fast-stream\.jav\.si\/seg\/1\.ts/);
   }
   assert.ok(calls.length >= 2);
 });
