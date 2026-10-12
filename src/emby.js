@@ -168,10 +168,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // （含 D1 持久层，键里含 sources-v4x）都必须失效。
 // v24/v42：HLS 子资源（分片/子清单/密钥）改用“任意公网域名”白名单，并补齐
 // 上游会轮换的 CDN 域名——旧解析结果里那些被 403 的分片地址必须整体失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v25";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v26";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-12-media-stream-consistency-42";
+const SERVER_BUILD_ID = "2026-10-12-memojav-shortlink-43";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -9140,6 +9140,122 @@ function mediaSourceIdForIndex(itemId, index) {
   ].join("-");
 }
 
+// MemoJav 302 直连源：Path/DirectStreamUrl 直接指向 /memo/<番号>。
+// 播放器请求这个裸短链时服务端只回 302，清单和分片都直达上游，
+// 不经过 /Videos/{id}/stream，也不产生 /emby-media/ 反代流量。
+function memoJavMediaSource(item, requestUrl, token, video, subtitles = [], movie = null) {
+  const code = movieResolveCode(movie || item.movie || item);
+  const normalizedCode = String(code || "").trim().toUpperCase();
+  if (!normalizedCode || !/^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(normalizedCode)) {
+    return null;
+  }
+  const memoUrl = new URL(
+    publicRoutePath(requestUrl, `/memo/${encodeURIComponent(normalizedCode)}`),
+    requestUrl,
+  );
+  memoUrl.searchParams.set("api_key", token);
+  const directUrl = `${memoUrl.pathname}${memoUrl.search}`;
+  const height = Number(video?.quality || 0);
+  const bitrate = estimatedMediaBitrate(true, height);
+  const runtimeTicks = Math.max(
+    0,
+    Number(video?.RunTimeTicks) || Number(item?.RunTimeTicks) || 0,
+  );
+  const sizeSeconds = runtimeTicks > 0 ? runtimeTicks / 10_000_000 : 3600;
+  const size = Math.max(1, Math.round((sizeSeconds * bitrate) / 8));
+  const width = height > 0 ? Math.round((height * 16) / 9 / 2) * 2 : undefined;
+  const subtitleStreams = subtitles.map((subtitle, index) => {
+    const streamIndex = index + 2;
+    const deliveryUrl = new URL(
+      publicRoutePath(
+        requestUrl,
+        `/Videos/${encodeURIComponent(item.Id)}/${encodeURIComponent(item.Id)}/Subtitles/${streamIndex}/Stream.${subtitle.codec}`,
+      ),
+      requestUrl,
+    );
+    deliveryUrl.searchParams.set("api_key", token);
+    deliveryUrl.searchParams.set("sid", subtitleStreamToken(item.Id, subtitle, index));
+    return {
+      Type: "Subtitle",
+      Codec: subtitle.codec,
+      Language: "chi",
+      DisplayLanguage: "中文",
+      Title: subtitle.title,
+      DisplayTitle: subtitle.title,
+      Index: streamIndex,
+      IsDefault: index === 0,
+      IsForced: false,
+      IsExternal: true,
+      IsExternalUrl: false,
+      IsTextSubtitleStream: true,
+      SupportsExternalStream: true,
+      DeliveryMethod: "External",
+      DeliveryUrl: `${deliveryUrl.pathname}${deliveryUrl.search}`,
+    };
+  });
+  return {
+    Id: `${item.Id}-memojav-302`,
+    MediaSourceId: `${item.Id}-memojav-302`,
+    Name: "MemoJav 302",
+    Path: memoUrl.toString(),
+    DirectStreamUrl: directUrl,
+    Protocol: "Http",
+    Type: "Default",
+    Container: "m3u8",
+    VideoType: "VideoFile",
+    IsRemote: true,
+    SupportsDirectPlay: true,
+    SupportsDirectStream: true,
+    SupportsTranscoding: false,
+    SupportsProbing: false,
+    RequiresOpening: false,
+    RequiresClosing: false,
+    RequiredHttpHeaders: {},
+    RunTimeTicks: item.RunTimeTicks,
+    Bitrate: bitrate,
+    Size: size,
+    DefaultAudioStreamIndex: 1,
+    DefaultSubtitleStreamIndex: subtitleStreams[0]?.Index,
+    MediaStreams: [
+      {
+        Type: "Video",
+        Codec: "h264",
+        DisplayTitle: height > 0 ? `${height}p H264 SDR` : "H264 SDR",
+        IsDefault: true,
+        IsForced: false,
+        IsExternal: false,
+        Index: 0,
+        Width: width,
+        Height: height || undefined,
+        BitRate: bitrate,
+        AspectRatio: "16:9",
+        VideoRange: "SDR",
+        VideoRangeType: "SDR",
+        IsInterlaced: false,
+        IsAVC: true,
+        IsAnamorphic: false,
+        TimeBase: "1/10000000",
+      },
+      {
+        Type: "Audio",
+        Codec: "aac",
+        CodecTag: "mp4a",
+        Language: "und",
+        DisplayLanguage: "Undetermined",
+        DisplayTitle: "AAC stereo",
+        IsDefault: true,
+        IsForced: false,
+        IsExternal: false,
+        Index: 1,
+        Channels: 2,
+        ChannelLayout: "stereo",
+        SampleRate: 48000,
+      },
+      ...subtitleStreams,
+    ],
+  };
+}
+
 function mediaSourceVariantIndex(itemId, mediaSourceId, variantCount = 0) {
   const base = String(itemId || "");
   const value = String(mediaSourceId || "").trim();
@@ -9176,8 +9292,12 @@ function selectedPlaybackVideo(video, itemId, requestUrl) {
 }
 
 function mediaSourcesForVideo(item, requestUrl, token, video, subtitles = []) {
+  return mediaSourcesForMovie(item, requestUrl, token, video, subtitles, null);
+}
+
+function mediaSourcesForMovie(item, requestUrl, token, video, subtitles = [], movie = null) {
   const variants = playbackVariants(video);
-  return variants.map((variant, index) =>
+  const sources = variants.map((variant, index) =>
     mediaSource(
       item,
       requestUrl,
@@ -9190,6 +9310,11 @@ function mediaSourcesForVideo(item, requestUrl, token, video, subtitles = []) {
       subtitles,
       mediaSourceIdForIndex(item.Id, index),
     ));
+  const memoSource = memoJavMediaSource(item, requestUrl, token, video, subtitles, movie);
+  if (memoSource) {
+    sources.push(memoSource);
+  }
+  return sources;
 }
 
 // 播放源还在后台解析时用的“按需线路”。
@@ -9693,12 +9818,13 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     refreshDetailBackdropTags(item, movie);
     return itemJsonResponse(item, request, { pendingSources: true });
   }
-  const mediaSources = mediaSourcesForVideo(
+  const mediaSources = mediaSourcesForMovie(
     item,
     request.url,
     playbackToken,
     video,
     subtitles,
+    movie,
   );
   const source = mediaSources[0];
   item.Path = source.Path;
@@ -12947,12 +13073,13 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
           MediaSourceCount: sources.length,
         });
       }
-      const mediaSources = mediaSourcesForVideo(
+      const mediaSources = mediaSourcesForMovie(
         item,
         request.url,
         playbackToken,
         video,
         subtitles,
+        movie,
       );
       if (!mediaSources.length) {
         const sources = pendingMediaSources(item, request.url, playbackToken, subtitles);

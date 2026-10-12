@@ -202,6 +202,8 @@ npx wrangler deploy --config=wrangler.worker.jsonc --dry-run
 | `EMBY_GUEST_TOKEN` | `bbjavdb-guest` | 访客播放会话使用的本地令牌 |
 | `EXTRA_MEDIA_HOSTS` | 空 | 额外允许代理的媒体域名，多个域名用英文逗号分隔 |
 | `PROXY_EXTERNAL_MEDIA` | `false` | 是否把白名单外部资源改写到同源媒体代理 |
+| `MEMOJAV_MEDIA_HOSTS` | `video10.memojav.net,*.memojav.net` | MemoJav 短链允许 302 跳转的媒体域名，多个域名用英文逗号分隔 |
+| `MEMOJAV_CACHE_TTL` | `600` | MemoJav 番号解析结果的缓存秒数 |
 
 本地 Wrangler 开发可以从示例文件开始：
 
@@ -239,6 +241,27 @@ PROXY_EXTERNAL_MEDIA=false
 支持的主要接口包括：`/System/Info/Public`、`/Users/AuthenticateByName`、`/Users/{id}/Views`、`/Items`、`/Items/{id}`、`/Items/{id}/Images/Primary`、`/Items/{id}/PlaybackInfo` 和 `/Videos/{id}/stream`。这些接口也覆盖了大多数 Emby 手机、桌面和电视客户端的首次连接流程。
 
 这是实时代理，不会缓存或保存影片文件。请只对你有权访问的内容使用，并在公开部署时给 Worker 绑定访问控制或仅允许自己的客户端访问。
+
+## MemoJav 零流量短链
+
+详情页和 `PlaybackInfo` 现在会额外提供一条 `MemoJav 302` 播放源。这条源的地址是裸短链 `/memo/<番号>`，客户端或播放器请求它时，Worker 只回一次 `302 Found`，把播放器直接带到 MemoJav 的上游 m3u8；清单、密钥和分片都不再经过 Worker，因此不会产生媒体转发流量，也不会占用媒体代理缓存。
+
+直接用 VLC、PotPlayer 或 Emby 外部播放器打开时，可以把地址写成：
+
+```text
+https://your-worker.example.com/memo/ROE-552
+```
+
+带 `api_key` 的完整地址可从 Emby 详情页的 `MemoJav 302` 播放源里取到。常用的调试入口：
+
+- `/memo/<番号>`：默认 302 直达上游。
+- `/memo/<番号>?json=1`：返回解析结果，便于检查番号是否命中。
+- `/memo/<番号>?refresh=1`：跳过解析缓存并重新探测上游。
+- `/memo/<番号>?web=1`：浏览器预览页面；它由 Worker 提供页面，不计入零流量，只用于人工检查。
+
+番号统一转成大写后探测 `MEMOJAV_MEDIA_HOSTS` 白名单内的上游域名。解析结果按 `MEMOJAV_CACHE_TTL` 缓存，命中失败也会短暂缓存，避免每个分片请求都重复探测。`.strm` 文件同样可以写入上面的裸短链地址。
+
+如果某条线路需要继续留在 Worker 侧反代（例如字幕联动或老客户端兼容），选择详情页里的其他播放源即可；`MemoJav 302` 只影响它自己这一条源，不改变原有 `/Videos/{id}/stream` 线路、播放记录和进度条。
 
 ## 自定义界面
 

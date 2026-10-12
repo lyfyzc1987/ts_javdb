@@ -1,4 +1,5 @@
 import { handleEmby } from "./emby.js";
+import { handleMemoJav } from "./memojav.js";
 
 export const DEFAULT_UPSTREAM_ORIGIN =
   "https://catembylegacy.fastcdn.dpdns.org";
@@ -820,6 +821,11 @@ export async function handleProxy(
   _context = {},
   fetchImpl = fetch,
 ) {
+  // /memo/ 短链解析：默认 302 直达上游，清单和分片不经过本服务。
+  const memoResponse = await handleMemoJav(request, env, _context, fetchImpl);
+  if (memoResponse) {
+    return memoResponse;
+  }
   const publicApiResponse = await handlePublicApi(request, env, fetchImpl);
   if (publicApiResponse) {
     return publicApiResponse;

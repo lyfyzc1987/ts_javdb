@@ -8,7 +8,9 @@
     "EMBY_SERVER_VERSION": "4.8.0.0",
     "EMBY_GUEST_ACCESS": "true",
     "SUBTITLE_AGGREGATOR": "true",
-    "PLAYBACK_DEPLOY_TAG": "pages"
+    "PLAYBACK_DEPLOY_TAG": "pages",
+    "MEMOJAV_MEDIA_HOSTS": "video10.memojav.net",
+    "MEMOJAV_CACHE_TTL": "600"
   },
   "d1_databases": [
     {

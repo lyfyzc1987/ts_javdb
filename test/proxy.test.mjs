@@ -14,6 +14,7 @@ import {
   createJavdbSignature,
   resetEmbyCachesForTests,
 } from "../src/emby.js";
+import { resetMemoJavCachesForTests } from "../src/memojav.js";
 
 const UPSTREAM = "https://catembylegacy.fastcdn.dpdns.org";
 const RESOLVER = "https://catembylegacy.fastcdn.dpdns.org";
@@ -123,6 +124,7 @@ async function encryptAes128Cbc(plaintext, keyBytes, iv) {
 
 beforeEach(() => {
   resetEmbyCachesForTests();
+  resetMemoJavCachesForTests();
 });
 
 function embyJsonRequest(path, body, method = "POST") {
@@ -296,7 +298,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v25",
+    version: "item-dto-v26",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -1582,8 +1584,8 @@ test("resolves a movie number through exact search and exposes all playback sour
   assert.equal(response.status, 200);
   assert.equal(payload.Id, "NQ7Mdg");
   assert.equal(payload.Name, "RCTD-740 Exact result");
-  assert.equal(payload.MediaSourceCount, 4);
-  assert.equal(payload.MediaSources.length, 4);
+  assert.equal(payload.MediaSourceCount, 5);
+  assert.equal(payload.MediaSources.length, 5);
   assert.equal(
     calls.some((target) => target.includes("/v4/movies/RCTD-740")),
     true,
@@ -1651,8 +1653,8 @@ test("returns a retryable detail response while cold resolution continues", asyn
   );
   const secondPayload = await second.json();
   assert.equal(second.status, 200);
-  assert.equal(secondPayload.MediaSourceCount, 4);
-  assert.equal(secondPayload.MediaSources.length, 4);
+  assert.equal(secondPayload.MediaSourceCount, 5);
+  assert.equal(secondPayload.MediaSources.length, 5);
   assert.equal(
     new Set(secondPayload.MediaSources.map((source) => source.Name)).size,
     secondPayload.MediaSources.length,
@@ -1753,7 +1755,7 @@ test("keeps unverified multi-source HLS lines when validation budget expires", a
   const payload = await response.json();
 
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 4);
+  assert.equal(payload.MediaSources.length, 5);
   assert.equal(
     new Set(payload.MediaSources.map((source) => source.Name)).size,
     payload.MediaSources.length,
@@ -1839,7 +1841,7 @@ test("keeps an oversized inline HLS line without scanning the whole manifest", a
   const payload = await response.json();
 
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources.length, 2);
   assert.ok(payload.MediaSources[0].Size > 0);
   // 前缀里的分片探测量必须受预算限制，绝不能与 2 万条分片成正比。
   assert.ok(segmentProbes <= 4);
@@ -1898,7 +1900,7 @@ test("returns a placeholder playback session while PlaybackInfo resolution conti
   const secondPayload = await second.json();
   assert.equal(second.status, 200);
   assert.ok(secondPayload.PlaySessionId);
-  assert.equal(secondPayload.MediaSources.length, 4);
+  assert.equal(secondPayload.MediaSources.length, 5);
 });
 
 test("keeps a playable on-demand placeholder instead of PlayAccess=None when resolution completes empty", async () => {
@@ -2072,7 +2074,7 @@ test("strips parsing-state text from every media source response boundary", asyn
   assert.equal(detail.status, 200);
   assert.deepEqual(
     detailPayload.MediaSources.map((source) => source.Name),
-    ["自动线路", "线路 2"],
+    ["自动线路", "线路 2", "MemoJav 302"],
   );
   assert.doesNotMatch(JSON.stringify(detailPayload), /解析中/);
 
@@ -2089,7 +2091,7 @@ test("strips parsing-state text from every media source response boundary", asyn
   assert.equal(playback.status, 200);
   assert.deepEqual(
     playbackPayload.MediaSources.map((source) => source.Name),
-    ["自动线路", "线路 2"],
+    ["自动线路", "线路 2", "MemoJav 302"],
   );
   assert.doesNotMatch(JSON.stringify(playbackPayload), /解析中/);
 });
@@ -2810,8 +2812,8 @@ test("keeps every playback source uniquely addressable across repeated reads", a
 
   const first = await readSources();
   const second = await readSources();
-  assert.equal(first.length, 3);
-  assert.equal(second.length, 3);
+  assert.equal(first.length, 4);
+  assert.equal(second.length, 4);
 
   for (const field of ["Id", "MediaSourceId", "Path", "DirectStreamUrl"]) {
     assert.equal(new Set(first.map((source) => source[field])).size, first.length);
@@ -2822,6 +2824,9 @@ test("keeps every playback source uniquely addressable across repeated reads", a
   }
   for (const source of first) {
     assert.equal(source.Id, source.MediaSourceId);
+    if (source.Name === "MemoJav 302") {
+      continue;
+    }
     const streamUrl = new URL(source.Path);
     assert.equal(streamUrl.searchParams.get("mediaSourceId"), source.Id);
     assert.match(source.DirectStreamUrl, new RegExp(`mediaSourceId=${source.Id}`));
@@ -2879,11 +2884,11 @@ test("keeps same-name sources from distinct URLs and removes exact duplicates", 
 
   const payload = await response.json();
   const sources = payload.MediaSources;
-  assert.equal(sources.length, 2);
+  assert.equal(sources.length, 3);
   assert.match(sources[0].Path, /source-a\.mp4/);
   assert.match(sources[1].Path, /source-b\.mp4/);
-  assert.equal(new Set(sources.map((source) => source.Id)).size, 2);
-  assert.equal(new Set(sources.map((source) => source.Name)).size, 2);
+  assert.equal(new Set(sources.map((source) => source.Id)).size, 3);
+  assert.equal(new Set(sources.map((source) => source.Name)).size, 3);
 });
 
 test("keeps late GetAV sources after early pseudo-HLS variants", async () => {
@@ -2916,12 +2921,15 @@ test("keeps late GetAV sources after early pseudo-HLS variants", async () => {
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 2);
+  assert.equal(payload.MediaSources.length, 3);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["getav_raw_4k", "getav_raw_1080p"],
+    ["getav_raw_4k", "getav_raw_1080p", "MemoJav 302"],
   );
   for (const source of payload.MediaSources) {
+    if (source.Name === "MemoJav 302") {
+      continue;
+    }
     assert.match(source.Path, /fast-stream\.jav\.si/);
     assert.doesNotMatch(source.Path, /googleusercontent/);
   }
@@ -3021,16 +3029,25 @@ test("keeps extensionless Google Drive HLS and embedded TS .image HLS", async ()
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 4);
+  assert.equal(payload.MediaSources.length, 5);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["fcjav_original", "压缩版 · 1", "javgg_original", "压缩版 · 2"],
+    [
+      "fcjav_original",
+      "压缩版 · 1",
+      "javgg_original",
+      "压缩版 · 2",
+      "MemoJav 302",
+    ],
   );
   assert.equal(
     new Set(payload.MediaSources.map((source) => source.Name)).size,
     payload.MediaSources.length,
   );
   for (const source of payload.MediaSources) {
+    if (source.Name === "MemoJav 302") {
+      continue;
+    }
     assert.equal(source.Container, "m3u8");
     assert.match(source.Path, /\/Videos\/42\/stream\.m3u8/);
   }
@@ -3300,7 +3317,7 @@ test("keeps four RCTD-740 playback sources including GG font-path HLS variants",
   assert.equal(response.headers.get("cache-control"), "no-store");
   assert.equal(response.headers.get("expires"), "0");
   assert.equal(response.headers.get("pragma"), "no-cache");
-  assert.equal(payload.MediaSources.length, 4);
+  assert.equal(payload.MediaSources.length, 5);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
     [
@@ -3308,6 +3325,7 @@ test("keeps four RCTD-740 playback sources including GG font-path HLS variants",
       "原版 1080P (GetAV)",
       "原版 (服务器GG)",
       "去码版 (服务器GG)",
+      "MemoJav 302",
     ],
   );
   assert.equal(
@@ -3400,7 +3418,7 @@ test("keeps AES-128 HLS sources whose encrypted segments use font paths", async 
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources.length, 2);
   assert.equal(payload.MediaSources[0].Name, "RCTD-740");
   assert.equal(payload.MediaSources[0].Container, "m3u8");
   assert.equal(calls.includes(keyUrl), true);
@@ -3553,7 +3571,7 @@ test("keeps a remote HLS source only after a playable segment probe", async () =
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources.length, 2);
   assert.equal(payload.MediaSources[0].Container, "m3u8");
   assert.deepEqual(
     calls.filter((target) => [masterUrl, childUrl, segmentUrl].includes(target)),
@@ -3615,7 +3633,7 @@ test("probes ordinary remote MP4 resolver sources before advertising them", asyn
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources.length, 2);
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
 });
 
@@ -3737,7 +3755,7 @@ test("keeps a valid root-relative resolver source while starting self-hosted sup
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources.length, 2);
   assert.equal(calls.includes(sourceUrl), true);
   assert.equal(calls.some((target) => /javtiful\.com/.test(target)), true);
   assert.equal(calls.some((target) => /getav\.net|r\.jina\.ai/.test(target)), true);
@@ -3826,7 +3844,7 @@ test("merges one public resolver source with two Javtiful qualities", async () =
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["原版", "Javtiful 1080P", "Javtiful 720P"],
+    ["原版", "Javtiful 1080P", "Javtiful 720P", "MemoJav 302"],
   );
 });
 
@@ -3952,8 +3970,8 @@ test("merges public resolver sources with GetAV qualities when the CDN requires 
     new URL(source.Path).searchParams.get("source")
   );
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 4);
-  assert.equal(new Set(sourceUrls).size, 4);
+  assert.equal(payload.MediaSources.length, 5);
+  assert.equal(new Set(sourceUrls).size, 5);
   assert.equal(sourceUrls.filter((source) => source === getav4kUrl).length, 1);
   assert.equal(sourceUrls.filter((source) => source === getav1080Url).length, 1);
 });
@@ -4023,7 +4041,7 @@ test("keeps a public source when self-hosted supplement times out", async () => 
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 1);
+  assert.equal(payload.MediaSources.length, 2);
   assert.match(payload.MediaSources[0].Path, /public\.mp4/);
 });
 
@@ -4137,7 +4155,7 @@ test("does not persist a thin GetAV result while supplement is pending", async (
     fetchImpl,
   );
   const firstPayload = await firstResponse.json();
-  assert.equal(firstPayload.MediaSources.length, 2);
+  assert.equal(firstPayload.MediaSources.length, 3);
   assert.equal(
     [...db.rows.keys()].some((key) =>
       key.startsWith("video-persist-v1\u0000")
@@ -4158,13 +4176,14 @@ test("does not persist a thin GetAV result while supplement is pending", async (
     fetchImpl,
   );
   const secondPayload = await secondResponse.json();
-  assert.equal(secondPayload.MediaSources.length, 6);
+  assert.equal(secondPayload.MediaSources.length, 7);
   assert.deepEqual(
-    secondPayload.MediaSources.map((source) =>
+    secondPayload.MediaSources.slice(0, 6).map((source) =>
       new URL(source.Path).searchParams.get("source")
     ),
     [...publicUrls, ...getavUrls],
   );
+  assert.equal(secondPayload.MediaSources[6].Name, "MemoJav 302");
 });
 
 test("publishes early public lines instead of a pending placeholder when a slow resolver still merges", async () => {
@@ -4282,11 +4301,11 @@ test("publishes early public lines instead of a pending placeholder when a slow 
     ),
     false,
   );
-  assert.equal(payload.MediaSourceCount, 2);
+  assert.equal(payload.MediaSourceCount, 3);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
-    ),
+    ).filter((source) => source !== null),
     publicUrls,
   );
   assert.equal(
@@ -4399,7 +4418,7 @@ test("shows the first self-hosted line on the detail screen while both resolver 
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ),
-    [fullHdUrl, hdUrl],
+    [fullHdUrl, hdUrl, null],
   );
 });
 
@@ -4488,12 +4507,12 @@ test("keeps self-hosted and public snapshots together so the detail screen never
   assert.equal(response.status, 200);
   // 两条链路各 2 条互补线路：合并后的首屏快照必须保留全部 4 条，不能因为
   // “后到的那份线路更少”就退回 2 条。
-  assert.equal(payload.MediaSourceCount, 4);
+  assert.equal(payload.MediaSourceCount, 5);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...javtifulUrls, ...publicUrls].sort(),
+    [...javtifulUrls, ...publicUrls, null].sort(),
   );
 });
 
@@ -4600,12 +4619,12 @@ test("does not answer the first screen with a single line while more lines are s
     false,
   );
   // 关键断言：首屏是 7 条，不是自建链路先到的那 2 条。
-  assert.equal(payload.MediaSourceCount, allUrls.length);
+  assert.equal(payload.MediaSourceCount, allUrls.length + 1);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...allUrls].sort(),
+    [...allUrls, null].sort(),
   );
 });
 
@@ -4714,12 +4733,12 @@ test("waits for the slow public batch instead of answering with the first self-h
     false,
   );
   // 关键断言：首屏是 7 条，不是自建链路先到的那 2 条。
-  assert.equal(payload.MediaSourceCount, allUrls.length);
+  assert.equal(payload.MediaSourceCount, allUrls.length + 1);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...allUrls].sort(),
+    [...allUrls, null].sort(),
   );
 });
 
@@ -4828,12 +4847,12 @@ test("waits within the bounded first-screen grace for a public batch that still 
     false,
   );
   // 关键断言 1：首屏是两批合并后的完整线路，不是先到的自建那 3 条。
-  assert.equal(payload.MediaSourceCount, allUrls.length);
+  assert.equal(payload.MediaSourceCount, allUrls.length + 1);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...allUrls].sort(),
+    [...allUrls, null].sort(),
   );
   // 关键断言 2：等到了公共批次（3 秒），但被补时窗口约束住，没有拖到 9 秒上限。
   assert.ok(elapsed < 4500, `first screen took ${elapsed}ms`);
@@ -4922,12 +4941,12 @@ test("answers with the self-hosted lines once the first-screen grace expires", a
   assert.equal(response.status, 200);
   assert.equal(payload.PlayAccess, "Full");
   // 首屏是自建那 3 条真实线路，而不是“自动线路”占位源。
-  assert.equal(payload.MediaSourceCount, selfHostedUrls.length);
+  assert.equal(payload.MediaSourceCount, selfHostedUrls.length + 1);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...selfHostedUrls].sort(),
+    [...selfHostedUrls, null].sort(),
   );
   // 关键断言：补时窗口一过就答复，没有死等到 9 秒上限。
   assert.ok(elapsed >= 4500, `first screen returned too early at ${elapsed}ms`);
@@ -5029,12 +5048,12 @@ test("waits through the extended cold-start window when the public batch complet
   const payload = await response.json();
   assert.equal(response.status, 200);
   assert.equal(payload.PlayAccess, "Full");
-  assert.equal(payload.MediaSourceCount, allUrls.length);
+  assert.equal(payload.MediaSourceCount, allUrls.length + 1);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       new URL(source.Path).searchParams.get("source")
     ).sort(),
-    [...allUrls].sort(),
+    [...allUrls, null].sort(),
   );
 });
 
@@ -5114,8 +5133,12 @@ test("keeps inline HLS lines on the first screen when every upstream line is a d
     ),
     false,
   );
-  assert.equal(payload.MediaSourceCount, 3);
+  assert.equal(payload.MediaSourceCount, 4);
   for (const source of payload.MediaSources) {
+    if (source.Name === "MemoJav 302") {
+      assert.equal(source.DirectStreamUrl, "/memo/RCTD-740?api_key=bbjavdb-guest");
+      continue;
+    }
     assert.equal(source.Container, "m3u8");
     assert.match(source.DirectStreamUrl, /\/Videos\/42\/stream\.m3u8/);
     assert.doesNotMatch(source.DirectStreamUrl, /source=/);
@@ -5199,7 +5222,7 @@ test("does not persist a thin result after the supplement finishes below target"
   );
 
   const payload = await response.json();
-  assert.equal(payload.MediaSources.length, 2);
+  assert.equal(payload.MediaSources.length, 3);
   assert.equal(
     [...db.rows.keys()].some((key) =>
       key.startsWith("video-persist-v1\u0000")
@@ -5330,7 +5353,7 @@ test("drops pseudo-HLS supplements and keeps validated self-hosted lines", async
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name).sort(),
-    ["原版", "Javtiful 720P", "原版 4K (GetAV)"].sort(),
+    ["原版", "Javtiful 720P", "原版 4K (GetAV)", "MemoJav 302"].sort(),
   );
   assert.equal(calls.includes(pseudoImageUrl), false);
 });
@@ -5446,7 +5469,7 @@ test("deduplicates exact cross-source URLs but keeps distinct URLs", async () =>
     new URL(source.Path).searchParams.get("source")
   );
   assert.equal(response.status, 200);
-  assert.equal(payload.MediaSources.length, 3);
+  assert.equal(payload.MediaSources.length, 4);
   assert.equal(sourceUrls.filter((source) => source === sharedUrl).length, 1);
   assert.equal(sourceUrls.includes(publicUrl), true);
   assert.equal(sourceUrls.includes(getavUrl), true);
@@ -5533,13 +5556,13 @@ test("loads Javtiful MP4 qualities in order and probes each stream", async () =>
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["Javtiful 1080P", "Javtiful 720P"],
+    ["Javtiful 1080P", "Javtiful 720P", "MemoJav 302"],
   );
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       source.MediaStreams.find((stream) => stream.Type === "Video").Height
     ),
-    [1080, 720],
+    [1080, 720, 1080],
   );
   assert.equal(calls.filter((target) => target === fullHdUrl).length, 1);
   assert.equal(calls.filter((target) => target === hdUrl).length, 1);
@@ -5644,13 +5667,14 @@ test("loads all GetAV qualities through parallel page requests", async () => {
       "原版 1080P (GetAV)",
       "原版 720P (GetAV)",
       "原版 480P (GetAV)",
+      "MemoJav 302",
     ],
   );
   assert.deepEqual(
     payload.MediaSources.map((source) =>
       source.MediaStreams.find((stream) => stream.Type === "Video").Height
     ),
-    [2160, 1080, 720, 480],
+    [2160, 1080, 720, 480, 2160],
   );
 });
 
@@ -5833,7 +5857,7 @@ test("embeds a directly streamable media source in movie details", async () => {
 
   const payload = await response.json();
   assert.equal(payload.PlayAccess, "Full");
-  assert.equal(payload.MediaSourceCount, 1);
+  assert.equal(payload.MediaSourceCount, 2);
   assert.match(payload.Path, /\/Videos\/42\/stream\.mp4/);
   assert.equal(payload.MediaSources[0].MediaStreams[1].Type, "Audio");
   assert.equal(payload.MediaSources[0].DefaultSubtitleStreamIndex, 2);
@@ -8415,7 +8439,7 @@ test("keeps the inline GG HLS line next to the self-hosted MP4 on the first scre
     false,
   );
   // 关键断言：内联 HLS 没有被当成不可用线路丢掉，首屏是 2 条。
-  assert.equal(payload.MediaSourceCount, 2);
+  assert.equal(payload.MediaSourceCount, 3);
   const hls = payload.MediaSources.find((source) => source.Container === "m3u8");
   const mp4 = payload.MediaSources.find((source) => source.Container === "mp4");
   assert.ok(hls, "expected the inline GG HLS line on the first screen");
@@ -8545,7 +8569,7 @@ test("keeps waiting when the public resolver fails fast and GetAV lines are stil
     false,
   );
   // 关键断言：没有停在“自建链路第一条”的半成品上，3 条都在首屏。
-  assert.equal(payload.MediaSourceCount, 3);
+  assert.equal(payload.MediaSourceCount, 4);
   const names = payload.MediaSources.map((source) => String(source.Name));
   assert.equal(names.includes("Javtiful 720P"), true);
   assert.equal(
@@ -9565,3 +9589,189 @@ test("still rejects a private host even for a depth >= 1 HLS child", async () =>
 
   assert.equal(response.status, 403);
 });
+
+function memoPlaylistResponse(body = "#EXTM3U\n#EXT-X-VERSION:7\ninit.mp4\n") {
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "application/vnd.apple.mpegurl" },
+  });
+}
+
+test("memo short link returns a 302 to the upstream m3u8 without proxying", async () => {
+  const calls = [];
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/roe-552.strm"),
+    {},
+    {},
+    async (url, init) => {
+      calls.push({ url, init });
+      return memoPlaylistResponse();
+    },
+  );
+
+  assert.equal(response.status, 302);
+  assert.equal(
+    response.headers.get("location"),
+    "https://video10.memojav.net/stream/ROE-552/master.m3u8",
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "https://video10.memojav.net/stream/ROE-552/master.m3u8",
+  );
+});
+
+test("memo json debug endpoint reports the resolved upstream", async () => {
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/ROE-552?json=1"),
+    {},
+    {},
+    async () => memoPlaylistResponse(),
+  );
+
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.ok, true);
+  assert.equal(payload.code, "ROE-552");
+  assert.equal(payload.host, "video10.memojav.net");
+  assert.equal(
+    payload.url,
+    "https://video10.memojav.net/stream/ROE-552/master.m3u8",
+  );
+});
+
+test("memo short link rejects an invalid code without contacting upstream", async () => {
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/..%2Fetc"),
+    {},
+    {},
+    () => {
+      throw new Error("fetch must not be called");
+    },
+  );
+
+  assert.equal(response.status, 400);
+});
+
+test("memo short link reports 404 when every upstream host misses", async () => {
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/ZZZZ-999"),
+    {},
+    {},
+    async () => new Response("not found", { status: 404 }),
+  );
+
+  assert.equal(response.status, 404);
+});
+
+test("memo proxy mode rewrites playlist URIs through the short link", async () => {
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/ROE-552?proxy=1"),
+    {},
+    {},
+    async () =>
+      memoPlaylistResponse(
+        "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:8.3,\nmaster0.m4s\n",
+      ),
+  );
+
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type"), /mpegurl/);
+  const body = await response.text();
+  assert.match(
+    body,
+    /URI="https:\/\/clone\.example\/memo\/ROE-552\/init\.mp4\?proxy=1&p=1"/,
+  );
+  assert.match(
+    body,
+    /https:\/\/clone\.example\/memo\/ROE-552\/master0\.m4s\?proxy=1&p=1/,
+  );
+});
+
+test("memo proxy mode forwards segment Range requests to upstream", async () => {
+  const calls = [];
+  const response = await handleProxy(
+    new Request(
+      "https://clone.example/memo/ROE-552/master0.m4s?proxy=1&p=1",
+      { headers: { range: "bytes=0-99" } },
+    ),
+    {},
+    {},
+    async (url, init) => {
+      calls.push({ url, init });
+      if (url.includes("master.m3u8")) {
+        return memoPlaylistResponse();
+      }
+      return new Response(new Uint8Array(100), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-99/1000",
+          "content-type": "video/mp2t",
+        },
+      });
+    },
+  );
+
+  assert.equal(response.status, 206);
+  const segmentCall = calls.find((call) => call.url.includes("master0.m4s"));
+  assert.ok(segmentCall);
+  assert.equal(
+    segmentCall.url,
+    "https://video10.memojav.net/stream/ROE-552/master0.m4s",
+  );
+  assert.equal(segmentCall.init.headers.get("range"), "bytes=0-99");
+});
+
+test("memo proxy mode rejects a path traversal segment", async () => {
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/ROE-552/..%2F..%2Fetc%2Fpasswd?proxy=1"),
+    {},
+    {},
+    async (url) => {
+      if (url.includes("master.m3u8")) return memoPlaylistResponse();
+      throw new Error("segment fetch must not be called");
+    },
+  );
+
+  assert.equal(response.status, 400);
+});
+
+test("memo route only claims the /memo/ prefix", async () => {
+  let forwarded = "";
+  const response = await handleProxy(
+    new Request("https://clone.example/memo"),
+    {},
+    {},
+    async (url) => {
+      forwarded = url;
+      return new Response("ok", {
+        headers: { "content-type": "text/plain" },
+      });
+    },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(forwarded, `${UPSTREAM}/memo`);
+});
+
+test("memo usage page lists the short-link endpoints", async () => {
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/"),
+    {},
+    {},
+    () => {
+      throw new Error("fetch must not be called");
+    },
+  );
+
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.ok, true);
+  assert.equal(payload.service, "memojav-shortlink");
+  assert.equal(
+    payload.example,
+    "https://clone.example/memo/ROE-552",
+  );
+});
+
+
