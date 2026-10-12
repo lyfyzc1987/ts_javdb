@@ -24,7 +24,7 @@
 
 export const MEMOJAV_ROUTE_PREFIX = "/memo/";
 
-export const MEMOJAV_BUILD_ID = "2026-10-12-memojav-multisource-3";
+export const MEMOJAV_BUILD_ID = "2026-10-12-memojav-multisource-4";
 
 // 上游媒体域名。video10 是 2026-09 实测唯一可用的域名；其余留作候选，
 // 按顺序探测，命中第一个真正返回 HLS 清单的域名。

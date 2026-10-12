@@ -190,10 +190,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // （含 D1 持久层，键里含 sources-v4x）都必须失效。
 // v24/v42：HLS 子资源（分片/子清单/密钥）改用“任意公网域名”白名单，并补齐
 // 上游会轮换的 CDN 域名——旧解析结果里那些被 403 的分片地址必须整体失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v32";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v33";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-12-provider-labels-50";
+const SERVER_BUILD_ID = "2026-10-12-memojav-provider-labels-51";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -9277,7 +9277,13 @@ function mediaSource(
     Id: mediaSourceId,
     MediaSourceId: mediaSourceId,
     Name: mediaSourceDisplayName(
-      providerPrefixedLabel(video.sourceName || video.title, video.variant),
+      video.memoJavLabel
+        ? `MemoJav ${
+          providerFirstSourceName(
+            providerPrefixedLabel(video.sourceName || video.title, video.variant),
+          ) || "线路"
+        }`
+        : providerPrefixedLabel(video.sourceName || video.title, video.variant),
       item.Name,
     ),
     Path: streamUrl.toString(),
@@ -9429,15 +9435,13 @@ function memoJavMediaSources(
 ) {
   const code = movieResolveCode(movie || item.movie || item);
   const normalizedCode = String(code || "").trim().toUpperCase();
-  if (!normalizedCode || !/^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(normalizedCode)) {
-    return [];
-  }
+  const validCode = Boolean(normalizedCode) &&
+    /^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(normalizedCode);
   // 解析失败 / 超时 / 上游 404 时不再插入占位死源：没有真实线路就不产出
   // MemoJav 条目，避免客户端点开一条永远转圈的“MemoJav 302”。
-  const resolved = Array.isArray(info?.sources) ? info.sources : [];
-  if (!resolved.length) return [];
+  const resolved = validCode && Array.isArray(info?.sources) ? info.sources : [];
   const subtitleStreams = memoJavSubtitleStreams(item, requestUrl, token, subtitles);
-  return resolved.map((entry) => {
+  const sources = resolved.map((entry) => {
     const memoUrl = new URL(
       publicRoutePath(requestUrl, `/memo/${encodeURIComponent(normalizedCode)}`),
       requestUrl,
@@ -9520,6 +9524,7 @@ function memoJavMediaSources(
       ],
     };
   });
+  return sources;
 }
 
 function mediaSourceVariantIndex(itemId, mediaSourceId, variantCount = 0) {
@@ -9617,6 +9622,7 @@ async function mediaSourcesForMovie(
       token,
       {
         ...variant,
+        memoJavLabel: true,
         sourceName: variant.sourceName ||
           (variants.length > 1 ? videoVariantLabel(variant, index, variants.length) : ""),
       },
