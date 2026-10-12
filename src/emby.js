@@ -131,11 +131,11 @@ const MAX_HLS_REWRITE_DEPTH = 8;
 //   - 4K 单段约 13.4MB，数量过多会浪费上游流量；
 //   - 后台任务通过 ctx.waitUntil 运行，不能超过 Worker 的生命周期预算；
 //   - 失败静默处理，绝不改变正常清单或阻塞播放请求。
-const GETAV_HLS_PREFETCH_SEGMENTS = 3;
+const GETAV_HLS_PREFETCH_SEGMENTS = 1;
 const GETAV_HLS_PREFETCH_CONCURRENCY = 2;
 const GETAV_HLS_PREFETCH_BUDGET_MS = 15 * 1000;
 const GETAV_HLS_PREFETCH_RECENT_MS = 60 * 1000;
-const GETAV_HLS_ROLLING_PREFETCH_SEGMENTS = 3;
+const GETAV_HLS_ROLLING_PREFETCH_SEGMENTS = 0;
 const GETAV_HLS_SEGMENT_MAP_MAX_ENTRIES = 1024;
 const GETAV_HLS_SEGMENT_MAP_TTL_MS = 10 * 60 * 1000;
 const GETAV_HLS_PREFETCH_IN_FLIGHT = new Set();
@@ -171,7 +171,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v25";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-11-subtitle-aggregator-41";
+const SERVER_BUILD_ID = "2026-10-12-media-stream-consistency-42";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -1963,6 +1963,305 @@ async function readMediaResponsePrefix(upstream, maxBytes) {
   return { bytes, complete };
 }
 
+// 与 readMediaResponsePrefix 不同，这里不能为了探测前缀而取消上游流：
+// 探测完成后还要把“已经读到的前缀”和剩余字节原样交给客户端。
+async function readMediaResponsePrefixKeepingReader(body, maxBytes) {
+  const limit = Math.max(1, Math.floor(Number(maxBytes) || 0));
+  if (!body) {
+    return {
+      bytes: new Uint8Array(),
+      reader: null,
+      complete: true,
+      remainder: null,
+    };
+  }
+  const reader = body.getReader();
+  const chunks = [];
+  let total = 0;
+  let complete = false;
+  let remainder = null;
+  try {
+    while (total < limit) {
+      const result = await reader.read();
+      if (result.done) {
+        complete = true;
+        break;
+      }
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value);
+      const remaining = limit - total;
+      if (chunk.byteLength > remaining) {
+        chunks.push(chunk.slice(0, remaining));
+        total += remaining;
+        remainder = chunk.slice(remaining);
+        break;
+      }
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+  } catch (error) {
+    try {
+      await reader.cancel(error);
+    } catch {}
+    throw error;
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes, reader, complete, remainder };
+}
+
+function streamMediaBodyWithPrefix(
+  prefix,
+  remainder,
+  reader,
+  complete,
+  options = {},
+) {
+  const expectedBytes = Math.max(
+    0,
+    Math.floor(Number(options.expectedBytes) || 0),
+  );
+  const cacheLimit = Math.max(
+    0,
+    Math.floor(Number(options.cacheLimit) || 0),
+  );
+  const cacheKey = options.cacheKey || "";
+  const cacheHeaders = options.cacheHeaders instanceof Headers
+    ? options.cacheHeaders
+    : new Headers();
+  const cacheStatus = Number(options.cacheStatus) || 200;
+  const cacheStatusText = String(options.cacheStatusText || "OK");
+  const cacheContentRange = String(options.cacheContentRange || "");
+  const canCache = Boolean(
+    cacheKey &&
+    expectedBytes > 0 &&
+    cacheLimit > 0 &&
+    expectedBytes <= cacheLimit,
+  );
+  const cacheBytes = canCache ? new Uint8Array(expectedBytes) : null;
+  let cacheOffset = 0;
+  let cacheComplete = Boolean(cacheBytes);
+  let delivered = 0;
+  let prefixSent = false;
+  let remainderSent = !remainder?.byteLength;
+  let streamComplete = complete;
+
+  const appendCache = (chunk) => {
+    if (!cacheBytes || !cacheComplete || !chunk?.byteLength) return;
+    if (cacheOffset + chunk.byteLength > cacheBytes.byteLength) {
+      cacheComplete = false;
+      return;
+    }
+    cacheBytes.set(chunk, cacheOffset);
+    cacheOffset += chunk.byteLength;
+  };
+
+  const storeCache = () => {
+    if (
+      !cacheBytes ||
+      !cacheComplete ||
+      cacheOffset !== cacheBytes.byteLength
+    ) {
+      return;
+    }
+    MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, {
+      bytes: cacheBytes,
+      headers: [...cacheHeaders.entries()],
+      status: cacheStatus,
+      statusText: cacheStatusText,
+      contentRange: cacheContentRange,
+      rangeable: true,
+    });
+  };
+
+  const body = new ReadableStream({
+    async pull(controller) {
+      if (!prefixSent) {
+        prefixSent = true;
+        if (prefix?.byteLength) {
+          delivered += prefix.byteLength;
+          appendCache(prefix);
+          controller.enqueue(prefix);
+        }
+        return;
+      }
+      if (!remainderSent) {
+        remainderSent = true;
+        delivered += remainder.byteLength;
+        appendCache(remainder);
+        controller.enqueue(remainder);
+        return;
+      }
+      if (streamComplete) {
+        if (expectedBytes > 0 && delivered < expectedBytes) {
+          controller.error(
+            new Error(`media segment truncated: ${delivered}/${expectedBytes}`),
+          );
+          return;
+        }
+        storeCache();
+        controller.close();
+        return;
+      }
+
+      let result;
+      try {
+        result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
+      } catch (error) {
+        try {
+          await reader?.cancel?.(error);
+        } catch {}
+        controller.error(error);
+        return;
+      }
+      if (result.done) {
+        streamComplete = true;
+        if (expectedBytes > 0 && delivered < expectedBytes) {
+          controller.error(
+            new Error(`media segment truncated: ${delivered}/${expectedBytes}`),
+          );
+          return;
+        }
+        storeCache();
+        controller.close();
+        return;
+      }
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value);
+      delivered += chunk.byteLength;
+      appendCache(chunk);
+      controller.enqueue(chunk);
+    },
+    cancel(reason) {
+      return reader?.cancel?.(reason);
+    },
+  });
+  return body;
+}
+
+async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) {
+  if (!upstream?.body) return null;
+  const originalContentType = String(
+    upstream.headers.get("content-type") || "",
+  ).split(";")[0].trim().toLowerCase();
+  const prefixResult = await readMediaResponsePrefixKeepingReader(
+    upstream.body,
+    REMOTE_MEDIA_PROBE_BYTES,
+  );
+  const prefix = prefixResult.bytes;
+  if (
+    mediaPayloadLooksLikeErrorDocument(prefix, originalContentType)
+  ) {
+    try {
+      await prefixResult.reader?.cancel?.();
+    } catch {}
+    return {
+      errorDocument: true,
+      response: mediaUpstreamInvalidResponse(),
+    };
+  }
+
+  const embeddedOffset = embeddedMpegTsOffset(prefix);
+  if (embeddedOffset < 0) {
+    const headers = mediaProxyResponseHeaders(upstream);
+    const body = streamMediaBodyWithPrefix(
+      prefix,
+      prefixResult.remainder,
+      prefixResult.reader,
+      prefixResult.complete,
+      { cacheKey: options.cacheKey || "" },
+    );
+    return {
+      embedded: false,
+      response: new Response(body, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers,
+      }),
+    };
+  }
+
+  const upstreamBodyBytes = expectedUpstreamBodyBytes(upstream.headers);
+  const normalizedBodyBytes = upstreamBodyBytes > 0
+    ? Math.max(0, upstreamBodyBytes - embeddedOffset)
+    : 0;
+  const upstreamTotal = upstreamBodyBytes > 0 ? upstreamBodyBytes : null;
+  const cacheKey = upstream.status === 200
+    ? String(options.cacheKey || "")
+    : "";
+  if (cacheKey && upstreamTotal) {
+    const metadata = mediaSegmentPrefixMetadata(
+      embeddedOffset,
+      upstreamTotal,
+      "video/mp2t",
+    );
+    if (metadata) {
+      MEDIA_SEGMENT_PREFIX_CACHE.write(cacheKey, metadata);
+    }
+  }
+  const headers = mediaProxyResponseHeaders(upstream);
+  headers.set("accept-ranges", "bytes");
+  headers.set("content-type", "video/mp2t");
+  headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
+  headers.delete("etag");
+  headers.delete("last-modified");
+  if (normalizedBodyBytes > 0) {
+    headers.set("content-length", String(normalizedBodyBytes));
+  } else {
+    headers.delete("content-length");
+  }
+
+  const upstreamContentRange = upstream.headers.get("content-range") || "";
+  if (upstream.status === 206 && upstreamContentRange && normalizedBodyBytes > 0) {
+    const adjusted = adjustedContentRangeAfterPrefix(
+      upstreamContentRange,
+      embeddedOffset,
+      normalizedBodyBytes,
+    );
+    if (adjusted) {
+      headers.set("content-range", adjusted);
+    } else {
+      headers.delete("content-range");
+    }
+  } else {
+    headers.delete("content-range");
+  }
+
+  const normalizedPrefix = embeddedOffset > 0
+    ? prefix.slice(embeddedOffset)
+    : prefix;
+  const body = streamMediaBodyWithPrefix(
+    normalizedPrefix,
+    prefixResult.remainder,
+    prefixResult.reader,
+    prefixResult.complete,
+    {
+      expectedBytes: normalizedBodyBytes,
+      cacheKey,
+      cacheLimit: MAX_CACHED_MEDIA_SEGMENT_BYTES,
+      cacheHeaders: headers,
+      cacheStatus: upstream.status,
+      cacheStatusText: upstream.statusText,
+    },
+  );
+  return {
+    embedded: true,
+    prefixLength: embeddedOffset,
+    upstreamTotal,
+    response: new Response(body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers,
+    }),
+  };
+}
+
 function responseFromBufferedBytes(upstream, bytes) {
   const headers = new Headers(upstream.headers);
   headers.delete("content-encoding");
@@ -1988,6 +2287,77 @@ function mediaSegmentRecordHeaders(upstream, byteLength) {
   headers.set("content-length", String(byteLength));
   headers.set("accept-ranges", "bytes");
   return headers;
+}
+
+function mediaRecordHeader(record, name) {
+  if (!record?.headers) return null;
+  for (const [headerName, value] of record.headers) {
+    if (String(headerName).toLowerCase() === name.toLowerCase()) {
+      return String(value);
+    }
+  }
+  return null;
+}
+
+function mediaRecordHasValidator(record) {
+  return Boolean(
+    mediaRecordHeader(record, "etag") ||
+    mediaRecordHeader(record, "last-modified"),
+  );
+}
+
+function mediaEtagListMatches(value, etag) {
+  if (!value || !etag) return false;
+  const target = String(etag).trim();
+  return String(value).split(",").some((candidate) => {
+    const item = candidate.trim();
+    if (item === "*") return true;
+    return item.replace(/^W\//i, "") === target.replace(/^W\//i, "");
+  });
+}
+
+function mediaCacheConditionalDecision(record, request) {
+  if (!record || !request?.headers) return "use";
+  const etag = mediaRecordHeader(record, "etag");
+  const lastModified = mediaRecordHeader(record, "last-modified");
+
+  const ifNoneMatch = request.headers.get("if-none-match");
+  if (ifNoneMatch) {
+    if (!etag) return "bypass";
+    if (mediaEtagListMatches(ifNoneMatch, etag)) return "not-modified";
+  } else {
+    const ifModifiedSince = request.headers.get("if-modified-since");
+    if (ifModifiedSince) {
+      const since = Date.parse(ifModifiedSince);
+      const modified = Date.parse(lastModified || "");
+      if (!Number.isFinite(since) || !Number.isFinite(modified)) {
+        return "bypass";
+      }
+      if (modified <= since) return "not-modified";
+    }
+  }
+
+  const ifRange = request.headers.get("if-range");
+  if (!ifRange) return "use";
+  const value = ifRange.trim();
+  if (/^(?:W\/)?"/.test(value)) {
+    if (!etag) return "bypass";
+    const strongMatch =
+      !/^W\//i.test(value) &&
+      !/^W\//i.test(etag) &&
+      value === etag;
+    return strongMatch ? "use" : "bypass";
+  }
+  const rangeDate = Date.parse(value);
+  const modified = Date.parse(lastModified || "");
+  if (
+    !Number.isFinite(rangeDate) ||
+    !Number.isFinite(modified) ||
+    modified > rangeDate
+  ) {
+    return "bypass";
+  }
+  return "use";
 }
 
 function mediaSegmentRecordForBytes(upstream, bytes) {
@@ -2097,6 +2467,18 @@ function cachedMediaSegmentResponse(record, request) {
   if (!record?.bytes) return null;
   const headers = new Headers(record.headers || []);
   headers.set("accept-ranges", "bytes");
+  const conditionalDecision = mediaCacheConditionalDecision(record, request);
+  if (conditionalDecision === "bypass") return null;
+  if (conditionalDecision === "not-modified") {
+    headers.delete("content-range");
+    headers.set("cache-control", "no-store");
+    headers.set("content-length", "0");
+    return new Response(null, {
+      status: 304,
+      statusText: "Not Modified",
+      headers,
+    });
+  }
   const rangeHeader = request.headers.get("range");
   if (!rangeHeader || record.rangeable === false || record.status !== 200) {
     return mediaRecordResponse(record, request);
@@ -2132,6 +2514,7 @@ function cachedMediaSegmentResponse(record, request) {
 
 function bufferedMediaResultResponse(result, request) {
   if (result?.errorDocument) return mediaUpstreamInvalidResponse();
+  if (result?.response) return result.response;
   if (result?.record) {
     return cachedMediaSegmentResponse(result.record, request);
   }
@@ -2191,7 +2574,11 @@ function teeMediaRangeResponseBody(upstream, rangeKey, maxBytes) {
   if (!upstream.body) return upstream;
   const contentLength = Number(upstream.headers.get("content-length"));
   const limit = Math.max(0, Math.floor(Number(maxBytes) || 0));
-  const shouldCache = Number.isSafeInteger(contentLength) &&
+  const hasValidator = Boolean(
+    upstream.headers.get("etag") || upstream.headers.get("last-modified"),
+  );
+  const shouldCache = hasValidator &&
+    Number.isSafeInteger(contentLength) &&
     contentLength > 0 &&
     contentLength <= limit;
   let buffer = shouldCache ? new Uint8Array(contentLength) : null;
@@ -2306,13 +2693,13 @@ async function fetchMediaUpstreamResponse(
   );
   const headersMaxAttempts = Math.max(
     1,
-    Math.floor(
+    Math.min(2, Math.floor(
       positiveEnvMilliseconds(
         env,
         "MEDIA_UPSTREAM_HEADERS_MAX_ATTEMPTS",
         MEDIA_UPSTREAM_HEADERS_MAX_ATTEMPTS,
       ),
-    ),
+    )),
   );
   const upstreamTimeoutResponse = () => new Response(null, {
     status: 504,
@@ -2340,12 +2727,14 @@ async function fetchMediaUpstreamResponse(
       return upstreamTimeoutResponse();
     }
   };
-  // “这次响应值不值得换条连接重试”：合成的超时（抖动/挂起）和上游 5xx
-  // 都重试；其余状态（200/206/3xx/4xx）说明上游确实回了话，直接交给上层。
+  // “这次响应值不值得换条连接重试”：只重试明确的边缘限流/网关超时。
+  // 500/501/502 等普通上游错误直接返回，避免把上游故障放大成重试风暴。
   const isRetryableUpstreamResponse = (response) => {
     if (!response) return true;
     if (response.headers.get(MEDIA_UPSTREAM_TIMEOUT_HEADER)) return true;
-    return response.status >= 500 && response.status < 600;
+    return response.status === 503 ||
+      response.status === 504 ||
+      response.status === 524;
   };
 
   // 一次媒体请求内“等响应头”的循环：
@@ -2374,8 +2763,9 @@ async function fetchMediaUpstreamResponse(
         response?.body?.cancel?.();
       } catch {}
       if (attempt + 1 >= headersMaxAttempts) break;
+      const retryAfterMs = retryAfterMilliseconds(response.headers);
       const waitMs = Math.min(
-        MEDIA_UPSTREAM_RETRY_DELAY_MS,
+        Math.max(MEDIA_UPSTREAM_RETRY_DELAY_MS, retryAfterMs),
         Math.max(0, deadline - Date.now() - 1),
       );
       if (waitMs > 0) {
@@ -2409,9 +2799,12 @@ async function fetchMediaUpstreamResponse(
       const rangeHeader = request.headers.get("range");
       const rangeKey = mediaSegmentRangeCacheKey(cacheKey, rangeHeader);
       const cachedRange = MEDIA_SEGMENT_RANGE_CACHE.read(rangeKey);
-      if (cachedRange?.bytes) {
-        const response = mediaRecordResponse(cachedRange, request);
+      if (cachedRange?.bytes && mediaRecordHasValidator(cachedRange)) {
+        const response = cachedMediaSegmentResponse(cachedRange, request);
         if (response) return response;
+        if (request.headers.has("if-range")) {
+          MEDIA_SEGMENT_RANGE_CACHE.forget(rangeKey);
+        }
       }
       // 同一分片的“整段下载”已经在进行（例如另一个没带 Range 的请求）：
       // 等它一次，避免同一分片被下载两遍。没有在下载时不做任何等待。
@@ -2425,42 +2818,39 @@ async function fetchMediaUpstreamResponse(
           if (response) return response;
         }
       }
-      let upstream = await fetchUpstreamWithRetry();
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        if (
-          upstream.status !== 206 ||
-          upstream.headers.has("content-encoding")
-        ) {
-          return upstream;
-        }
-        if (
-          mediaContentTypeLooksLikeErrorDocument(
-            upstream.headers.get("content-type") || "",
-          )
-        ) {
-          try {
-            await upstream.body?.cancel();
-          } catch {}
-          return mediaUpstreamInvalidResponse();
-        }
-        const rangeMatches = mediaRangeResponseMatchesRequest(
-          rangeHeader,
-          upstream.headers,
-        );
-        if (rangeMatches !== false) {
-          return teeMediaRangeResponseBody(
-            upstream,
-            rangeKey,
-            MAX_CACHED_MEDIA_SEGMENT_RANGE_BYTES,
-          );
-        }
+      const upstream = await fetchUpstreamWithRetry();
+      if (
+        upstream.status !== 206 ||
+        upstream.headers.has("content-encoding")
+      ) {
+        return upstream;
+      }
+      if (
+        mediaContentTypeLooksLikeErrorDocument(
+          upstream.headers.get("content-type") || "",
+        )
+      ) {
         try {
           await upstream.body?.cancel();
         } catch {}
-        if (attempt > 0) return mediaUpstreamInvalidResponse();
-        upstream = await fetchUpstreamWithRetry();
+        return mediaUpstreamInvalidResponse();
       }
-      return mediaUpstreamInvalidResponse();
+      const rangeMatches = mediaRangeResponseMatchesRequest(
+        rangeHeader,
+        upstream.headers,
+      );
+      if (rangeMatches === false) {
+        try {
+          await upstream.body?.cancel();
+        } catch {}
+        MEDIA_SEGMENT_RANGE_CACHE.forget(rangeKey);
+        return mediaUpstreamInvalidResponse();
+      }
+      return teeMediaRangeResponseBody(
+        upstream,
+        rangeKey,
+        MAX_CACHED_MEDIA_SEGMENT_RANGE_BYTES,
+      );
     }
     const upstream = await fetchUpstreamWithRetry();
     const response = streamCompleteMediaSegmentResponse(upstream, cacheKey);
@@ -2510,10 +2900,14 @@ async function fetchMediaUpstreamResponse(
 
   const requestedRangeHeader = request.headers.get("range");
   if (!requestedRangeHeader) {
-    const result = await bufferFullEmbeddedTsResponse();
-    const response = bufferedMediaResultResponse(result, request);
-    if (response) return response;
-    return fetchUpstreamWithRetry();
+    const upstream = await fetchUpstreamWithRetry();
+    const result = await streamEmbeddedTsMediaResponse(
+      upstream,
+      sourceUrl,
+      { cacheKey },
+    );
+    if (result?.response) return result.response;
+    return upstream;
   }
 
   let metadata = MEDIA_SEGMENT_PREFIX_CACHE.read(cacheKey);
@@ -3157,43 +3551,20 @@ async function proxyMediaResponse(
   const embeddedTsCandidate = upstreamType.startsWith("image/") ||
     HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
   if (embeddedTsCandidate && !prefixAdjusted) {
-    const bytes = new Uint8Array(await upstream.arrayBuffer());
-    const prefixLength = embeddedMpegTsOffset(bytes);
-    if (prefixLength >= 0) {
-      const mediaBytes = prefixLength > 0 ? bytes.slice(prefixLength) : bytes;
-      const contentRange = headers.get("content-range");
-      if (upstream.status === 206 && contentRange) {
-        const adjusted = adjustedContentRangeAfterPrefix(
-          contentRange,
-          prefixLength,
-          mediaBytes.byteLength,
-        );
-        if (adjusted) {
-          headers.set("content-range", adjusted);
-        } else {
-          headers.delete("content-range");
-        }
-      } else {
-        headers.delete("content-range");
-      }
-      headers.set("accept-ranges", "bytes");
-      headers.set("content-length", String(mediaBytes.byteLength));
-      headers.set("content-type", "video/mp2t");
-      headers.delete("etag");
-      headers.delete("last-modified");
-      return new Response(mediaBytes, {
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers,
-      });
-    }
-    // 真实图片仍然按原样返回，只有带 TS 包头的伪图片才被转换成视频。
-    headers.set("content-length", String(bytes.byteLength));
-    return new Response(bytes, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers,
-    });
+    const cacheKey = request.method === "GET" &&
+      !request.headers.has("range") &&
+      !hlsManifestRequest &&
+      kind !== "key" &&
+      kind !== "manifest" &&
+      kind !== "map"
+      ? mediaSegmentCacheKey(sourceUrl)
+      : "";
+    const result = await streamEmbeddedTsMediaResponse(
+      upstream,
+      sourceUrl,
+      { cacheKey },
+    );
+    if (result?.response) return result.response;
   }
 
   if (
@@ -3750,6 +4121,18 @@ function remainingRequestMs(deadline, fallbackMs = FETCH_TIMEOUT_MS) {
 function positiveEnvMilliseconds(env, name, fallbackMs) {
   const value = Number(env?.[name]);
   return Number.isFinite(value) && value > 0 ? value : fallbackMs;
+}
+
+function retryAfterMilliseconds(headers) {
+  const value = String(headers?.get("retry-after") || "").trim();
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.max(0, Math.floor(seconds * 1000));
+  }
+  const date = Date.parse(value);
+  if (!Number.isFinite(date)) return 0;
+  return Math.max(0, date - Date.now());
 }
 
 async function fetchWithRetry(
