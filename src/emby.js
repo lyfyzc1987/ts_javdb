@@ -190,10 +190,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // （含 D1 持久层，键里含 sources-v4x）都必须失效。
 // v24/v42：HLS 子资源（分片/子清单/密钥）改用“任意公网域名”白名单，并补齐
 // 上游会轮换的 CDN 域名——旧解析结果里那些被 403 的分片地址必须整体失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v34";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v35";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-13-memojav-label-truthful-52";
+const SERVER_BUILD_ID = "2026-10-13-drop-expired-sources-53";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -826,6 +826,45 @@ function hlsUriLooksLikeMediaSegment(value, baseUrl) {
   }
 }
 
+// 上游媒体 CDN 用“带签名的短时效 URL”分发分片（tiktokcdn 的 x-expires、
+// worldstatic 的 e、summitdigitalhub 的 kx 等）。签名一旦过期，分片一定返回
+// 403/410，客户端表现就是“花屏 / 跳段 / 一直加载中”。这类源常常还在缓存里
+// （解析结果缓存 30 分钟、D1 长期层更久），所以必须主动识别，否则会一直把
+// 死源挂给播放器。
+// 判断只看“明确的过期参数名 + 10~13 位纯数字时间戳 + 已过期”三条同时成立，
+// 避免把普通查询串误判成过期。这是确定性证据，不受“清单被截断就没看全”的
+// fail-open 影响。
+const HLS_EXPIRY_QUERY_NAMES = [
+  "x-expires",
+  "x_expires",
+  "expires",
+  "expire",
+  "exp",
+  "e",
+  "kx",
+];
+
+function hlsSignedUrlExpired(value, nowMs = Date.now()) {
+  const uri = String(value || "");
+  if (!uri) return false;
+  let url;
+  try {
+    url = new URL(uri);
+  } catch {
+    return false;
+  }
+  for (const name of HLS_EXPIRY_QUERY_NAMES) {
+    const raw = url.searchParams.get(name);
+    if (!raw || !/^\d{9,13}$/.test(raw)) continue;
+    const numeric = Number(raw);
+    if (!Number.isFinite(numeric)) continue;
+    // 13 位按毫秒、其余按秒；任何“过去时间”都算过期。
+    const expiresMs = numeric > 1e12 ? numeric : numeric * 1000;
+    if (expiresMs < nowMs) return true;
+  }
+  return false;
+}
+
 function bytesLookLikeFont(bytes) {
   const signatures = [
     [0x77, 0x4f, 0x46, 0x32], // wOF2
@@ -1278,6 +1317,11 @@ async function validateHlsPlaylistSource(
     }
     if (hlsUriLooksLikeMediaSegment(entry.uri, baseUrl)) {
       attemptedSegment = true;
+      // 签名已过期 = 死源：分片必然 403/410，即使清单本身能被截断式扫描
+      // 看到也不能按 fail-open 保留，否则播放器点到这条源就花屏/跳段。
+      if (hlsSignedUrlExpired(entry.uri)) {
+        return false;
+      }
       if (await probeRemoteHlsSegment(
         entry.uri,
         fetchImpl,

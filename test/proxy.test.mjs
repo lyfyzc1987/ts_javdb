@@ -298,7 +298,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v34",
+    version: "item-dto-v35",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -3657,6 +3657,93 @@ test("keeps a remote HLS source only after a playable segment probe", async () =
     [masterUrl, childUrl, segmentUrl],
   );
   assert.equal(new Headers(segmentHeaders).get("range"), "bytes=0-511");
+});
+
+test("drops remote HLS sources whose segment signature already expired", async () => {
+  const sourceUrl =
+    "https://sn3k.summitdigitalhub.space/v4/cvo/mpbydi/index.m3u8";
+
+  const run = async (segmentUrl) => {
+    const calls = [];
+    const response = await handleProxy(
+      new Request("https://clone.example/Items/42/PlaybackInfo", {
+        method: "POST",
+      }),
+      {},
+      {},
+      async (url) => {
+        const target = String(url);
+        calls.push(target);
+        if (target.includes("/v4/movies/42")) {
+          return new Response(
+            JSON.stringify({
+              success: 1,
+              data: {
+                movie: { id: 42, number: "RCTD-740", title: "RCTD-740" },
+              },
+            }),
+            { headers: { "content-type": "application/json" } },
+          );
+        }
+        if (target.includes(`${RESOLVER}/api/v/resolve`)) {
+          return new Response(
+            JSON.stringify({
+              variants: [{
+                variant: "gg_reducing",
+                sourceUrl,
+                sourceType: "application/vnd.apple.mpegurl",
+              }],
+            }),
+            { headers: { "content-type": "application/json" } },
+          );
+        }
+        if (target === sourceUrl) {
+          return new Response([
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            "#EXT-X-TARGETDURATION:10",
+            "#EXTINF:10,",
+            segmentUrl,
+            "#EXT-X-ENDLIST",
+          ].join("\n"), {
+            headers: { "content-type": "application/vnd.apple.mpegurl" },
+          });
+        }
+        if (target === segmentUrl) {
+          return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0x00]), {
+            status: 206,
+            headers: { "content-type": "video/mp2t" },
+          });
+        }
+        assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
+        return new Response(
+          JSON.stringify({ code: 0, data: [] }),
+          { headers: { "content-type": "application/json" } },
+        );
+      },
+    );
+    const payload = await response.json();
+    return { calls, payload };
+  };
+
+  // 签名 kx 已过期（2026-10-06）：分片一定 403/410，签名过期是确定性证据，
+  // 必须直接丢弃，不能因为清单行数被截断就按 fail-open 保留死源。
+  const expiredSegmentUrl =
+    "https://sn3k.summitdigitalhub.space/v4/cvo/mpbydi/seg-1.woff2" +
+    "?k=abc&kx=1791245139";
+  const expired = await run(expiredSegmentUrl);
+  assert.equal(expired.calls.includes(expiredSegmentUrl), false);
+  assert.equal(expired.payload.MediaSources.length, 1);
+  assert.equal(expired.payload.MediaSources[0].Name, "自动线路");
+
+  // 签名仍有效（kx = 2100-01-01）：正常探测并保留线路。
+  const liveSegmentUrl =
+    "https://sn3k.summitdigitalhub.space/v4/cvo/mpbydi/seg-1.woff2" +
+    "?k=abc&kx=4102444800";
+  const live = await run(liveSegmentUrl);
+  assert.equal(live.calls.includes(liveSegmentUrl), true);
+  assert.equal(live.payload.MediaSources.length, 1);
+  assert.notEqual(live.payload.MediaSources[0].Name, "自动线路");
 });
 
 test("probes ordinary remote MP4 resolver sources before advertising them", async () => {
