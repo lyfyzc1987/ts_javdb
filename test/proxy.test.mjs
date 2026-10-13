@@ -298,7 +298,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v36",
+    version: "item-dto-v37",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -6444,6 +6444,128 @@ test("serves inline HLS variants through a short Emby stream URL", async () => {
   assert.match(stream.headers.get("content-type"), /application\/vnd\.apple\.mpegurl/);
   const rewritten = await stream.text();
   assert.match(rewritten, /^https:\/\/media\.example\/segment\.ts$/m);
+});
+
+test("serves GG pseudo-HLS segments as direct CDN byterange for compatible players", async () => {
+  // 服务器GG / fcjav / javgg 的分片是「70 字节 PNG 外壳 + 纯 TS」。上游 CDN
+  // 会把超长的单段 Range clamp 到真实总长，所以可以把分片改写成
+  // EXT-X-BYTERANGE 让播放器直接向 CDN 取 bytes=70-...，媒体流量不再经过
+  // Worker（零流量）；不兼容的客户端（AVPlayer 等）仍走代理剥壳。
+  const segmentA =
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/ad-site-i18n-sg/aaa~tplv-d5opwmad15-ttam-origin.image?x-expires=1814258524";
+  const segmentB =
+    "https://p19-ad-site-sign-sg.tiktokcdn.com/ad-site-i18n-sg/bbb~tplv-d5opwmad15-ttam-origin.image?x-expires=1814258524";
+  const playlist = [
+    "#EXTM3U",
+    "#EXT-X-TARGETDURATION:10",
+    "#EXT-X-VERSION:3",
+    "#EXT-X-MEDIA-SEQUENCE:1",
+    "#EXTINF:10.010,",
+    segmentA,
+    "#EXTINF:10.010,",
+    segmentB,
+    "#EXT-X-ENDLIST",
+    "",
+  ].join("\n");
+  const inlineSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(playlist)}`;
+  // 70 字节 PNG 外壳 + 3 个 TS 包，满足 embeddedMpegTsOffset 的包序列校验。
+  const embeddedTs = (() => {
+    const bytes = new Uint8Array(70 + 188 * 3);
+    bytes.fill(0x11);
+    for (let index = 0; index < 70; index += 1) bytes[index] = index & 0xff;
+    for (const offset of [70, 70 + 188, 70 + 376]) bytes[offset] = 0x47;
+    return bytes;
+  })();
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    if (target.includes("/v4/movies/42")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: { movie: { id: 42, number: "RCTD-740", title: "GG Inline" } },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes(`${RESOLVER}/api/v/resolve`)) {
+      return new Response(
+        JSON.stringify({
+          variants: [{
+            variant: "javgg_original",
+            label: "原版 (服务器GG)",
+            sourceUrl: inlineSource,
+            sourceType: "application/vnd.apple.mpegurl",
+          }],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target === segmentA || target === segmentB) {
+      return new Response(embeddedTs, {
+        status: 206,
+        headers: { "content-type": "image/png" },
+      });
+    }
+    if (target.includes("/api/subtitle")) {
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const playback = await handleProxy(
+    new Request(
+      "https://clone.example/emby/Items/42/PlaybackInfo?api_key=bbjavdb-guest",
+      { method: "POST" },
+    ),
+    {},
+    {},
+    fetchImpl,
+  );
+  const mediaSource = (await playback.json()).MediaSources[0];
+  assert.equal(mediaSource.Container, "m3u8");
+  const streamUrl = new URL(
+    mediaSource.DirectStreamUrl,
+    "https://clone.example",
+  ).toString();
+
+  // 浏览器 / hls.js：分片直连 CDN，零 Worker 媒体流量。
+  const browserStream = await handleProxy(
+    new Request(streamUrl, {
+      headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0" },
+    }),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(browserStream.status, 200);
+  const browserPlaylist = await browserStream.text();
+  assert.equal(
+    (browserPlaylist.match(/#EXT-X-BYTERANGE:16777216@70/g) || []).length,
+    2,
+  );
+  assert.match(browserPlaylist, /^#EXT-X-VERSION:4$/m);
+  assert.doesNotMatch(browserPlaylist, /#EXT-X-VERSION:3/);
+  assert.ok(browserPlaylist.includes(segmentA), segmentA);
+  assert.ok(browserPlaylist.includes(segmentB), segmentB);
+  assert.doesNotMatch(browserPlaylist, /\/emby-media\//);
+
+  // AVPlayer 等不能处理 image/png 分片的客户端：继续走代理剥壳。
+  const appleStream = await handleProxy(
+    new Request(streamUrl, {
+      headers: { "user-agent": "AppleCoreMedia/1.0.0.20L498 (iPhone; U; CPU OS)" },
+    }),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(appleStream.status, 200);
+  const applePlaylist = await appleStream.text();
+  assert.doesNotMatch(applePlaylist, /#EXT-X-BYTERANGE/);
+  assert.match(applePlaylist, /\/emby-media\//);
 });
 
 test("rewrites master and child HLS manifests through the local media proxy", async () => {
