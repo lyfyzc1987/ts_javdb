@@ -190,10 +190,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // （含 D1 持久层，键里含 sources-v4x）都必须失效。
 // v24/v42：HLS 子资源（分片/子清单/密钥）改用“任意公网域名”白名单，并补齐
 // 上游会轮换的 CDN 域名——旧解析结果里那些被 403 的分片地址必须整体失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v35";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v36";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-13-drop-expired-sources-53";
+const SERVER_BUILD_ID = "2026-10-13-head-embedded-ts-54";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -2419,6 +2419,100 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
   };
 }
 
+// HEAD 请求在伪 HLS 分片上必须给出与 GET 一致的语义头部。上游把 TS 装在
+// PNG/图片外壳里：Content-Type 是 image/png，Content-Length 还包含外壳前缀。
+// 若原样转发，播放器在取流前先发一次 HEAD 时会看到 image/png，直接判定
+// “这不是视频”，表现就是花屏 / 跳段 / 一直加载中。这里复用前缀缓存；未命中
+// 时只回源探测前 REMOTE_MEDIA_PROBE_BYTES 字节（不下载整段），算出真实类型和
+// 长度后写进缓存。探测失败时至少把类型纠正为 video/mp2t，绝不把图片类型透传。
+async function probeEmbeddedTsSegmentMetadata(
+  sourceUrl,
+  request,
+  env,
+  options,
+  cacheKey,
+) {
+  const fetchImpl = typeof options?.fetchImpl === "function"
+    ? options.fetchImpl
+    : fetch;
+  try {
+    const probeHeaders = mediaProxyRequestHeaders(request, env, sourceUrl, {});
+    probeHeaders.set(
+      "range",
+      `bytes=0-${Math.max(0, REMOTE_MEDIA_PROBE_BYTES - 1)}`,
+    );
+    const probe = await fetchWithTimeout(
+      fetchImpl,
+      sourceUrl,
+      { method: "GET", headers: probeHeaders, redirect: "follow" },
+      MEDIA_UPSTREAM_HEADERS_TIMEOUT_MS,
+    );
+    const prefix = await readMediaResponsePrefix(
+      probe,
+      REMOTE_MEDIA_PROBE_BYTES,
+    );
+    const offset = embeddedMpegTsOffset(prefix.bytes);
+    const range = parseMediaContentRange(
+      probe.headers.get("content-range") || "",
+    );
+    const contentLength = Number(probe.headers.get("content-length"));
+    const complete = prefix.complete ||
+      (probe.status === 200 &&
+        Number.isSafeInteger(contentLength) &&
+        contentLength === prefix.bytes.byteLength);
+    const total = range?.total ??
+      (probe.status === 200 && Number.isSafeInteger(contentLength)
+        ? contentLength
+        : complete
+          ? prefix.bytes.byteLength
+          : null);
+    const rangeStartsAtZero = !range || range.start === 0;
+    if (offset >= 0 && total && rangeStartsAtZero) {
+      const metadata = mediaSegmentPrefixMetadata(offset, total, "video/mp2t");
+      if (metadata) {
+        if (cacheKey) MEDIA_SEGMENT_PREFIX_CACHE.write(cacheKey, metadata);
+        return metadata;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+async function applyEmbeddedTsHeadHeaders(
+  upstream,
+  sourceUrl,
+  request,
+  env,
+  options,
+  headers,
+) {
+  headers.set("content-type", "video/mp2t");
+  headers.set("accept-ranges", "bytes");
+  headers.delete("etag");
+  headers.delete("last-modified");
+  headers.delete("content-range");
+  const cacheKey = mediaSegmentCacheKey(sourceUrl);
+  let metadata = MEDIA_SEGMENT_PREFIX_CACHE.read(cacheKey) || null;
+  if (!metadata) {
+    metadata = await probeEmbeddedTsSegmentMetadata(
+      sourceUrl,
+      request,
+      env,
+      options,
+      cacheKey,
+    );
+  }
+  const length = metadata && metadata.upstreamTotal > 0
+    ? Math.max(0, metadata.upstreamTotal - metadata.prefixLength)
+    : 0;
+  if (length > 0) {
+    headers.set("content-length", String(length));
+  } else {
+    headers.delete("content-length");
+  }
+  return headers;
+}
+
 function responseFromBufferedBytes(upstream, bytes) {
   const headers = new Headers(upstream.headers);
   headers.delete("content-encoding");
@@ -3739,7 +3833,27 @@ async function proxyMediaResponse(
   ) {
     headers.set("content-type", "application/octet-stream");
   }
+  let pathname = "";
+  try {
+    pathname = new URL(sourceUrl).pathname;
+  } catch {}
+  const embeddedTsCandidate = upstreamType.startsWith("image/") ||
+    HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
   if (request.method === "HEAD" || !upstream.body) {
+    // 伪 HLS 分片的上游外壳是 image/png，且 Content-Length 含前缀。播放器在
+    // 取流前先发 HEAD 时会根据这里的头部判断“能不能播”；原样透传图片类型会
+    // 让它直接放弃（花屏 / 跳段 / 一直加载中）。这里把头部纠正成真实的
+    // video/mp2t 语义（未命中前缀缓存时只探测前几百字节，不下载整段）。
+    if (request.method === "HEAD" && embeddedTsCandidate && !prefixAdjusted) {
+      await applyEmbeddedTsHeadHeaders(
+        upstream,
+        sourceUrl,
+        request,
+        env,
+        options,
+        headers,
+      );
+    }
     return new Response(null, {
       status: upstream.status,
       statusText: upstream.statusText,
@@ -3747,12 +3861,6 @@ async function proxyMediaResponse(
     });
   }
 
-  let pathname = "";
-  try {
-    pathname = new URL(sourceUrl).pathname;
-  } catch {}
-  const embeddedTsCandidate = upstreamType.startsWith("image/") ||
-    HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
   if (embeddedTsCandidate && !prefixAdjusted) {
     const cacheKey = request.method === "GET" &&
       !request.headers.has("range") &&

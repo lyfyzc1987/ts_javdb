@@ -298,7 +298,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v35",
+    version: "item-dto-v36",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -7666,6 +7666,59 @@ test("maps pseudo PNG ranges beyond the prefix probe without a full download", a
     new Uint8Array(await response.arrayBuffer()),
     rawBytes.slice(370, 558),
   );
+});
+
+test("answers HEAD on a pseudo PNG segment with video/mp2t and prefix-free length", async () => {
+  const sourceUrl =
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/head-probe.image?token=head";
+  const pseudoPngBytes = new Uint8Array(512);
+  pseudoPngBytes.set([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ], 0);
+  pseudoPngBytes[70] = 0x47;
+  pseudoPngBytes[258] = 0x47;
+  pseudoPngBytes[446] = 0x47;
+  const methods = [];
+
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`,
+      { method: "HEAD" },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      const method = init.method || "GET";
+      methods.push(method);
+      if (method === "HEAD") {
+        return new Response(null, {
+          status: 200,
+          headers: {
+            "content-length": String(pseudoPngBytes.length),
+            "content-type": "image/png",
+          },
+        });
+      }
+      assert.equal(init.headers.get("range"), "bytes=0-511");
+      return new Response(pseudoPngBytes, {
+        status: 200,
+        headers: {
+          "content-length": String(pseudoPngBytes.length),
+          "content-type": "image/png",
+        },
+      });
+    },
+  );
+
+  assert.deepEqual(methods, ["HEAD", "GET"]);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "video/mp2t");
+  assert.equal(response.headers.get("accept-ranges"), "bytes");
+  assert.equal(
+    response.headers.get("content-length"),
+    String(pseudoPngBytes.length - 70),
+  );
+  assert.equal(await response.text(), "");
 });
 
 test("reassembles every pseudo PNG virtual range without dropping TS bytes", async () => {
