@@ -298,7 +298,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v33",
+    version: "item-dto-v34",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -908,15 +908,17 @@ test("does not adopt orphan playback buckets when the deployment has multiple us
   assert.equal((await readBack.json()).PlaybackPositionTicks, 0);
 });
 
-test("reports a D1 write failure instead of silently accepting playback state", async () => {
+test("keeps playback progress best-effort but still reports authoritative delete failures", async () => {
   const env = { PLAYBACK_DB: createPlaybackD1({ failWrites: true }) };
   const progress = await callLocalEmby(embyJsonRequest("/Sessions/Playing", {
     ItemId: "42",
     PlaySessionId: "session-d1-broken",
     PositionTicks: 120_000_000,
   }), env);
-  assert.equal(progress.status, 503);
+  // 播放进度上报是旁路：持久化失败降级为日志，仍回 204，播放器退出时不再弹 503。
+  assert.equal(progress.status, 204);
 
+  // 删除记录是权威操作：写入失败必须回错误，不能悄悄告诉客户端“已删除”。
   const deleted = await callLocalEmby(
     embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"),
     env,
@@ -2074,7 +2076,7 @@ test("strips parsing-state text from every media source response boundary", asyn
   assert.equal(detail.status, 200);
   assert.deepEqual(
     detailPayload.MediaSources.map((source) => source.Name),
-    ["MemoJav 自动线路", "MemoJav 线路 2"],
+    ["自动线路", "线路 2"],
   );
   assert.doesNotMatch(JSON.stringify(detailPayload), /解析中/);
 
@@ -2091,7 +2093,7 @@ test("strips parsing-state text from every media source response boundary", asyn
   assert.equal(playback.status, 200);
   assert.deepEqual(
     playbackPayload.MediaSources.map((source) => source.Name),
-    ["MemoJav 自动线路", "MemoJav 线路 2"],
+    ["自动线路", "线路 2"],
   );
   assert.doesNotMatch(JSON.stringify(playbackPayload), /解析中/);
 });
@@ -2921,7 +2923,7 @@ test("keeps late GetAV sources after early pseudo-HLS variants", async () => {
   assert.equal(payload.MediaSources.length, 2);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["MemoJav getav_raw_4k", "MemoJav getav_raw_1080p"],
+    ["getav_raw_4k", "getav_raw_1080p"],
   );
   for (const source of payload.MediaSources) {
     assert.match(source.Path, /fast-stream\.jav\.si/);
@@ -3027,10 +3029,10 @@ test("keeps extensionless Google Drive HLS and embedded TS .image HLS", async ()
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
     [
-      "MemoJav fcjav 原版",
-      "MemoJav fcjav 去码版",
-      "MemoJav javgg_original",
-      "MemoJav 去码版",
+      "fcjav 原版",
+      "fcjav 去码版",
+      "javgg_original",
+      "去码版",
     ],
   );
   assert.equal(
@@ -3127,7 +3129,7 @@ test("prefixes fcjav bare original/reducing labels with the provider name", asyn
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["MemoJav fcjav 原版", "MemoJav fcjav 去码版"],
+    ["fcjav 原版", "fcjav 去码版"],
   );
 });
 
@@ -3399,10 +3401,10 @@ test("keeps four RCTD-740 playback sources including GG font-path HLS variants",
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
     [
-      "MemoJav GetAV 原版 4K",
-      "MemoJav GetAV 原版 1080P",
-      "MemoJav 服务器GG 原版",
-      "MemoJav 服务器GG 去码版",
+      "GetAV 原版 4K",
+      "GetAV 原版 1080P",
+      "服务器GG 原版",
+      "服务器GG 去码版",
     ],
   );
   assert.equal(
@@ -3496,7 +3498,7 @@ test("keeps AES-128 HLS sources whose encrypted segments use font paths", async 
   const payload = await response.json();
   assert.equal(response.status, 200);
   assert.equal(payload.MediaSources.length, 1);
-  assert.equal(payload.MediaSources[0].Name, "MemoJav RCTD-740");
+  assert.equal(payload.MediaSources[0].Name, "RCTD-740");
   assert.equal(payload.MediaSources[0].Container, "m3u8");
   assert.equal(calls.includes(keyUrl), true);
   assert.equal(calls.includes(segmentUrl), true);
@@ -3921,7 +3923,7 @@ test("merges one public resolver source with two Javtiful qualities", async () =
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["MemoJav 原版", "MemoJav Javtiful 1080P", "MemoJav Javtiful 720P"],
+    ["原版", "MemoJav Javtiful 1080P", "MemoJav Javtiful 720P"],
   );
   const javtifulSources = payload.MediaSources.filter((source) =>
     source.Name.includes("Javtiful ")
@@ -5690,7 +5692,7 @@ test("drops pseudo-HLS supplements and keeps validated self-hosted lines", async
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name).sort(),
-    ["MemoJav 原版", "MemoJav Javtiful 720P", "MemoJav GetAV 原版 4K"].sort(),
+    ["原版", "MemoJav Javtiful 720P", "GetAV 原版 4K"].sort(),
   );
   assert.equal(calls.includes(pseudoImageUrl), false);
 });
@@ -6000,10 +6002,10 @@ test("loads all GetAV qualities through parallel page requests", async () => {
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
     [
-      "MemoJav GetAV 原版 4K",
-      "MemoJav GetAV 原版 1080P",
-      "MemoJav GetAV 原版 720P",
-      "MemoJav GetAV 原版 480P",
+      "GetAV 原版 4K",
+      "GetAV 原版 1080P",
+      "GetAV 原版 720P",
+      "GetAV 原版 480P",
     ],
   );
   assert.deepEqual(

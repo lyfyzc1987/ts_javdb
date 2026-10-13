@@ -190,10 +190,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // （含 D1 持久层，键里含 sources-v4x）都必须失效。
 // v24/v42：HLS 子资源（分片/子清单/密钥）改用“任意公网域名”白名单，并补齐
 // 上游会轮换的 CDN 域名——旧解析结果里那些被 403 的分片地址必须整体失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v33";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v34";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-12-memojav-provider-labels-51";
+const SERVER_BUILD_ID = "2026-10-13-memojav-label-truthful-52";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -9243,6 +9243,11 @@ function mediaSource(
     : useGetavRedirect
       ? buildGetavRedirectUrl()
       : buildProxyStreamUrl(streamExtension);
+  // "MemoJav" 代表媒体流量不经过 Worker 的 302 短链（GetAV / Javtiful 直链）。
+  // 只有真正走 302 的线路才加这个前缀；走 /Videos/{id}/stream 代理的线路
+  // （data: 内联 HLS、服务器GG / fcjav / javgg 等）仍显示原本的来源名，
+  // 否则用户会以为这些源也是零流量短链。
+  const isZeroTransferSource = useDirectRedirect || useGetavRedirect;
   const subtitleStreams = subtitles.map((subtitle, index) => {
     const streamIndex = index + 2;
     const deliveryUrl = new URL(
@@ -9277,7 +9282,7 @@ function mediaSource(
     Id: mediaSourceId,
     MediaSourceId: mediaSourceId,
     Name: mediaSourceDisplayName(
-      video.memoJavLabel
+      isZeroTransferSource
         ? `MemoJav ${
           providerFirstSourceName(
             providerPrefixedLabel(video.sourceName || video.title, video.variant),
@@ -9622,7 +9627,6 @@ async function mediaSourcesForMovie(
       token,
       {
         ...variant,
-        memoJavLabel: true,
         sourceName: variant.sourceName ||
           (variants.length > 1 ? videoVariantLabel(variant, index, variants.length) : ""),
       },
@@ -10343,15 +10347,32 @@ async function durableDbRead(db, namespace, key) {
 }
 
 async function durableDbWrite(db, namespace, key, value) {
-  await db
-    .prepare(
-      "INSERT INTO playback_json (namespace, key, value, updated_at) " +
-      "VALUES (?, ?, CAST(? AS TEXT), ?) " +
-      "ON CONFLICT(namespace, key) DO UPDATE SET " +
-      "value = excluded.value, updated_at = excluded.updated_at",
-    )
-    .bind(namespace, key, JSON.stringify(value), Date.now())
-    .run();
+  const statement = db.prepare(
+    "INSERT INTO playback_json (namespace, key, value, updated_at) " +
+    "VALUES (?, ?, CAST(? AS TEXT), ?) " +
+    "ON CONFLICT(namespace, key) DO UPDATE SET " +
+    "value = excluded.value, updated_at = excluded.updated_at",
+  );
+  const payload = JSON.stringify(value);
+  // D1 在并发写同一行 / 短暂限流时会抛瞬时错误（客户端表现为“退出播放就 503”
+  // 或“移除记录没生效”）。这里对“写失败”做一次短重试：绝大多数抖动是毫秒级
+  // 的，重试一次就能把权威写入（删除墓碑、播放进度）落盘，避免把瞬时故障
+  // 直接放大成用户可见的错误。
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await statement.bind(namespace, key, payload, Date.now()).run();
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("D1 write failed");
 }
 
 // —— 零配置持久化兜底 ——
@@ -12818,18 +12839,18 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
     path === "/Sessions/Playing/Progress" ||
     path === "/Sessions/Playing/Stopped"
   ) {
+    // 播放进度 / 停止上报属于“尽力而为”的旁路上报：真正的状态在写入内存后
+    // 已经可用，持久化（D1）偶发失败不应该让客户端收到 503——用户看到的就是
+    // “退出播放就报错”。这里把异常降级为日志，仍然返回 204 让客户端正常退出，
+    // 墓碑 + 内存态仍能挡住迟到脏写，保证删除记录不会被旧上报带回来。
     try {
       await recordPlaybackEvent(path, request, env);
     } catch (error) {
       console.error(JSON.stringify({
-        message: "Playback event handling failed",
+        message: "Playback event persistence failed",
         path,
         error: error instanceof Error ? error.message : String(error),
       }));
-      return errorResponse(
-        503,
-        "Playback state is temporarily unavailable; retry the request",
-      );
     }
     return noContentResponse();
   }
