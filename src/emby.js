@@ -190,12 +190,14 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // （含 D1 持久层，键里含 sources-v4x）都必须失效。
 // v24/v42：HLS 子资源（分片/子清单/密钥）改用“任意公网域名”白名单，并补齐
 // 上游会轮换的 CDN 域名——旧解析结果里那些被 403 的分片地址必须整体失效。
-// v37：服务器GG / fcjav / javgg 的伪 HLS 分片改用 EXT-X-BYTERANGE 直连上游
-// CDN（零 Worker 媒体流量）。清单形态变了，旧 DTO / 旧解析缓存必须失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v37";
+// v38：服务器GG / fcjav / javgg 的伪 HLS 分片回退成 Worker 代理剥壳（video/mp2t）。
+// v37 的「EXT-X-BYTERANGE 直连 CDN 零流量」方案在真实播放器上会一直加载/黑屏
+// （CDN 对 4MB+ 的 Range 请求长时间不吐字节），清单形态再次变化，
+// 旧 DTO / 旧解析缓存必须失效。
+const ITEM_DTO_ETAG_VERSION = "item-dto-v38";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-13-head-embedded-ts-55";
+const SERVER_BUILD_ID = "2026-10-14-head-proxy-embedded-ts-56";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -786,59 +788,21 @@ const HLS_IMAGE_RESOURCE_PATTERN = /\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)/
 const HLS_AES_KEY_LENGTH = 16;
 const HLS_AES_BLOCK_LENGTH = 16;
 // 服务器GG / fcjav / javgg 的分片是「固定 70 字节 PNG 外壳 + 纯 TS」的伪 HLS：
-// 上游 CDN 把 .image 当图片托管，但真实内容是整段 MPEG-TS，0x47 同步字节
-// 固定在 offset 70（PNG 头 + IEND 共 70 字节，样本跨 3 条线路、index 0~1948
-// 逐个字节一致）。这类分片如果让播放器整段直连，会拿到带外壳的 image/png，
-// 表现为花屏/跳段，所以旧代码把它们全部塞回 Worker 代理。
+// 上游 CDN 把 .image / .woff2 / 无扩展名短链当图片、字体托管，真实内容却是整段
+// MPEG-TS，0x47 同步字节固定在 offset 70（样本跨多条线路、index 0~1948 逐个
+// 字节一致）。播放器整段直连只会拿到带外壳的 image/png（或 font/woff2），
+// 表现为黑屏 / 一直加载 / 花屏，所以这些分片一律回 Worker 代理：代理剥掉外壳、
+// 改回 video/mp2t 再吐给播放器。
 //
-// 实测该 CDN 对超长的单段 Range 会 clamp 到真实总长：
-//   Range: bytes=70-8388607  →  206 Content-Range: bytes 70-<total-1>/<total>
-// 因此可以在清单里用 HLS 的 EXT-X-BYTERANGE 让播放器直接向 CDN 发
-// `Range: bytes=70-...`，拿到的就是没有外壳的纯 TS —— 媒体流量完全不经过
-// Worker（零流量），Worker 只负责产出清单。分片长度按上界给，CDN 会截断到
-// 真实长度，播放器按 EXTINF 驱动，不受影响。
-const EMBEDDED_TS_DIRECT_HOST_PATTERN = /(?:^|\.)tiktokcdn\.com$/i;
-const EMBEDDED_TS_PREFIX_BYTES = 70;
-// 上界要大于任何单段分片（实测 10s 段约 0.5~1.6MB），CDN 会把超出部分裁掉。
-const EMBEDDED_TS_BYTERANGE_SPAN = 16 * 1024 * 1024;
-// 只有能正确处理「byterange 分片 + image/png 响应体」的客户端才走直连；
-// 其余（AVPlayer、未知/空 UA 等）继续走 Worker 代理，由代理剥壳并改回
-// video/mp2t，保证兼容性不退化。
-const EMBEDDED_TS_DIRECT_USER_AGENTS = new Set([
-  "mozilla", // 浏览器 / Electron（Emby 网页端、桌面端）用的 hls.js
-  "vlc",
-  "lavf", // ffmpeg / PotPlayer 等
-  "mpv",
-  "libmpv",
-  "exoplayer",
-  "exoplayerlib", // Emby Android / Android TV
-  "stagefright",
-  "infuse",
-  "infuse-direct",
-]);
-
-function embeddedTsClientAllowsDirectRange(userAgent) {
-  const normalized = String(userAgent || "").trim().toLowerCase();
-  if (!normalized) return false;
-  const products = normalized.match(/[a-z0-9][a-z0-9._-]*/g) || [];
-  return products.some((product) => EMBEDDED_TS_DIRECT_USER_AGENTS.has(product));
-}
-
-// 命中「可直连的伪 HLS 分片」时返回原始 CDN 地址，否则返回 null。
-// 只认已验证会 clamp Range 的 tiktokcdn，其它主机继续走代理，避免把不支持的
-// CDN（可能对超长 Range 返回 416）误判成直连。
-function embeddedTsDirectSegmentUrl(value, baseUrl) {
-  let target;
-  try {
-    target = new URL(value, baseUrl);
-  } catch {
-    return null;
-  }
-  if (target.protocol !== "https:" && target.protocol !== "http:") return null;
-  if (!EMBEDDED_TS_DIRECT_HOST_PATTERN.test(target.hostname)) return null;
-  if (!HLS_EMBEDDED_TS_IMAGE_PATTERN.test(target.pathname)) return null;
-  return target.toString();
-}
+// 2026-10 实测过「清单里写 EXT-X-BYTERANGE，让播放器直接向 CDN 取 bytes=70-16MiB」
+// 的零流量方案：CDN 确实会返回 206 + 纯 TS（Content-Range 被 clamp 到真实长度），
+// 但真实播放器/ffmpeg 拉这种 4MB+ 的 Range 会长时间不吐字节（8 分钟 0 进度），
+// 用户看到的就是黑屏 / 一直加载。可播性优先，这里不再走直连。
+//
+// 清单改写阶段拿不到响应体，只能用 URI 形状判断；只要分片地址不是「一眼就是普通
+// 媒体文件」（.ts/.m4s/.mp4…）就交给代理，未知 CDN 的签名短链也不会漏掉。
+const HLS_DIRECT_SEGMENT_PATH_PATTERN =
+  /\.(?:ts|m2ts|m4s|mp4|m4v|aac|m4a|mp3|ac3|ec3|webvtt|vtt|key)(?:[?#]|$)/i;
 
 function hlsPathLooksLikeMediaSegment(pathname) {
   return INLINE_HLS_SEGMENT_PATTERN.test(pathname) ||
@@ -3495,9 +3459,18 @@ function rewriteHlsTagUris(line, baseUrl, requestUrl, depth) {
 //   3) 图片文件（可能是伪装成图片的伪 HLS 数据）
 function hlsSegmentShouldProxy(url) {
   const pathname = url.pathname.toLowerCase();
-  return HLS_FONT_RESOURCE_PATTERN.test(pathname) ||
+  if (
+    HLS_FONT_RESOURCE_PATTERN.test(pathname) ||
     HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname) ||
-    HLS_IMAGE_RESOURCE_PATTERN.test(pathname);
+    HLS_IMAGE_RESOURCE_PATTERN.test(pathname)
+  ) {
+    return true;
+  }
+  // 服务器GG / fcjav / javgg 的分片 CDN 域名每部片子都不一样（qooglecdn.com、
+  // *.tiktokcdn.com、*.creativegrowthworld.site…），路径还可能是 "/" 或
+  // /v4/xxx/seg-1-f1-v1-a1.woff2 这种假扩展名，无法在改写阶段枚举。
+  // 因此反过来判：只有一眼就是普通媒体文件的分片才直连，其余一律走代理剥壳。
+  return !HLS_DIRECT_SEGMENT_PATH_PATTERN.test(pathname);
 }
 
 function hlsSegmentDirectUrl(line, baseUrl, requestUrl, depth, encrypted) {
@@ -3537,8 +3510,6 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth, options = 
   const output = [];
   let encrypted = false;
   let nextUriKind = "";
-  let usedByteRange = false;
-  let sawVersionLine = false;
   for (const rawLine of source.replace(/\r\n?/g, "\n").split("\n")) {
     const line = rawLine.trim();
     if (!line) {
@@ -3547,14 +3518,7 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth, options = 
     }
     if (line.startsWith("#")) {
       if (/^#EXT-X-VERSION:/i.test(line)) {
-        sawVersionLine = true;
-        // EXT-X-BYTERANGE 需要版本 >= 4，否则严格客户端会忽略分片范围。
-        const version = Number(line.replace(/^#EXT-X-VERSION:/i, "").trim());
-        output.push(
-          options.embeddedTsDirect && Number.isFinite(version) && version < 4
-            ? "#EXT-X-VERSION:4"
-            : rawLine,
-        );
+        output.push(rawLine);
         continue;
       }
       output.push(rewriteHlsTagUris(rawLine, baseUrl, requestUrl, depth));
@@ -3573,20 +3537,9 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth, options = 
     const kind = nextUriKind || "segment";
     nextUriKind = "";
     if (kind === "segment") {
-      const directSegment = options.embeddedTsDirect
-        ? embeddedTsDirectSegmentUrl(line, baseUrl)
-        : null;
-      if (directSegment) {
-        // 让播放器直接向 CDN 取 `bytes=70-<上界>`，CDN clamp 到真实长度后返回
-        // 纯 TS，媒体流量不经过 Worker。
-        output.push(
-          `#EXT-X-BYTERANGE:${EMBEDDED_TS_BYTERANGE_SPAN}@${EMBEDDED_TS_PREFIX_BYTES}`,
-        );
-        output.push(directSegment);
-        usedByteRange = true;
-      } else {
-        output.push(hlsSegmentDirectUrl(line, baseUrl, requestUrl, depth, encrypted));
-      }
+      // 普通媒体文件（.ts/.m4s/.mp4…）直连 CDN 省流量，伪 HLS 分片走本地代理
+      // 剥掉 PNG/字体外壳后回 video/mp2t（详见 hlsSegmentShouldProxy 注释）。
+      output.push(hlsSegmentDirectUrl(line, baseUrl, requestUrl, depth, encrypted));
     } else {
       // 子清单（master -> variant）仍走代理，便于继续重写子清单。
       output.push(hlsProxyUrl(line, baseUrl, requestUrl, depth, {
@@ -3595,10 +3548,6 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth, options = 
         encrypted,
       }));
     }
-  }
-  if (usedByteRange && !sawVersionLine) {
-    // 原清单没有 EXT-X-VERSION 行时补一条，声明使用了 byterange 语法。
-    output.splice(1, 0, "#EXT-X-VERSION:4");
   }
   return output.join("\n");
 }
@@ -12311,11 +12260,6 @@ async function streamResponse(id, request, env, fetchImpl, token, ctx = null) {
             inlineUrl,
             request.url,
             0,
-            {
-              embeddedTsDirect: embeddedTsClientAllowsDirectRange(
-                request.headers.get("user-agent"),
-              ),
-            },
           );
           return new Response(
             request.method === "HEAD" ? null : playlist,

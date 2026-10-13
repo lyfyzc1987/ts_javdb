@@ -298,7 +298,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v37",
+    version: "item-dto-v38",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -6446,15 +6446,18 @@ test("serves inline HLS variants through a short Emby stream URL", async () => {
   assert.match(rewritten, /^https:\/\/media\.example\/segment\.ts$/m);
 });
 
-test("serves GG pseudo-HLS segments as direct CDN byterange for compatible players", async () => {
-  // 服务器GG / fcjav / javgg 的分片是「70 字节 PNG 外壳 + 纯 TS」。上游 CDN
-  // 会把超长的单段 Range clamp 到真实总长，所以可以把分片改写成
-  // EXT-X-BYTERANGE 让播放器直接向 CDN 取 bytes=70-...，媒体流量不再经过
-  // Worker（零流量）；不兼容的客户端（AVPlayer 等）仍走代理剥壳。
+test("proxies GG pseudo-HLS segments for every player instead of direct byterange", async () => {
+  // 服务器GG / fcjav / javgg 的分片是「70 字节 PNG 外壳 + 纯 TS」。Ext-X-BYTERANGE
+  // 直连方案（零流量）在真实播放器上会一直加载/黑屏，所以现在一律回 Worker 代理
+  // 剥壳并改回 video/mp2t；只有一眼就是普通媒体文件（.ts/.m4s/.mp4…）的分片直连。
   const segmentA =
     "https://p16-ad-site-sign-sg.tiktokcdn.com/ad-site-i18n-sg/aaa~tplv-d5opwmad15-ttam-origin.image?x-expires=1814258524";
   const segmentB =
     "https://p19-ad-site-sign-sg.tiktokcdn.com/ad-site-i18n-sg/bbb~tplv-d5opwmad15-ttam-origin.image?x-expires=1814258524";
+  // fcjav 的另一种伪 HLS：CDN 域名随机、路径是 "/"，只能靠扩展名判断。
+  const segmentC = "https://qooglecdn.com/?t=202507035d0d4dbf51af1ed64eb9902a";
+  // 真正的普通分片仍然直连 CDN，保持零 Worker 媒体流量。
+  const segmentD = "https://media.example.com/plain/seg-1.ts";
   const playlist = [
     "#EXTM3U",
     "#EXT-X-TARGETDURATION:10",
@@ -6464,6 +6467,10 @@ test("serves GG pseudo-HLS segments as direct CDN byterange for compatible playe
     segmentA,
     "#EXTINF:10.010,",
     segmentB,
+    "#EXTINF:10.010,",
+    segmentC,
+    "#EXTINF:10.010,",
+    segmentD,
     "#EXT-X-ENDLIST",
     "",
   ].join("\n");
@@ -6501,10 +6508,16 @@ test("serves GG pseudo-HLS segments as direct CDN byterange for compatible playe
         { headers: { "content-type": "application/json" } },
       );
     }
-    if (target === segmentA || target === segmentB) {
+    if (target === segmentA || target === segmentB || target === segmentC) {
       return new Response(embeddedTs, {
         status: 206,
         headers: { "content-type": "image/png" },
+      });
+    }
+    if (target === segmentD) {
+      return new Response(embeddedTs, {
+        status: 200,
+        headers: { "content-type": "video/mp2t" },
       });
     }
     if (target.includes("/api/subtitle")) {
@@ -6532,40 +6545,42 @@ test("serves GG pseudo-HLS segments as direct CDN byterange for compatible playe
     "https://clone.example",
   ).toString();
 
-  // 浏览器 / hls.js：分片直连 CDN，零 Worker 媒体流量。
-  const browserStream = await handleProxy(
-    new Request(streamUrl, {
-      headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0" },
-    }),
-    {},
-    {},
-    fetchImpl,
-  );
-  assert.equal(browserStream.status, 200);
-  const browserPlaylist = await browserStream.text();
-  assert.equal(
-    (browserPlaylist.match(/#EXT-X-BYTERANGE:16777216@70/g) || []).length,
-    2,
-  );
-  assert.match(browserPlaylist, /^#EXT-X-VERSION:4$/m);
-  assert.doesNotMatch(browserPlaylist, /#EXT-X-VERSION:3/);
-  assert.ok(browserPlaylist.includes(segmentA), segmentA);
-  assert.ok(browserPlaylist.includes(segmentB), segmentB);
-  assert.doesNotMatch(browserPlaylist, /\/emby-media\//);
-
-  // AVPlayer 等不能处理 image/png 分片的客户端：继续走代理剥壳。
-  const appleStream = await handleProxy(
-    new Request(streamUrl, {
-      headers: { "user-agent": "AppleCoreMedia/1.0.0.20L498 (iPhone; U; CPU OS)" },
-    }),
-    {},
-    {},
-    fetchImpl,
-  );
-  assert.equal(appleStream.status, 200);
-  const applePlaylist = await appleStream.text();
-  assert.doesNotMatch(applePlaylist, /#EXT-X-BYTERANGE/);
-  assert.match(applePlaylist, /\/emby-media\//);
+  for (
+    const userAgent of [
+      "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0",
+      "AppleCoreMedia/1.0.0.20L498 (iPhone; U; CPU OS)",
+      "",
+    ]
+  ) {
+    const stream = await handleProxy(
+      new Request(streamUrl, { headers: { "user-agent": userAgent } }),
+      {},
+      {},
+      fetchImpl,
+    );
+    assert.equal(stream.status, 200);
+    const playlistBody = await stream.text();
+    // 不再改写 EXT-X-BYTERANGE：CDN 对 4MB+ Range 长时间不吐字节，播放器黑屏。
+    assert.doesNotMatch(playlistBody, /#EXT-X-BYTERANGE/);
+    assert.match(playlistBody, /^#EXT-X-VERSION:3$/m);
+    // 伪 HLS 分片全部走本地代理剥壳，未知 CDN 的无扩展名短链也在内。
+    for (const segment of [segmentA, segmentB, segmentC]) {
+      // 代理 URL 会把 "~" 也转义成 %7E，这里跟着转义后再比对。
+      const proxied = `/emby-media/?url=${
+        encodeURIComponent(segment).replace(/~/g, "%7E")
+      }`;
+      assert.ok(
+        playlistBody.includes(proxied),
+        `${segment} 应该走代理\n${playlistBody}`,
+      );
+      assert.ok(
+        !playlistBody.split("\n").includes(segment),
+        `${segment} 不应该再直连 CDN`,
+      );
+    }
+    // 真正的媒体文件分片保持直连。
+    assert.ok(playlistBody.includes(segmentD), segmentD);
+  }
 });
 
 test("rewrites master and child HLS manifests through the local media proxy", async () => {
