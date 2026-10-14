@@ -197,10 +197,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // 旧 DTO / 旧解析缓存必须失效。
 // v39：收紧实例内多份缓存的内存预算，避免长寿命热点 isolate 在反复解析 /
 // 播放分片后累计超过 Cloudflare Worker 内存上限并返回 503 / 1102。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v39";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-14-linear-resolver-stream-60";
+const SERVER_BUILD_ID = "2026-10-14-first-screen-full-sources-61";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -228,6 +228,9 @@ const REMOTE_HLS_VARIANT_CONCURRENCY = 2;
 const REMOTE_HLS_PROBE_BUDGET = 4;
 const REMOTE_HLS_PROBE_DEPTH = 2;
 const REMOTE_MEDIA_PROBE_BYTES = 512;
+// 同流线路去重的额外探测预算：只取主清单 + 一个分片。串行做是为了避免
+// 校验刚并发跑完又立刻打出第二波并发请求，把 Worker 推向 1102 / 503。
+const HLS_STREAM_IDENTITY_BUDGET_MS = 4500;
 // 上游媒体 CDN（尤其直链 / HLS 分片）会偶发“TCP 已经连上，但迟迟不回响应头”。
 // 旧实现直接 await fetchImpl(...)，没有任何超时：Worker 会一直挂在那里，客户端
 // 看到的就是“点了播放一直加载中”，最后自己弹 Connection timeout。
@@ -274,7 +277,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v44";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v45";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -334,6 +337,103 @@ function md5(value) {
 
   words[bytes.length >>> 2] |= 0x80 << ((bytes.length & 3) * 8);
   const bitLength = bytes.length * 8;
+  words[blockLength - 2] = bitLength;
+  words[blockLength - 1] = Math.floor(bitLength / 4294967296);
+
+  const shifts = [
+    [7, 12, 17, 22],
+    [5, 9, 14, 20],
+    [4, 11, 16, 23],
+    [6, 10, 15, 21],
+  ];
+  const constants = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+    0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+    0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+    0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+    0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+    0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+  ];
+
+  let a = 0x67452301 | 0;
+  let b = 0xefcdab89 | 0;
+  let c = 0x98badcfe | 0;
+  let d = 0x10325476 | 0;
+
+  for (let offset = 0; offset < blockLength; offset += 16) {
+    const originalA = a;
+    const originalB = b;
+    const originalC = c;
+    const originalD = d;
+
+    for (let index = 0; index < 64; index += 1) {
+      let functionValue;
+      let wordIndex;
+      let round;
+
+      if (index < 16) {
+        functionValue = (b & c) | (~b & d);
+        wordIndex = index;
+        round = 0;
+      } else if (index < 32) {
+        functionValue = (d & b) | (~d & c);
+        wordIndex = (5 * index + 1) % 16;
+        round = 1;
+      } else if (index < 48) {
+        functionValue = b ^ c ^ d;
+        wordIndex = (3 * index + 5) % 16;
+        round = 2;
+      } else {
+        functionValue = c ^ (b | ~d);
+        wordIndex = (7 * index) % 16;
+        round = 3;
+      }
+
+      const shifted = add32(
+        a,
+        functionValue,
+        words[offset + wordIndex],
+        constants[index],
+      );
+      const nextA = d;
+      d = c;
+      c = b;
+      b = add32(
+        b,
+        rotateLeft(shifted, shifts[round][index % 4]),
+      );
+      a = nextA;
+    }
+
+    a = add32(a, originalA);
+    b = add32(b, originalB);
+    c = add32(c, originalC);
+    d = add32(d, originalD);
+  }
+
+  return [a, b, c, d].map(littleEndianHex).join("");
+}
+
+function md5Bytes(value) {
+  const blockLength = (((value.length + 8) >>> 6) + 1) * 16;
+  const words = new Int32Array(blockLength);
+
+  for (let index = 0; index < value.length; index += 1) {
+    words[index >>> 2] |= value[index] << ((index & 3) * 8);
+  }
+
+  words[value.length >>> 2] |= 0x80 << ((value.length & 3) * 8);
+  const bitLength = value.length * 8;
   words[blockLength - 2] = bitLength;
   words[blockLength - 1] = Math.floor(bitLength / 4294967296);
 
@@ -1486,6 +1586,82 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl, budget) {
   return true;
 }
 
+// 上游有时会把同一条视频流包装成多条“URL 不同”的线路（例如 GG / fcjav
+// 的伪 HLS 每个分片 URL 都不一样，但字节内容相同）。这类线路发给客户端后，
+// 播放器可能在两条“不同线路”之间切换，表现为花屏 / 跳段，而且每次重播出错
+// 位置不同。探测时顺手算首个分片的短内容指纹，收尾后按指纹去掉同流线路。
+// 指纹只用于同内容去重，缺失或冲突时按 fail-open 保留原线路。
+async function attachHlsStreamIdentity(variant, fetchImpl, budget) {
+  if (!remoteHlsVariant(variant)) return variant;
+  try {
+    let playlist = variant.inlinePlaylist || null;
+    let baseUrl = variant.inlinePlaylist ? "https://inline.invalid/" : variant.sourceUrl;
+    let segment = null;
+    // 清单可能是 master（只列子清单）。为了不把 master 和它的媒体清单当成
+    // 不同身份，最多往下取两层子清单再找首个视频分片。
+    for (let depth = 0; depth < 3 && !segment; depth += 1) {
+      if (playlist === null) {
+        const response = await fetchRemoteHlsResponse(baseUrl, fetchImpl, { budget });
+        if (!response?.ok) return variant;
+        playlist = await response.text();
+      }
+      const entries = await hlsPlaylistMediaEntries(
+        playlist,
+        baseUrl,
+        fetchImpl,
+        budget,
+      );
+      if (!entries.entries) return variant;
+      segment = entries.entries.find((entry) =>
+        hlsUriLooksLikeMediaSegment(entry.uri, baseUrl));
+      if (segment) break;
+      const child = entries.entries.find((entry) => /\.m3u8(?:\?|$)/i.test(entry.uri));
+      if (!child) return variant;
+      playlist = null;
+      baseUrl = child.uri;
+    }
+    if (!segment) return variant;
+    const response = await fetchRemoteHlsResponse(segment.uri, fetchImpl, {
+      range: true,
+      budget,
+    });
+    if (!response?.ok) return variant;
+    const bytes = new Uint8Array(await response.arrayBuffer())
+      .subarray(0, REMOTE_MEDIA_PROBE_BYTES);
+    if (!bytes.length) return variant;
+    return { ...variant, streamIdentity: md5Bytes(bytes) };
+  } catch {
+    return variant;
+  }
+}
+
+function dedupeSameStreamVariants(variants) {
+  const label = (value) =>
+    String(value?.sourceName || value?.label || value?.variant || "").toLowerCase();
+  const providerRank = (value) => {
+    const name = label(value);
+    if (name.includes("getav")) return 0;
+    if (name.includes("服务器gg") || name.includes("服务器 gg")) return 1;
+    if (name.includes("fcjav") || name.includes("javgg")) return 2;
+    return 3;
+  };
+  const preferred = (value) => `${providerRank(value)}|${label(value)}`;
+  const byIdentity = new Map();
+  for (const variant of variants) {
+    const identity = String(variant?.streamIdentity || "").trim();
+    if (!identity) continue;
+    const existing = byIdentity.get(identity);
+    if (!existing || preferred(variant) < preferred(existing)) {
+      byIdentity.set(identity, variant);
+    }
+  }
+  if (!byIdentity.size) return variants;
+  return variants.filter((variant) => {
+    const identity = String(variant?.streamIdentity || "").trim();
+    return !identity || byIdentity.get(identity) === variant;
+  });
+}
+
 async function videoVariantLooksPlayable(variant, fetchImpl, budget) {
   if (!remoteHlsVariant(variant)) {
     return httpMediaVariantLooksPlayable(variant, fetchImpl, budget);
@@ -1544,8 +1720,17 @@ async function validatedVideoVariants(
   );
   await Promise.all(workers);
   const playable = variants.filter((_, index) => results[index]);
-  assignUniqueSourceNames(playable);
-  return playable;
+  const identityDeadline = Date.now() + HLS_STREAM_IDENTITY_BUDGET_MS;
+  for (let index = 0; index < playable.length; index += 1) {
+    playable[index] = await attachHlsStreamIdentity(
+      playable[index],
+      fetchImpl,
+      remoteHlsValidationBudget(identityDeadline),
+    );
+  }
+  const uniqueStreams = dedupeSameStreamVariants(playable);
+  assignUniqueSourceNames(uniqueStreams);
+  return uniqueStreams;
 }
 
 // 上游有些线路（目前只有 fcjav）只给 "原版 / 去码版" 这类裸标签，提供方只写
@@ -7593,7 +7778,20 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
     : null;
   // 若任务到这时还没收尾（等满自建合并预算），也通知一次：详情页不该再为它空等。
   notifySelfHostedPhaseSettled();
-  const merged = mergeResolvedVideoVariants(env, publicVideo, selfHosted);
+  // 收尾合并必须把“已经通过 publishPartial 发给客户端的中途快照”也算进来：
+  // 自建补源（Javtiful / GetAV）的第一批线路会先发布给客户端，但它不一定能在
+  // selfHostedMergeBudget（默认 3.5 秒）内等到 selfHostedVideoTask 收尾——超时后
+  // selfHosted 为 null，只合并 publicVideo 会比中途快照还少几条（实测 RCTD-740：
+  // 首屏快照 8 条，收尾结果反而只有 7 条，于是写进缓存、客户端刷新后源变少）。
+  // 并入 publishedVideo 后，收尾结果保证“≥ 已经发给客户端的快照”，不会再倒退。
+  // publishedVideo 里的线路仍会经过 finalizeVideo（validatedResolvedVideo）逐条
+  // 探测校验，伪 HLS / 死源照样会被剔除，所以这里只是“不丢真线路”。
+  const merged = mergeResolvedVideoVariants(
+    env,
+    publicVideo,
+    selfHosted,
+    publishedVideo,
+  ) || publishedVideo;
   const validated = await finalizeVideo(merged);
   if (validated) {
     // “本次解析已经收尾”才算完成：
@@ -8142,11 +8340,18 @@ const RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS = 9000;
 // “主批次且已有多个线路”的快照到达后的静默窗口：只要这个窗口内不再出现
 // 线路更多的快照，就返回当前快照；期间整条解析链若收尾则优先返回完整结果。
 const RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS = 400;
-// 公共解析器这条链路“一条快照都没发布”持续这么久之后，判定为卡住/挂了：
+// 公共解析器这条链路“距离上一份快照”持续这么久之后，判定为卡住/挂了：
 // 此后允许带着自建补源已有的多条线路提前返回，不再为它空等到首屏上限。
-// 只在“公共链路完全没出线路”时才生效（majorSeen 仍为 false），所以不会把
-// 正常挤牙膏的公共批次截断。
-const RESOLVE_VIDEO_FIRST_SCREEN_PUBLIC_STALL_MS = 4500;
+// 只在“已经拿到 ≥ TARGET_COUNT 条线路”时才生效，不会把只有 0~1 条的场景
+// 提前截断（那种情况一律等满首屏上限）。
+//
+// 校准值：/api/v/resolve 冷启动实测最坏 ~7.0~7.5 秒才把整批线路一次吐完
+// （不是流式挤牙膏，onVariants 到最后一刻才回调，期间一份快照都不发布）。
+// 旧值 4500 会在 5.0~5.5 秒就带着自建 GetAV 的 4 条提前返回，公共批次
+// 7.5 秒才到——用户看到的就是“第一次点开只有 4 条，退出再进才变 8 条”。
+// 放到 7000 后，正常到达的公共批次能在首屏上限内赶回来；链路真的挂死时
+// 也只比旧行为晚 ~2.5 秒，仍由 FIRST_SCREEN_MAX_WAIT_MS 兜底。
+const RESOLVE_VIDEO_FIRST_SCREEN_PUBLIC_STALL_MS = 7000;
 // 已经有 ≥ TARGET_COUNT 条可用线路、但公共批次还没收尾时，最多再给公共批次这么
 // 久的补时（从请求开始算，不是从自建快照算）。旧实现这里直接空等到 9 秒上限，
 // 公共链路一卡就让详情页转 9 秒，客户端容易撞上自己的 HTTP 超时；而公共批次正常
@@ -8888,9 +9093,13 @@ async function resolveVideoForResponse(
   //   4. 最坏由 FIRST_SCREEN_MAX_WAIT_MS 兜底。
   let partialTimer = null;
   let partialResolve = null;
-  // “主批次”（公共解析器）是否已经发布过。发布过之后，后续的自建补充线路
-  // 只值得再等一个短静默期，不必再等满宽限期。
-  let majorSeen = false;
+  // 最近一次“线路更多”的快照到达时间。公共批次常常是流式挤牙膏（实测
+  // RCTD-740：自建 GetAV 约 3.5 秒给 4 条，公共批次 5.0~6.8 秒才把第 5~8 条
+  // 挤完）。判断“公共链路是不是卡住了”必须按“距离上一份快照多久”，按
+  // “距离请求开始多久”会把正常挤牙膏的公共批次误判成卡住。
+  let lastSnapshotAt = startedAt;
+  // 当前已发布快照的线路条数（每次 arm 更新）。
+  let currentCount = 0;
   // 公共解析器两条链路是否已经彻底落定（resolveVideo 的 onPublicPhaseSettled）。
   let publicPhaseSettled = false;
   // 自建补源这一批是否已经落定（resolveVideo 的 onSelfHostedPhaseSettled）。
@@ -8905,68 +9114,108 @@ async function resolveVideoForResponse(
     }
     partialResolve = null;
   };
-  const armPartialWindow = (count, major) => {
-    // 已经结束（或已被其它分支收尾）就不再重新计时。
-    if (!partialResolve) return;
-    if (major === true) majorSeen = true;
-    if (partialTimer) clearTimeout(partialTimer);
-    let delay;
-    // 什么时候可以用 400 毫秒的短静默窗口返回首屏？
+  // 返回首屏的时机（可重复评估）：
+  //   { exit: true }  → 已经可以答复，只等一个短静默期；
+  //   { delay: <ms> } → 还不能答复，最多再等这么久后重新评估。
+  const partialWindowDecision = (count) => {
+    // 什么时候可以答复首屏？
     //   1. 两条链路都收尾：不可能再有新线路；
     //   2. 公共解析器这条链路收尾、且已经拿到 ≥ 目标条数：它基本代表上游
     //      到底有几条线路（服务器GG / javgg / fcjav / GetAV 原生）。
     //
-    // 关键：**公共解析器“途中发布的流式快照”不算收尾**。旧写法用
-    // `majorSeen && enough` 判断，而 majorSeen 会被流式快照（数组还在挤牙膏、
-    // 只到前几条）立刻置位，于是窗口在第一批线路到达时就收成 400 毫秒：
-    // 实测本地直连上游 RCTD-740 首屏只拿到 4 条（自建 GetAV），后台补完 8 条；
-    // 线上 PPPD-477 首屏 3 条、再进变 6 条。用户看到的就是“第一次点开线路少，
-    // 退出再进才变多”。
+    // 关键：**公共解析器“途中发布的流式快照”不算收尾**。上游把整批线路挤在
+    // 一条 1~2MB 的流式 JSON 里，publishPartial 会在数组还在挤牙膏时（只到
+    // 前几条）就发出快照。旧实现“拿到多条自建线路 + 公共批次没落地就给
+    // GRACE(5s) 补时”，5.0 秒就把“只有自建 4 条”的结果答复出去，而公共批次
+    // 5.2 秒才到——用户看到的就是“第一次点开只有 4 条，退出再进才变 8 条”。
+    // 现在：只要公共批次还没收尾，就不提前答复，最多等到首屏上限。
     //
-    // 同理，只凭“自建补源单独收尾 + ≥3 条”也不提前返回：自建链路通常只有
-    // 1~4 条，而公共批次还在路上（RCTD-740：自建 2.5 秒给 4 条，公共批次
-    // 3 秒才给出另外 4 条）。这条规则正是首屏少线路的最后一个来源。
-    //
-    // 逃生口：公共链路连一条快照都没发布（majorSeen 仍为 false）且已超过
-    // PUBLIC_STALL_MS 时，判定它卡住了，带着自建的多条线路先返回，不能让首屏
-    // 陪它空等到上限。
+    // 但也不能为它空等到上限：公共链路整条挂死时（本地实测有资源 8.8 秒都
+    // 没吐出第一条线路），手上已有的多条线路应该先发给客户端。逃生口用
+    // “距离上一份快照的静默时长”（PUBLIC_STALL_MS），既能放过正常挤牙膏的
+    // 公共批次，又能在它真挂死时提前答复。
     const enough = count >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT;
-    const enoughToExitEarly =
-      count >= RESOLVE_VIDEO_FIRST_SCREEN_EARLY_EXIT_COUNT;
     const bothSettled = publicPhaseSettled && selfHostedPhaseSettled;
     const elapsed = Date.now() - startedAt;
-    const publicStalled =
-      !publicPhaseSettled &&
-      !majorSeen &&
-      elapsed >= RESOLVE_VIDEO_FIRST_SCREEN_PUBLIC_STALL_MS;
-    if (
-      bothSettled ||
-      (publicPhaseSettled && enough) ||
-      (enoughToExitEarly && publicStalled)
-    ) {
-      delay = RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS;
-    } else if (enough) {
-      // 已经有多条可用线路，但公共批次还没收尾：给公共批次一段有限的补时，
-      // 不能因为自建链路先收尾就空等到首屏上限（那会把详情页拖到 9 秒）。
-      delay = Math.max(
-        RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS,
-        RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS - elapsed,
-      );
-    } else {
-      // 手上只有 0~1 条：等下去比提前答复（客户端只会看到一条/占位源）更值。
-      delay = RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS;
+    if (bothSettled || (publicPhaseSettled && enough)) {
+      return { exit: true };
     }
-    partialTimer = setTimeout(() => {
+    // 公共批次收尾但仍不足目标条数：给自建补源一段有界补时（从请求开始算）。
+    if (publicPhaseSettled) {
+      return elapsed >= RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS
+        ? { exit: true }
+        : {
+          delay: Math.max(
+            RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS,
+            RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS - elapsed,
+          ),
+        };
+    }
+    // 公共批次还没收尾。
+    //   手上 0~1 条：等下去比提前答复（客户端只会看到一条/占位源）更值，
+    //   由首屏上限兜底。
+    //   手上 ≥ 目标条数：继续等公共批次收尾，或用静默逃生口提前答复。
+    const capLeftMs = RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS - elapsed;
+    if (capLeftMs <= 0) return { exit: true };
+    let wakeMs = capLeftMs;
+    if (enough) {
+      const idleMs = Date.now() - lastSnapshotAt;
+      const untilStallMs = RESOLVE_VIDEO_FIRST_SCREEN_PUBLIC_STALL_MS - idleMs;
+      if (untilStallMs <= 0) return { exit: true };
+      wakeMs = Math.min(wakeMs, untilStallMs);
+    }
+    return {
+      delay: Math.max(RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS, wakeMs),
+    };
+  };
+  const finishPartialWindow = () => {
+    const resolve = partialResolve;
+    partialResolve = null;
+    if (!resolve) return;
+    try {
+      resolve({ kind: "partial" });
+    } catch {
+      // 唤醒失败不影响解析。
+    }
+  };
+  const armPartialTimer = () => {
+    // 已经结束（或已被其它分支收尾）就不再重新计时。
+    if (!partialResolve) return;
+    if (partialTimer) {
+      clearTimeout(partialTimer);
       partialTimer = null;
-      const resolve = partialResolve;
-      partialResolve = null;
-      if (!resolve) return;
-      try {
-        resolve({ kind: "partial" });
-      } catch {
-        // 唤醒失败不影响解析。
+    }
+    const decision = partialWindowDecision(currentCount);
+    const onFire = () => {
+      partialTimer = null;
+      // 条件可能刚好成立，也可能又来了新线路需要重新计时：重新评估一次。
+      armPartialTimer();
+    };
+    if (decision.exit) {
+      // 已经可以答复：再等一个静默期，把最后几毫秒内到达的快照一起收进来。
+      const settleLeftMs = RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS -
+        (Date.now() - lastSnapshotAt);
+      if (settleLeftMs <= 0) {
+        finishPartialWindow();
+        return;
       }
-    }, delay);
+      partialTimer = setTimeout(onFire, settleLeftMs);
+      return;
+    }
+    partialTimer = setTimeout(onFire, decision.delay);
+  };
+  const armPartialWindow = (count, major) => {
+    if (!partialResolve) return;
+    currentCount = count;
+    lastSnapshotAt = Date.now();
+    dbgResolve("partial-window", debugCode, {
+      n: count,
+      major: major === true,
+      elapsed: Date.now() - startedAt,
+      publicSettled: publicPhaseSettled,
+      selfHostedSettled: selfHostedPhaseSettled,
+    });
+    armPartialTimer();
   };
   const resolveTask = resolveVideoCached(movie, env, fetchImpl, ctx, {
     onPartial: (video, meta) => {
