@@ -299,7 +299,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v39",
+    version: "item-dto-v40",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -2933,34 +2933,42 @@ test("keeps late GetAV sources after early pseudo-HLS variants", async () => {
 });
 
 test("keeps extensionless Google Drive HLS and embedded TS .image HLS", async () => {
-  const googlePlaylist = [
+  const googlePlaylist = (segmentName) => [
     "#EXTM3U",
     "#EXT-X-TARGETDURATION:8",
     "#EXTINF:8,",
-    "https://lh3.googleusercontent.com/d/segment-one=d",
+    `https://lh3.googleusercontent.com/d/${segmentName}=d`,
     "#EXT-X-ENDLIST",
   ].join("\n");
-  const imagePlaylist = [
+  const imagePlaylist = (token) => [
     "#EXTM3U",
     "#EXT-X-TARGETDURATION:10",
     "#EXTINF:10,",
-    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/origin.image?token=abc",
+    `https://p16-ad-site-sign-sg.tiktokcdn.com/video/origin.image?token=${token}`,
     "#EXT-X-ENDLIST",
   ].join("\n");
-  const googleSource =
-    `data:application/vnd.apple.mpegurl,${encodeURIComponent(googlePlaylist)}`;
-  const imageSource =
-    `data:application/vnd.apple.mpegurl,${encodeURIComponent(imagePlaylist)}`;
-  const imageSegmentUrl =
-    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/origin.image?token=abc";
+  const googleOriginalSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(googlePlaylist("segment-original"))}`;
+  const googleReducedSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(googlePlaylist("segment-reduced"))}`;
+  const imageOriginalSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(imagePlaylist("orig"))}`;
+  const imageReducedSource =
+    `data:application/vnd.apple.mpegurl,${encodeURIComponent(imagePlaylist("red"))}`;
+  const imageSegmentUrl = (token) =>
+    `https://p16-ad-site-sign-sg.tiktokcdn.com/video/origin.image?token=${token}`;
   const pngPrefix = Uint8Array.from([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
   ]);
-  const imageSegmentBytes = new Uint8Array(512);
-  imageSegmentBytes.set(pngPrefix, 0);
-  imageSegmentBytes[70] = 0x47;
-  imageSegmentBytes[258] = 0x47;
-  imageSegmentBytes[446] = 0x47;
+  const imageSegmentBytes = (seed) => {
+    const bytes = new Uint8Array(512);
+    bytes.set(pngPrefix, 0);
+    bytes[70] = 0x47;
+    bytes[258] = 0x47;
+    bytes[446] = 0x47;
+    bytes[500] = seed;
+    return bytes;
+  };
 
   const response = await handleProxy(
     new Request("https://clone.example/Items/42/PlaybackInfo", {
@@ -2984,22 +2992,22 @@ test("keeps extensionless Google Drive HLS and embedded TS .image HLS", async ()
             variants: [
               {
                 variant: "fcjav_original",
-                sourceUrl: googleSource,
+              sourceUrl: googleOriginalSource,
                 sourceType: "application/vnd.apple.mpegurl",
               },
               {
                 variant: "fcjav_reducing_mosaic",
-                sourceUrl: googleSource,
+              sourceUrl: googleReducedSource,
                 sourceType: "application/vnd.apple.mpegurl",
               },
               {
                 variant: "javgg_original",
-                sourceUrl: imageSource,
+                sourceUrl: imageOriginalSource,
                 sourceType: "application/vnd.apple.mpegurl",
               },
               {
                 variant: "javgg_reducing_mosaic",
-                sourceUrl: imageSource,
+                sourceUrl: imageReducedSource,
                 sourceType: "application/vnd.apple.mpegurl",
               },
             ],
@@ -3007,8 +3015,19 @@ test("keeps extensionless Google Drive HLS and embedded TS .image HLS", async ()
           { headers: { "content-type": "application/json" } },
         );
       }
-      if (url === imageSegmentUrl) {
-        return new Response(imageSegmentBytes, {
+      if (url.startsWith("https://lh3.googleusercontent.com/d/segment-")) {
+        return new Response(
+          Uint8Array.from([
+            0x47, 0x40, url.includes("original") ? 0 : 1, 0, 0,
+          ]),
+          {
+            status: 206,
+            headers: { "content-type": "video/mp2t" },
+          },
+        );
+      }
+      if (url === imageSegmentUrl("orig") || url === imageSegmentUrl("red")) {
+        return new Response(imageSegmentBytes(url.endsWith("orig") ? 0 : 1), {
           status: 206,
           headers: {
             "content-range": "bytes 0-511/512",
@@ -3113,7 +3132,12 @@ test("prefixes fcjav bare original/reducing labels with the provider name", asyn
         );
       }
       if (target === fcjavOriginalSegment || target === fcjavReducedSegment) {
-        return new Response(new Uint8Array([0x47, 0, 0, 0]), {
+        // 原版 / 去码版是两条真实不同的流，分片字节必须不同；否则会被
+        // 同流去重合并（线上真实源的分片内容也各不相同）。
+        const bytes = target === fcjavOriginalSegment
+          ? Uint8Array.from([0x47, 0, 0, 0])
+          : Uint8Array.from([0x47, 1, 0, 0]);
+        return new Response(bytes, {
           status: 206,
           headers: { "content-type": "application/octet-stream" },
         });
@@ -3305,7 +3329,9 @@ test("keeps four RCTD-740 playback sources including GG font-path HLS variants",
   ].join("\n");
   const inlineSource = (playlist) =>
     `data:application/vnd.apple.mpegurl,${encodeURIComponent(playlist)}`;
-  const segmentBytes = Uint8Array.from([0x47, 0x40, 0x11, 0x10, 0x00, 0x01]);
+  const segmentByteAt = (index) => Uint8Array.from(
+    [0x47, 0x40, 0x11, 0x10, index, 0x01],
+  );
   const calls = [];
 
   const response = await handleProxy(
@@ -3380,10 +3406,17 @@ test("keeps four RCTD-740 playback sources including GG font-path HLS variants",
         target === ggOriginalSegment ||
         target === ggReducedSegment
       ) {
-        return new Response(segmentBytes, {
-          status: 206,
-          headers: { "content-type": "application/octet-stream" },
-        });
+        return new Response(
+          segmentByteAt(
+            target === ggOriginalSegment ? 0
+              : target === ggReducedSegment ? 1
+              : target.includes("/4k/") ? 2 : 3,
+          ),
+          {
+            status: 206,
+            headers: { "content-type": "application/octet-stream" },
+          },
+        );
       }
       assert.match(target, /\/api\/subtitle\?name=RCTD-740/);
       return new Response(
@@ -5321,8 +5354,9 @@ test("answers with the self-hosted lines once the first-screen grace expires", a
         );
       }
       if (target.includes("/api/v/resolve?code=RCTD-742")) {
-        // 公共解析器挂住：整条链路超过首屏预算仍不吐出任何线路。
-        await new Promise((resolve) => setTimeout(resolve, 7000));
+        // 公共解析器挂住：超过 PUBLIC_STALL_MS(7s) 仍不吐出任何线路。
+        // mock 放到 7.5 秒，避开 7.0 秒静默逃生口的边界抖动。
+        await new Promise((resolve) => setTimeout(resolve, 7500));
         return new Response(JSON.stringify({ variants: [] }), {
           headers: { "content-type": "application/json" },
         });
@@ -5380,8 +5414,8 @@ test("answers with the self-hosted lines once the first-screen grace expires", a
     [...selfHostedUrls].sort(),
   );
   // 关键断言：补时窗口一过就答复，没有死等到 9 秒上限。
-  assert.ok(elapsed >= 4500, `first screen returned too early at ${elapsed}ms`);
-  assert.ok(elapsed < 7000, `first screen took ${elapsed}ms`);
+  assert.ok(elapsed >= 7000, `first screen returned too early at ${elapsed}ms`);
+  assert.ok(elapsed < 9000, `first screen took ${elapsed}ms`);
 });
 test("waits through the extended cold-start window when the public batch completes with six lines", async () => {
   // 同一资源的两种解析端点：

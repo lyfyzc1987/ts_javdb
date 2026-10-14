@@ -822,11 +822,15 @@ function canonicalResolverSource(item) {
   if (!raw) return "";
   if (raw.startsWith("data:")) {
     // 内联清单可能有数 MB，不能为了去重对整个字符串做 md5（会同步吃满
-    // Worker CPU）。长度 + 首尾片段足以区分不同资源，且是轻量常量级开销。
+    // Worker CPU）。但仅取首尾会把“只有中间清晰度行不同”的多条真实线路
+    // 合并成一条；这里按固定比例采样常量个窗口，开销仍是 O(1)。
     const length = raw.length;
-    const prefix = raw.slice(0, 96);
-    const suffix = raw.slice(-96);
-    return `data:${length}:${md5(`${length}|${prefix}|${suffix}`)}`;
+    const probes = [raw.slice(0, 96), raw.slice(-96)];
+    for (let ratio = 1; ratio <= 7; ratio += 1) {
+      const center = Math.floor((length * ratio) / 8);
+      probes.push(raw.slice(Math.max(0, center - 48), center + 48));
+    }
+    return `data:${length}:${md5(`${length}|${probes.join("\u0000")}`)}`;
   }
   try {
     const url = new URL(raw);
@@ -1638,6 +1642,19 @@ async function attachHlsStreamIdentity(variant, fetchImpl, budget) {
 function dedupeSameStreamVariants(variants) {
   const label = (value) =>
     String(value?.sourceName || value?.label || value?.variant || "").toLowerCase();
+  // 首分片指纹相同不代表一定是同一条流：MPEG-TS 分片开头 512 字节里
+  // PAT/PMT 表对同一番号的不同清晰度转码完全可能一致（测试 mock 也是这样
+  // 复用同一份分片字节）。真实不同质量（4K / 1080P / 720P）绝不能被去重
+  // 掉，所以双方都带明确清晰度且数值不同时直接豁免。
+  const quality = (value) => {
+    const raw = Number(value?.quality ?? value?.Quality);
+    const height = Number(
+      value?.mediaStreams?.find?.((stream) => stream?.Type === "Video")?.Height,
+    );
+    return Number.isFinite(raw) && raw > 0
+      ? raw
+      : Number.isFinite(height) && height > 0 ? height : 0;
+  };
   const providerRank = (value) => {
     const name = label(value);
     if (name.includes("getav")) return 0;
@@ -1650,15 +1667,27 @@ function dedupeSameStreamVariants(variants) {
   for (const variant of variants) {
     const identity = String(variant?.streamIdentity || "").trim();
     if (!identity) continue;
-    const existing = byIdentity.get(identity);
-    if (!existing || preferred(variant) < preferred(existing)) {
-      byIdentity.set(identity, variant);
-    }
+    if (!byIdentity.has(identity)) byIdentity.set(identity, []);
+    byIdentity.get(identity).push(variant);
   }
   if (!byIdentity.size) return variants;
+  const kept = new Set();
+  for (const bucket of byIdentity.values()) {
+    const qualities = new Set(
+      bucket.map(quality).filter((value) => value > 0),
+    );
+    if (qualities.size > 1) {
+      // 同一指纹里出现了多个明确不同的清晰度：这是真实的不同转码，
+      // 首分片头相同不能当作同流，全部保留。
+      bucket.forEach((variant) => kept.add(variant));
+      continue;
+    }
+    kept.add(bucket.reduce((best, variant) =>
+      preferred(variant) < preferred(best) ? variant : best));
+  }
   return variants.filter((variant) => {
     const identity = String(variant?.streamIdentity || "").trim();
-    return !identity || byIdentity.get(identity) === variant;
+    return !identity || kept.has(variant);
   });
 }
 
@@ -1691,6 +1720,29 @@ async function validatedVideoVariants(
   const deadline = Date.now() +
     Math.max(1, Number(budgetMs) || REMOTE_HLS_VALIDATION_BUDGET_MS);
 
+  // 验证阶段与指纹阶段共享同一份 fetch 缓存：同一条线路验证时抓过的
+  // 清单 / 分片，指纹阶段直接复用。不缓存的话同一次请求会对上游重复
+  // 发 2~3 倍子请求，是 Cloudflare 503/1102 的主要压力来源之一。
+  const sharedFetchCache = new Map();
+  const cachedFetch = async (url, init = {}) => {
+    // drop-in fetchImpl 包装：调用方（fetchRemoteHlsResponse / 探测器）已经
+    // 构建好 Headers，这里只按 URL + Range 缓存响应体，原样透传其余参数。
+    const range = String(init?.headers?.get?.("range") || "");
+    const cacheKey = `${String(url)}|${range}`;
+    if (sharedFetchCache.has(cacheKey)) {
+      const { status, headers, body } = sharedFetchCache.get(cacheKey);
+      return new Response(body, { status, headers });
+    }
+    const response = await fetchImpl(url, init);
+    const body = await response.arrayBuffer();
+    sharedFetchCache.set(cacheKey, {
+      status: response.status,
+      headers: [...response.headers.entries()],
+      body,
+    });
+    return new Response(body, { status: response.status, headers: response.headers });
+  };
+
   const results = new Array(variants.length);
   let nextIndex = 0;
   const workers = Array.from(
@@ -1702,7 +1754,7 @@ async function validatedVideoVariants(
         try {
           results[index] = await videoVariantLooksPlayable(
             variants[index],
-            fetchImpl,
+            cachedFetch,
             remoteHlsValidationBudget(deadline),
           );
         } catch (error) {
@@ -1724,7 +1776,7 @@ async function validatedVideoVariants(
   for (let index = 0; index < playable.length; index += 1) {
     playable[index] = await attachHlsStreamIdentity(
       playable[index],
-      fetchImpl,
+      cachedFetch,
       remoteHlsValidationBudget(identityDeadline),
     );
   }
