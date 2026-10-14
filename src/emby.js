@@ -1,4 +1,5 @@
 import { resolveMemoSourceCached } from "./memojav.js";
+import { createResolverVariantParser } from "./resolver-stream.js";
 
 const DEFAULT_API_ORIGIN = "https://jdforrepam.com/api";
 const DEFAULT_UPSTREAM_ORIGIN = "https://catembylegacy.fastcdn.dpdns.org";
@@ -194,10 +195,12 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // v37 的「EXT-X-BYTERANGE 直连 CDN 零流量」方案在真实播放器上会一直加载/黑屏
 // （CDN 对 4MB+ 的 Range 请求长时间不吐字节），清单形态再次变化，
 // 旧 DTO / 旧解析缓存必须失效。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v38";
+// v39：收紧实例内多份缓存的内存预算，避免长寿命热点 isolate 在反复解析 /
+// 播放分片后累计超过 Cloudflare Worker 内存上限并返回 503 / 1102。
+const ITEM_DTO_ETAG_VERSION = "item-dto-v39";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-14-head-proxy-embedded-ts-56";
+const SERVER_BUILD_ID = "2026-10-14-linear-resolver-stream-60";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -271,7 +274,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v43";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v44";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -3976,125 +3979,6 @@ function dbgResolve(tag, code, data) {
   }
 }
 
-function createResolverVariantParser() {
-  let json = "";
-  let keySearchIndex = 0;
-  let arrayStart = -1;
-  let scanIndex = -1;
-  let arrayComplete = false;
-  let inString = false;
-  let escaped = false;
-  let elementStart = -1;
-  let elementDepth = 0;
-  const variants = [];
-
-  const findArrayStart = () => {
-    if (arrayStart >= 0) return;
-    const pattern = /"(?:variants|sources|videos|streams)"\s*:/g;
-    pattern.lastIndex = keySearchIndex;
-    const match = pattern.exec(json);
-    if (!match) {
-      keySearchIndex = Math.max(0, json.length - 32);
-      return;
-    }
-    let index = pattern.lastIndex;
-    while (index < json.length && /\s/.test(json[index])) index += 1;
-    if (json[index] !== "[") {
-      keySearchIndex = pattern.lastIndex;
-      return;
-    }
-    arrayStart = index;
-    scanIndex = index + 1;
-  };
-
-  const scan = () => {
-    findArrayStart();
-    if (arrayStart < 0 || arrayComplete) return;
-    while (scanIndex < json.length) {
-      const char = json[scanIndex];
-      if (inString) {
-        if (escaped) {
-          escaped = false;
-        } else if (char === "\\") {
-          escaped = true;
-        } else if (char === '"') {
-          inString = false;
-        }
-        scanIndex += 1;
-        continue;
-      }
-      if (char === '"') {
-        inString = true;
-        scanIndex += 1;
-        continue;
-      }
-      if (elementStart < 0) {
-        if (char === "]") {
-          arrayComplete = true;
-          const text = json.slice(arrayStart, scanIndex + 1);
-          try {
-            const complete = JSON.parse(text);
-            if (Array.isArray(complete)) {
-              variants.splice(0, variants.length, ...complete);
-            }
-          } catch {
-            // 已经收集到的对象仍可用。
-          }
-          break;
-        }
-        if (char === "{" || char === "[" || char === '"') {
-          if (char === "{") {
-            elementStart = scanIndex;
-            elementDepth = 1;
-          }
-        }
-      } else if (char === "{" || char === "[") {
-        elementDepth += 1;
-      } else if (char === "}" || char === "]") {
-        elementDepth -= 1;
-        if (elementDepth === 0) {
-          try {
-            variants.push(JSON.parse(json.slice(elementStart, scanIndex + 1)));
-          } catch {
-            // 半截或非对象元素直接跳过。
-          }
-          elementStart = -1;
-        }
-      }
-      scanIndex += 1;
-    }
-  };
-
-  return {
-    push(fragment) {
-      if (!fragment) return;
-      json += fragment;
-      scan();
-    },
-    variants() {
-      return variants.slice();
-    },
-    // 只回条数，避免每次 push 都为了“有没有新增”复制一遍数组
-    // （700KB~1.5MB 的 JSON 会分很多次到达，逐次 slice 是平方级开销）。
-    count() {
-      return variants.length;
-    },
-    complete() {
-      return arrayComplete;
-    },
-    payload() {
-      if (variants.length || arrayComplete) {
-        return { variants: variants.slice() };
-      }
-      try {
-        return JSON.parse(json);
-      } catch {
-        return null;
-      }
-    },
-  };
-}
-
 async function readResolverJsonResponse(response, options = {}) {
   const timeoutMs = Math.max(
     1,
@@ -4528,7 +4412,7 @@ const TRUNCATED_LIST_CACHE_TTL_MS = 10 * 1000;
 // 这里把共享副本留 5 分钟：进程内仍是 60 秒（同一实例的连续请求即刻命中），
 // 换实例 / 换请求时则直接复用共享结果，不再回源重扫。
 const LIST_EDGE_CACHE_TTL_MS = 5 * 60 * 1000;
-const MAX_MOVIE_CACHE_ENTRIES = 4000;
+const MAX_MOVIE_CACHE_ENTRIES = 2000;
 const MAX_RESOLVE_CACHE_ENTRIES = 1000;
 // 解析过程中的“部分结果”缓存：公共解析器已经拿到的线路会先落到这里。
 // 详情页 / PlaybackInfo 的解析预算（3s / 12s）远小于自建补源（Javtiful /
@@ -4550,15 +4434,15 @@ const LIST_PAGE_WINDOW = 300;
 const LIST_WINDOW_TTL_MS = 5 * 60 * 1000;
 // 窗口条目约 300 条影片（几百 KB），必须单独限量：若混进 400 条的普通列表缓存，
 // 高并发下会把实例内存打爆（同样是 1102）。
-const MAX_LIST_WINDOW_ENTRIES = 8;
+const MAX_LIST_WINDOW_ENTRIES = 4;
 // Keep a small number of complete segments per Worker instance. HLS players
 // often re-request the same segment with several byte ranges while seeking or
 // resuming; caching the complete body keeps those ranges local instead of
 // repeatedly downloading the CDN object.
-// GetAV 的 4K 分片约 13.4 MB，原先 8 MB 的上限会让它每次 Range 请求都回源。
-// 保留 2 条、单条最多 16 MB：既覆盖该分片，又把单实例内存峰值从 64 MB
-// 压到 32 MB。分片缓存只是“seek/断点续传时少一次回源”，条数减少不会
-// 影响播放正确性，却能显著降低触发 Cloudflare 1102（内存/CPU 超限）的概率。
+// GetAV 的 4K 分片约 13.4 MB。为了优先消除 503 / 1102，不再把这么大的整段
+// 长期留在实例内存；超过 8 MB 的分片仍会正常透传，只是不写完整分片缓存，
+// 由客户端的 Range / 断点续传请求继续处理。分片缓存只影响重复回源次数，
+// 不影响播放正确性。
 const MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES = 2;
 // 单个 Range 响应的本地缓存。多线程 HLS 播放器（“m3u8 多线程加速 / 断点
 // 续传”那类实现）会把同一分片拆成多个 Range 并行拉取，还会对同一 Range
@@ -4573,19 +4457,19 @@ const MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES = 2;
 //     （断点续传重试、seek 回看）直接命中本地，不再回源。
 // 单条上限 2 MB：Range 分块通常 ~1 MB，缓存的是“块”而不是 13 MB 的整段，
 // 同样的内存预算能覆盖更多请求，也不会再把实例内存打爆（Cloudflare 1102）。
-const MEDIA_SEGMENT_RANGE_CACHE_MAX_ENTRIES = 24;
+const MEDIA_SEGMENT_RANGE_CACHE_MAX_ENTRIES = 12;
 const MAX_CACHED_MEDIA_SEGMENT_RANGE_BYTES = 2 * 1024 * 1024;
 // 伪 PNG/TS 分片只需要缓存“PNG 前缀长度”和上游总长度。这个元数据很小，
 // 可以比完整分片多留很多条，让并发 Range 请求不用反复探测同一分片。
 const MEDIA_SEGMENT_PREFIX_CACHE_MAX_ENTRIES = 1024;
-const MAX_CACHED_MEDIA_SEGMENT_BYTES = 16 * 1024 * 1024;
+const MAX_CACHED_MEDIA_SEGMENT_BYTES = 8 * 1024 * 1024;
 // 条数上限之外再加一道“总字节上限”。媒体分片缓存的条目大小差得很远
 // （GetAV 4K 分片 13.4 MB，HLS Range 块约 1 MB），只数条数时并发下载很容易
 // 让单实例内存冲上七八十 MB，转成 Cloudflare 1102（内存超限）。
-// 24 MB + 24 MB 仍然覆盖“seek / 断点续传时少回源”的常见场景，
-// 但把媒体缓存的内存峰值从 80 MB 压到 48 MB。
-const MEDIA_SEGMENT_BODY_CACHE_MAX_TOTAL_BYTES = 24 * 1024 * 1024;
-const MEDIA_SEGMENT_RANGE_CACHE_MAX_TOTAL_BYTES = 24 * 1024 * 1024;
+// 8 MB + 12 MB 仍然覆盖“seek / 断点续传时少回源”的常见场景，
+// 但把媒体缓存的内存峰值继续压低，给解析 JSON、字幕和并发响应体留出余量。
+const MEDIA_SEGMENT_BODY_CACHE_MAX_TOTAL_BYTES = 8 * 1024 * 1024;
+const MEDIA_SEGMENT_RANGE_CACHE_MAX_TOTAL_BYTES = 12 * 1024 * 1024;
 
 // 媒体缓存条目都形如 { bytes: Uint8Array, headers, ... }，按实际字节数记账。
 function mediaCacheEntryBytes(record) {
@@ -4721,8 +4605,8 @@ function createTtlCache(ttlMs, maxEntries, options = {}) {
 const MOVIE_CACHE = createTtlCache(MOVIE_CACHE_TTL_MS, MAX_MOVIE_CACHE_ENTRIES);
 // 播放源解析结果按“条数 + 总字节”双重限流：条数上限保证 LRU 行为可预期，
 // 字节上限才是防 1102 的关键（见 resolvedVideoCacheEntryBytes 的注释）。
-const MAX_RESOLVE_VIDEO_CACHE_ENTRIES = 400;
-const MAX_RESOLVE_VIDEO_CACHE_BYTES = 40 * 1024 * 1024;
+const MAX_RESOLVE_VIDEO_CACHE_ENTRIES = 160;
+const MAX_RESOLVE_VIDEO_CACHE_BYTES = 16 * 1024 * 1024;
 const RESOLVE_VIDEO_CACHE = createTtlCache(
   RESOLVE_CACHE_TTL_MS,
   MAX_RESOLVE_VIDEO_CACHE_ENTRIES,
@@ -4734,8 +4618,8 @@ const RESOLVE_VIDEO_CACHE = createTtlCache(
 // 只存“解析到一半”的公共线路快照，见 PARTIAL_RESOLVE_TTL_MS 的注释。
 // 半成品快照比完整结果更“胖”（每条链路刚发布的快照都是整份内联清单），
 // 但活得更短，所以字节上限再收紧一档。
-const MAX_PARTIAL_RESOLVE_CACHE_ENTRIES = 80;
-const MAX_PARTIAL_RESOLVE_CACHE_BYTES = 24 * 1024 * 1024;
+const MAX_PARTIAL_RESOLVE_CACHE_ENTRIES = 32;
+const MAX_PARTIAL_RESOLVE_CACHE_BYTES = 8 * 1024 * 1024;
 const PARTIAL_RESOLVE_CACHE = createTtlCache(
   PARTIAL_RESOLVE_TTL_MS,
   MAX_PARTIAL_RESOLVE_CACHE_ENTRIES,
@@ -5055,8 +4939,11 @@ const RESOLVER_JSON_CACHE_TTL_MS = 5 * 60 * 1000;
 // 解析一遍（这才是 CPU 大头），命中后放内存里直接复用解析好的对象。
 const RESOLVER_JSON_MEMORY = new Map();
 // 每份解析 JSON 常见 0.7~1.8 MB（内联 HLS 清单），8 份就是十几 MB 常驻内存。
-// 它只是“避免重复解析”的加速层，边缘缓存仍在，所以只留最近 3 份。
-const RESOLVER_JSON_MEMORY_MAX_ENTRIES = 3;
+// 它只是“避免重复解析”的加速层，边缘缓存仍在，所以只留最近 2 份，并再按
+// 实际线路字符串大小限制总字节数；单份就超过预算的大 JSON 直接不驻留。
+const RESOLVER_JSON_MEMORY_MAX_ENTRIES = 2;
+const RESOLVER_JSON_MEMORY_MAX_BYTES = 4 * 1024 * 1024;
+let resolverJsonMemoryBytes = 0;
 // 同一 URL 的并发回源合并成一次。典型场景：详情页 Items 与紧接着的 PlaybackInfo
 // 同时打同一个番号，两条链路各要 8~9 秒——不合并等于把冷启动付两遍。
 const RESOLVER_JSON_INFLIGHT = new Map();
@@ -5065,15 +4952,66 @@ function isCacheableResolverJson(payload) {
   return Boolean(payload && typeof payload === "object" && sourceVariants(payload).length);
 }
 
+function resolverJsonPayloadBytes(payload) {
+  let bytes = 128;
+  for (const variant of sourceVariants(payload)) {
+    bytes += 128;
+    if (typeof variant === "string") {
+      bytes += variant.length;
+      continue;
+    }
+    if (!variant || typeof variant !== "object") continue;
+    const raw = sourceUrlValue(variant);
+    if (typeof raw === "string") bytes += raw.length;
+    for (const key of [
+      "name",
+      "title",
+      "quality",
+      "label",
+      "type",
+      "sourceType",
+      "source_type",
+      "referer",
+      "origin",
+    ]) {
+      const value = variant[key];
+      if (typeof value === "string") bytes += value.length;
+    }
+  }
+  return Math.max(1, Math.floor(bytes));
+}
+
+function dropResolverJsonMemory(key) {
+  const entry = RESOLVER_JSON_MEMORY.get(key);
+  if (!entry) return false;
+  RESOLVER_JSON_MEMORY.delete(key);
+  resolverJsonMemoryBytes = Math.max(
+    0,
+    resolverJsonMemoryBytes - Math.max(0, Number(entry.size) || 0),
+  );
+  return true;
+}
+
 function storeResolverJsonMemory(key, payload) {
   if (!isCacheableResolverJson(payload)) return;
-  RESOLVER_JSON_MEMORY.delete(key);
-  RESOLVER_JSON_MEMORY.set(key, { at: Date.now(), payload });
-  while (RESOLVER_JSON_MEMORY.size > RESOLVER_JSON_MEMORY_MAX_ENTRIES) {
+  const size = resolverJsonPayloadBytes(payload);
+  dropResolverJsonMemory(key);
+  if (size > RESOLVER_JSON_MEMORY_MAX_BYTES) return;
+  RESOLVER_JSON_MEMORY.set(key, { at: Date.now(), payload, size });
+  resolverJsonMemoryBytes += size;
+  while (
+    RESOLVER_JSON_MEMORY.size > RESOLVER_JSON_MEMORY_MAX_ENTRIES ||
+    resolverJsonMemoryBytes > RESOLVER_JSON_MEMORY_MAX_BYTES
+  ) {
     const oldest = RESOLVER_JSON_MEMORY.keys().next().value;
     if (oldest === undefined) break;
-    RESOLVER_JSON_MEMORY.delete(oldest);
+    dropResolverJsonMemory(oldest);
   }
+}
+
+function clearResolverJsonMemory() {
+  RESOLVER_JSON_MEMORY.clear();
+  resolverJsonMemoryBytes = 0;
 }
 
 async function fetchResolverJsonUpstream(url, env, fetchImpl, options = {}) {
@@ -5124,7 +5062,7 @@ async function resolverJsonUrl(url, env, fetchImpl, options = {}) {
     return memory.payload;
   }
   if (memory) {
-    RESOLVER_JSON_MEMORY.delete(key);
+    dropResolverJsonMemory(key);
   }
 
   try {
@@ -8594,10 +8532,121 @@ function releaseResolveVideoSession(session) {
   }
 }
 
+// ---------- 每实例解析并发闸门 ----------
+// Cloudflare 的 CPU 上限按 isolate（实例）计，不是按单个请求计。wrangler tail 实测：
+// 一个自身只花了 20ms CPU 的详情请求也会被判 exceededCpu / 503，因为同一实例里还有
+// 好几个冷解析请求（每个 CPU 200ms~1.3s、墙钟 3~12s）在并发跑，叠加后顶爆实例上限。
+// RESOLVE_VIDEO_CACHE.coalesce 只能按 key 去重，挡不住“N 个不同番号同时冷解析”。
+// 这里给真正的现场解析（resolveVideo）加一个每实例信号量：
+//   1. 最多 MAX 条链同时跑，从源头上避免 CPU 叠加；
+//   2. 超额的请求进“有界等待队列”，等到空位再跑——解析结果照常写缓存，客户端下次
+//      重拉或后台预热都能命中，而不是让这次请求彻底落空；
+//   3. 队列满或等待超时则抛错，由 resolveVideoForResponse 回退到中途快照 / 边缘缓存 /
+//      占位源。宁可个别请求先显示较少线路，也不能让整个 isolate 被判 exceededCpu 而把
+//      邻近请求全部打成 503 / 1102。
+const RESOLVE_VIDEO_GATE_MAX = 2;
+const RESOLVE_VIDEO_GATE_QUEUE_LIMIT = 16;
+// 等待预算必须小于调用方的解析预算（详情 / PlaybackInfo / stream 都是 9s），
+// 否则排队请求会一直占着 isolate 的空闲墙钟：CPU 没花，但实例迟迟不释放，
+// 同 colo 的邻近请求照样被判 503 / 1102。8s 让“排不到的请求”在客户端 HTTP
+// 超时之前就快速失败，回退到中途快照 / 缓存 / 占位源，而不是把实例吊住 15 秒。
+const RESOLVE_VIDEO_GATE_WAIT_MS = 8000;
+const RESOLVE_VIDEO_GATE_OVERLOAD = "resolve video gate overloaded";
+const RESOLVE_VIDEO_GATE_WAIT_TIMEOUT = "resolve video gate wait timed out";
+
+// 通用“有界并发闸门”：run(fn) 拿到一个空位才执行 fn，执行完自动释放。等待队列
+// 有上限、等待有时间上限，超限一律快速失败，避免无界排队把实例挂死。
+function createConcurrencyGate({ max, queueLimit, waitMs }) {
+  const limit = Math.max(1, Math.floor(Number(max) || 1));
+  const maxWaiters = Math.max(0, Math.floor(Number(queueLimit) || 0));
+  const waitBudgetMs = Math.max(0, Number(waitMs) || 0);
+  let active = 0;
+  const waiters = new Set();
+
+  const pump = () => {
+    for (const waiter of Array.from(waiters)) {
+      if (active >= limit) break;
+      waiters.delete(waiter);
+      clearTimeout(waiter.timer);
+      active += 1;
+      waiter.granted = true;
+      waiter.resolve(() => {
+        active = Math.max(0, active - 1);
+        pump();
+      });
+    }
+  };
+
+  const acquire = () => new Promise((resolve) => {
+    if (active < limit) {
+      active += 1;
+      resolve(() => {
+        active = Math.max(0, active - 1);
+        pump();
+      });
+      return;
+    }
+    const waiter = {
+      granted: false,
+      timer: null,
+      resolve: (release) => {
+        waiter.granted = true;
+        resolve(release);
+      },
+    };
+    waiter.timer = setTimeout(() => {
+      if (waiter.granted) return;
+      waiters.delete(waiter);
+      waiter.granted = true;
+      resolve(null);
+    }, waitBudgetMs);
+    waiters.add(waiter);
+  });
+
+  return {
+    get active() {
+      return active;
+    },
+    get waiting() {
+      return waiters.size;
+    },
+    isOverloaded: () => active >= limit && waiters.size >= maxWaiters,
+    async run(fn) {
+      if (active >= limit && waiters.size >= maxWaiters) {
+        throw new Error(RESOLVE_VIDEO_GATE_OVERLOAD);
+      }
+      const release = await acquire();
+      if (typeof release !== "function") {
+        throw new Error(RESOLVE_VIDEO_GATE_WAIT_TIMEOUT);
+      }
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    },
+    reset() {
+      for (const waiter of Array.from(waiters)) {
+        clearTimeout(waiter.timer);
+        waiter.granted = true;
+        waiter.resolve(null);
+      }
+      waiters.clear();
+      active = 0;
+    },
+  };
+}
+
+const RESOLVE_VIDEO_GATE = createConcurrencyGate({
+  max: RESOLVE_VIDEO_GATE_MAX,
+  queueLimit: RESOLVE_VIDEO_GATE_QUEUE_LIMIT,
+  waitMs: RESOLVE_VIDEO_GATE_WAIT_MS,
+});
+
 async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {}) {
   const key = resolvedVideoCacheKey(movie, env);
   if (!key) {
-    return resolveVideo(movie, env, fetchImpl, options);
+    return RESOLVE_VIDEO_GATE.run(() => resolveVideo(movie, env, fetchImpl, options));
   }
   // 命中完整缓存时不会再跑解析链，也就不会发布任何事件：这时不建会话，
   // 否则会话表会按“每个点开过的番号”无界增长。
@@ -8700,7 +8749,10 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
     }
 
     try {
-      const video = await resolveVideo(
+      // 现场解析走每实例闸门：并发叠加是 1102/exceededCpu 的直接来源，见
+      // RESOLVE_VIDEO_GATE 的注释。闸门只包住“真正花 CPU 的这一段”，缓存读写
+      // 不受影响；被挡下的请求抛错后由 resolveVideoForResponse 回退到快照/缓存。
+      const video = await RESOLVE_VIDEO_GATE.run(() => resolveVideo(
         movie,
         env,
         fetchImpl,
@@ -8710,7 +8762,7 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
           onPublicPhaseSettled,
           onSelfHostedPhaseSettled,
         },
-      );
+      ));
       if (isUsableResolvedVideo(video)) {
         if (resolvedVideoResolutionComplete(video)) {
           // 打上“解析已收尾”标记再落缓存：下一次请求命中这份缓存时，即使只有
@@ -10154,6 +10206,13 @@ function prewarmSearchResults(result, env, fetchImpl, ctx) {
 // 下次(真正点播放时)直接命中,起播和字幕出现都更快。
 function prewarmResolve(movie, env, fetchImpl, ctx = null) {
   if (!movie?.id && !movie?.number) return;
+  // 预热只是“下次点播放快一点”的优化，绝不能和真实请求抢解析槽位：
+  // 一旦实例里已经有请求在解析（在跑或在排队），就跳过这次预热。
+  // 否则“列表 / 搜索”触发的后台预热会把闸门占满，真正点开资源的用户反而
+  // 排在后面等满 8 秒预算，最后只能拿到占位源（用户看到的“解析中”）。
+  if (RESOLVE_VIDEO_GATE.active > 0 || RESOLVE_VIDEO_GATE.waiting > 0) {
+    return;
+  }
   // 播放源与字幕并行解析,不要在后台排队等两次冷启动。
   const task = Promise.all([
     resolveVideoCached(movie, env, fetchImpl, ctx).catch(() => {}),
@@ -10195,6 +10254,12 @@ function keepAliveBounded(task, ctx, budgetMs = BACKGROUND_RESOLVE_GRACE_MS) {
     ctx,
   );
 }
+
+// 字幕后台解析同样必须带上墙钟预算：详情页 / PlaybackInfo 已经拿到播放源后，
+// 字幕链路（上游聚合 8s + 回源）以前是无界登记的。上游一抖动，这个 waitUntil
+// 就把 isolate 一直挂到 Cloudflare 的 30 秒上限，邻近请求被判 503 / 1102。
+// 预算内没跑完就结束 waitUntil；字幕本身仍会由下一次请求重新解析（有缓存）。
+const BACKGROUND_SUBTITLE_GRACE_MS = 8000;
 
 // 只查缓存、不触发回源:起播解析超时时,如果字幕之前已经预解析过,
 // 仍然把字幕流一起下发,避免“视频已经播了字幕还没出来”。
@@ -10334,7 +10399,8 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     subtitles = await peekCachedSubtitles(movie, env);
   }
   if (!subtitleResolution.record.done) {
-    keepAlive(subtitleResolution.tracked, ctx);
+    // 有界登记：字幕链路最坏要等上游聚合，不能让它把实例挂到 waitUntil 上限。
+    keepAliveBounded(subtitleResolution.tracked, ctx, BACKGROUND_SUBTITLE_GRACE_MS);
   }
 
   const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
@@ -12388,7 +12454,10 @@ async function streamResponse(id, request, env, fetchImpl, token, ctx = null) {
     } else {
       // 快照已到但补源没收尾，或预算彻底用尽：后台继续跑完并写缓存。
       // 本次先用已经解析出的线路试播（有就立即播放），客户端重试时命中缓存。
-      keepAlive(streamResolveTask.catch(() => null), ctx);
+      // 必须“有界登记”：解析链（解析器合并 + 自建补源 + 校验，最坏 15s）无界
+      // 挂在 waitUntil 上时会把 isolate 吊到 Cloudflare 的 30 秒上限，同 colo
+      // 的邻近请求随即被判 503 / 1102。预算内没跑完就放掉 waitUntil。
+      keepAliveBounded(streamResolveTask, ctx);
       resolvedVideo = isUsableResolvedVideo(streamPartial.video)
         ? streamPartial.video
         : await peekPartialResolvedVideo(movieForStream, env);
@@ -13723,7 +13792,8 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       }
       if (!subtitleResolution.record.done) {
         // 播放源已经拿到:让字幕在后台继续解析完并写进缓存。
-        keepAlive(subtitleResolution.tracked, ctx);
+        // 同样有界：避免上游抖动时把这个实例挂到 waitUntil 上限而拖累邻近请求。
+        keepAliveBounded(subtitleResolution.tracked, ctx, BACKGROUND_SUBTITLE_GRACE_MS);
       }
 
       if (!video) {
@@ -13917,11 +13987,17 @@ export async function handleEmby(request, env = {}, fetchImpl = fetch, ctx = nul
 
 // 集成测试会复用同一个模块实例；清空所有进程内状态，避免不同上游响应
 // 被前一个用例的影片、播放源或播放记录缓存串用。
+// 另导出并发闸门工厂，便于单测直接构造隔离实例验证“有界并发 / 有界等待 / 快速失败”。
+export function createEmbyConcurrencyGateForTests(options) {
+  return createConcurrencyGate(options);
+}
+
 export function resetEmbyCachesForTests() {
   MOVIE_CACHE.clear();
   RESOLVE_VIDEO_CACHE.clear();
   RESOLVE_VIDEO_SESSIONS.clear();
-  RESOLVER_JSON_MEMORY.clear();
+  RESOLVE_VIDEO_GATE.reset();
+  clearResolverJsonMemory();
   RESOLVER_JSON_INFLIGHT.clear();
   PARTIAL_RESOLVE_CACHE.clear();
   RESOLVE_SUBTITLE_CACHE.clear();

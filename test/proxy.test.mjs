@@ -12,6 +12,7 @@ import {
 } from "../src/proxy.js";
 import {
   createJavdbSignature,
+  createEmbyConcurrencyGateForTests,
   resetEmbyCachesForTests,
 } from "../src/emby.js";
 import { resetMemoJavCachesForTests } from "../src/memojav.js";
@@ -298,7 +299,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v38",
+    version: "item-dto-v39",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -8044,7 +8045,7 @@ test("streams pseudo TS media before the upstream response finishes", async () =
   assert.deepEqual(delivered, rawBytes.slice(prefixLength));
 });
 
-test("caches complete GetAV HLS segments larger than 8 MiB", async () => {
+test("streams complete GetAV HLS segments larger than 8 MiB without caching them", async () => {
   const sourceUrl =
     "https://static.worldstatic.com/cdn/assets/deliveries/v2/4k/seg-0.woff2?e=2104450940";
   const proxyUrl =
@@ -8082,12 +8083,21 @@ test("caches complete GetAV HLS segments larger than 8 MiB", async () => {
     new Request(proxyUrl, { headers: { range: "bytes=1024-1535" } }),
     {},
     {},
-    async () => {
-      throw new Error("large cached segment should not be fetched again");
+    async (_url, init = {}) => {
+      upstreamFetches += 1;
+      assert.equal(init.headers.get("range"), "bytes=1024-1535");
+      return new Response(segmentBytes.slice(1024, 1536), {
+        status: 206,
+        headers: {
+          "content-range": `bytes 1024-1535/${segmentLength}`,
+          "content-length": "512",
+          "content-type": "video/mp2t",
+        },
+      });
     },
   );
 
-  assert.equal(upstreamFetches, 1);
+  assert.equal(upstreamFetches, 2);
   assert.equal(secondRange.status, 206);
   assert.equal(
     secondRange.headers.get("content-range"),
@@ -8396,7 +8406,7 @@ test("keeps the media Range cache under its total byte budget", async () => {
     { headers: { range: `bytes=0-${entryLength - 1}` } },
   );
 
-  // 每条 2 MB，13 条共 26 MB，超过 24 MB 的总字节上限。
+  // 每条 2 MB，13 条共 26 MB，超过 12 MB 的总字节上限。
   for (let index = 0; index < 13; index += 1) {
     const response = await handleProxy(
       requestFor(index),
@@ -10509,6 +10519,82 @@ test("memo usage page lists the short-link endpoints", async () => {
     payload.example,
     "https://clone.example/memo/ROE-552",
   );
+});
+
+// ---------- 每实例解析并发闸门（503 / 1102 / exceededCpu 修复）----------
+
+test("concurrency gate caps in-flight tasks at max", async () => {
+  const gate = createEmbyConcurrencyGateForTests({
+    max: 2,
+    queueLimit: 32,
+    waitMs: 5000,
+  });
+  let active = 0;
+  let peak = 0;
+  const run = () => gate.run(async () => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    active -= 1;
+  });
+  await Promise.all(Array.from({ length: 8 }, run));
+  assert.equal(peak, 2);
+  assert.equal(gate.active, 0);
+  assert.equal(gate.waiting, 0);
+});
+
+test("concurrency gate fails fast once the wait queue is full", async () => {
+  const gate = createEmbyConcurrencyGateForTests({
+    max: 1,
+    queueLimit: 1,
+    waitMs: 5000,
+  });
+  let releaseHolder;
+  const holder = gate.run(
+    () => new Promise((resolve) => {
+      releaseHolder = resolve;
+    }),
+  );
+  // 占满唯一的等待名额。
+  const queued = gate.run(async () => "queued");
+  await assert.rejects(gate.run(async () => "overflow"), /overloaded/);
+  releaseHolder();
+  await holder;
+  assert.equal(await queued, "queued");
+});
+
+test("concurrency gate gives up waiting after waitMs", async () => {
+  const gate = createEmbyConcurrencyGateForTests({
+    max: 1,
+    queueLimit: 32,
+    waitMs: 30,
+  });
+  let releaseHolder;
+  const holder = gate.run(
+    () => new Promise((resolve) => {
+      releaseHolder = resolve;
+    }),
+  );
+  await assert.rejects(gate.run(async () => "late"), /timed out/);
+  releaseHolder();
+  await holder;
+  assert.equal(gate.active, 0);
+});
+
+test("concurrency gate releases the slot when the task throws", async () => {
+  const gate = createEmbyConcurrencyGateForTests({
+    max: 1,
+    queueLimit: 4,
+    waitMs: 1000,
+  });
+  await assert.rejects(
+    gate.run(async () => {
+      throw new Error("boom");
+    }),
+    /boom/,
+  );
+  assert.equal(gate.active, 0);
+  assert.equal(await gate.run(async () => "ok"), "ok");
 });
 
 

@@ -1,5 +1,6 @@
 import { handleEmby } from "./emby.js";
 import { handleMemoJav } from "./memojav.js";
+import { createResolverVariantParser } from "./resolver-stream.js";
 
 export const DEFAULT_UPSTREAM_ORIGIN =
   "https://catembylegacy.fastcdn.dpdns.org";
@@ -453,117 +454,6 @@ function settledWithin(promise, ms) {
     timer = setTimeout(() => resolve(null), ms);
   });
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
-}
-
-function createResolverVariantParser() {
-  let json = "";
-  let keySearchIndex = 0;
-  let arrayStart = -1;
-  let scanIndex = -1;
-  let arrayComplete = false;
-  let inString = false;
-  let escaped = false;
-  let elementStart = -1;
-  let elementDepth = 0;
-  const variants = [];
-
-  const findArrayStart = () => {
-    if (arrayStart >= 0) return;
-    const pattern = /"(?:variants|sources|videos|streams)"\s*:/g;
-    pattern.lastIndex = keySearchIndex;
-    const match = pattern.exec(json);
-    if (!match) {
-      keySearchIndex = Math.max(0, json.length - 32);
-      return;
-    }
-    let index = pattern.lastIndex;
-    while (index < json.length && /\s/.test(json[index])) index += 1;
-    if (json[index] !== "[") {
-      keySearchIndex = pattern.lastIndex;
-      return;
-    }
-    arrayStart = index;
-    scanIndex = index + 1;
-  };
-
-  const scan = () => {
-    findArrayStart();
-    if (arrayStart < 0 || arrayComplete) return;
-    while (scanIndex < json.length) {
-      const char = json[scanIndex];
-      if (inString) {
-        if (escaped) {
-          escaped = false;
-        } else if (char === "\\") {
-          escaped = true;
-        } else if (char === '"') {
-          inString = false;
-        }
-        scanIndex += 1;
-        continue;
-      }
-      if (char === '"') {
-        inString = true;
-        scanIndex += 1;
-        continue;
-      }
-      if (elementStart < 0) {
-        if (char === "]") {
-          arrayComplete = true;
-          try {
-            const complete = JSON.parse(json.slice(arrayStart, scanIndex + 1));
-            if (Array.isArray(complete)) {
-              variants.splice(0, variants.length, ...complete);
-            }
-          } catch {
-            // 已收集到的对象仍可用。
-          }
-          break;
-        }
-        if (char === "{") {
-          elementStart = scanIndex;
-          elementDepth = 1;
-        }
-      } else if (char === "{" || char === "[") {
-        elementDepth += 1;
-      } else if (char === "}" || char === "]") {
-        elementDepth -= 1;
-        if (elementDepth === 0) {
-          try {
-            variants.push(JSON.parse(json.slice(elementStart, scanIndex + 1)));
-          } catch {
-            // 半截或非对象元素直接跳过。
-          }
-          elementStart = -1;
-        }
-      }
-      scanIndex += 1;
-    }
-  };
-
-  return {
-    push(fragment) {
-      if (!fragment) return;
-      json += fragment;
-      scan();
-    },
-    variants() {
-      return variants.slice();
-    },
-    complete() {
-      return arrayComplete;
-    },
-    payload() {
-      if (variants.length || arrayComplete) {
-        return { variants: variants.slice() };
-      }
-      try {
-        return JSON.parse(json);
-      } catch {
-        return null;
-      }
-    },
-  };
 }
 
 async function readResolverJsonResponse(response) {
