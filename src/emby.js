@@ -1998,14 +1998,20 @@ function mediaSegmentCacheKey(sourceUrl) {
   return `media-segment-v1|${md5(String(sourceUrl || ""))}`;
 }
 
-function mediaSegmentNeedsEmbeddedTsNormalization(sourceUrl) {
+function mediaSegmentNeedsEmbeddedTsNormalization(sourceUrl, encrypted = false) {
   let pathname = "";
   try {
     pathname = new URL(sourceUrl).pathname;
   } catch {
     return false;
   }
-  return HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
+  // AES 加密分片没有明文 TS 包序列，不能探测或剥离外壳；加密参数必须和
+  // proxyMediaResponse 的 embeddedTsCandidate 保持同一判断，否则会多发一次
+  // 0-511 探测，再把客户端 Range 请求落到兜底路径。
+  return (
+    HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname) ||
+    HLS_FONT_RESOURCE_PATTERN.test(pathname)
+  ) && !encrypted;
 }
 
 function parseSingleByteRange(value, total) {
@@ -2195,7 +2201,11 @@ function guardMediaStreamBody(
 }
 
 function embeddedTsMappedResponse(upstream, metadata, range) {
-  if (!upstream.body || upstream.headers.has("content-encoding")) {
+  if (
+    !upstream.body ||
+    upstream.headers.has("content-encoding") ||
+    upstream.headers.get(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER) === "1"
+  ) {
     return null;
   }
   const headers = new Headers();
@@ -2585,8 +2595,15 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
   }
 
   const embeddedOffset = embeddedMpegTsOffset(prefix);
+  // fetch 会自动解压响应体。压缩响应不能沿用上游 Content-Length /
+  // Content-Range 推导剥离后的长度，否则客户端会按错误长度提前截断，
+  // 表现为播放卡住或花屏。这里只对未压缩响应做精确长度映射。
+  const contentEncoded = upstream.headers.has("content-encoding");
   if (embeddedOffset < 0) {
     const headers = mediaProxyResponseHeaders(upstream);
+    // 这里已经检查过前 512 字节并确认不是伪 TS 分片。带上内部标记，
+    // 避免 proxyMediaResponse 再次把同一个流送进剥壳探测。
+    headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
     const body = streamMediaBodyWithPrefix(
       prefix,
       prefixResult.remainder,
@@ -2604,7 +2621,9 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
     };
   }
 
-  const upstreamBodyBytes = expectedUpstreamBodyBytes(upstream.headers);
+  const upstreamBodyBytes = contentEncoded
+    ? 0
+    : expectedUpstreamBodyBytes(upstream.headers);
   const normalizedBodyBytes = upstreamBodyBytes > 0
     ? Math.max(0, upstreamBodyBytes - embeddedOffset)
     : 0;
@@ -2628,14 +2647,21 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
   headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
   headers.delete("etag");
   headers.delete("last-modified");
-  if (normalizedBodyBytes > 0) {
+  if (!contentEncoded && normalizedBodyBytes > 0) {
     headers.set("content-length", String(normalizedBodyBytes));
   } else {
     headers.delete("content-length");
   }
 
-  const upstreamContentRange = upstream.headers.get("content-range") || "";
-  if (upstream.status === 206 && upstreamContentRange && normalizedBodyBytes > 0) {
+  const upstreamContentRange = contentEncoded
+    ? ""
+    : upstream.headers.get("content-range") || "";
+  if (
+    !contentEncoded &&
+    upstream.status === 206 &&
+    upstreamContentRange &&
+    normalizedBodyBytes > 0
+  ) {
     const adjusted = adjustedContentRangeAfterPrefix(
       upstreamContentRange,
       embeddedOffset,
@@ -3187,8 +3213,10 @@ async function fetchMediaUpstreamResponse(
     sourceUrl,
     options,
   );
+  const requestUrl = new URL(request.url);
+  const requestEncrypted = requestUrl.searchParams.get("encrypted") === "1";
   const needsEmbeddedTsNormalization =
-    mediaSegmentNeedsEmbeddedTsNormalization(sourceUrl);
+    mediaSegmentNeedsEmbeddedTsNormalization(sourceUrl, requestEncrypted);
   const headersTimeoutMs = positiveEnvMilliseconds(
     env,
     "MEDIA_UPSTREAM_HEADERS_TIMEOUT_MS",
@@ -3334,6 +3362,7 @@ async function fetchMediaUpstreamResponse(
         upstream.status !== 206 ||
         upstream.headers.has("content-encoding")
       ) {
+        upstream.headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
         return upstream;
       }
       if (
@@ -3357,6 +3386,7 @@ async function fetchMediaUpstreamResponse(
         MEDIA_SEGMENT_RANGE_CACHE.forget(rangeKey);
         return mediaUpstreamInvalidResponse();
       }
+      upstream.headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
       return teeMediaRangeResponseBody(
         upstream,
         rangeKey,
@@ -3466,7 +3496,11 @@ async function fetchMediaUpstreamResponse(
     }
 
     if (!metadata) {
-      return fetchUpstreamWithRetry();
+      const upstream = await fetchUpstreamWithRetry(headers);
+      // 前缀探测已经消费/取消过响应体，这里必须用原始 Range 重新拉取；
+      // 继续沿用探测 Range 会把分片开头返回给播放器的中段请求。
+      upstream.headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
+      return upstream;
     }
 
     if (probe.status === 200 && probeComplete) {
@@ -4112,8 +4146,13 @@ async function proxyMediaResponse(
   try {
     pathname = new URL(sourceUrl).pathname;
   } catch {}
+  // fcjav / GetAV 的伪分片外壳除了 image/png，还常见 font/woff2；这类明文
+  // 分片必须进入剥壳路径，否则外壳字节会被原样透传，播放器解码失败后表现
+  // 为花屏 / 跳段。AES 加密分片没有明文 TS 包序列，不能按外壳剥离。
   const embeddedTsCandidate = upstreamType.startsWith("image/") ||
-    HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
+    (upstreamType.startsWith("font/") && !encrypted) ||
+    (HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname) ||
+      HLS_FONT_RESOURCE_PATTERN.test(pathname)) && !encrypted;
   if (request.method === "HEAD" || !upstream.body) {
     // 伪 HLS 分片的上游外壳是 image/png，且 Content-Length 含前缀。播放器在
     // 取流前先发 HEAD 时会根据这里的头部判断“能不能播”；原样透传图片类型会
@@ -4136,7 +4175,7 @@ async function proxyMediaResponse(
     });
   }
 
-  if (embeddedTsCandidate && !prefixAdjusted) {
+  if (embeddedTsCandidate && !prefixAdjusted && kind !== "key") {
     const cacheKey = request.method === "GET" &&
       !request.headers.has("range") &&
       !hlsManifestRequest &&

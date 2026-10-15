@@ -7052,7 +7052,12 @@ test("marks key and encrypted segment proxy URLs and forces safe content types",
     fetchImpl,
   );
   assert.equal(segmentResponse.status, 206);
-  assert.equal(segmentResponse.headers.get("content-type"), "application/octet-stream");
+  // fcjav 的 font/woff2 外壳必须进入伪 TS 归一化路径；四个字节探测不出
+  // 外壳时按媒体分片语义回传，不把字体类型暴露给播放器。
+  assert.equal(
+    segmentResponse.headers.get("content-type"),
+    "application/octet-stream",
+  );
   assert.equal(segmentResponse.headers.get("content-range"), "bytes 0-3/4");
   assert.equal(segmentResponse.headers.get("etag"), "segment-etag");
   assert.equal(new Headers(segmentRequestHeaders).get("range"), "bytes=0-3");
@@ -7556,7 +7561,7 @@ test("proxies resolver CDN Range requests for every current media suffix", async
       `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
     const bytes = new Uint8Array([0x47, 0x40, 0x11, 0x10]);
     let upstreamFetches = 0;
-    let seenRange = null;
+    const seenRanges = [];
 
     const response = await handleProxy(
       new Request(proxyUrl, { headers: { range: "bytes=0-3" } }),
@@ -7564,7 +7569,7 @@ test("proxies resolver CDN Range requests for every current media suffix", async
       {},
       async (_url, init = {}) => {
         upstreamFetches += 1;
-        seenRange = init.headers.get("range");
+        seenRanges.push(init.headers.get("range"));
         return new Response(bytes, {
           status: 206,
           headers: {
@@ -7577,9 +7582,12 @@ test("proxies resolver CDN Range requests for every current media suffix", async
     );
 
     assert.equal(upstreamFetches, 1);
-    assert.equal(seenRange, "bytes=0-3");
+    // .woff2 先用 0-511 探测伪 TS 外壳；这个小响应本身完整，探测结果
+    // 可直接作为分片响应，不需要再发一次原始 Range。
+    assert.deepEqual(seenRanges, ["bytes=0-511"]);
     assert.equal(response.status, 206);
     assert.equal(response.headers.get("content-range"), "bytes 0-3/4");
+    assert.equal(response.headers.get("content-type"), "video/mp2t");
     assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
   }
 });
@@ -8087,6 +8095,8 @@ test("streams complete GetAV HLS segments larger than 8 MiB without caching them
   const segmentLength = 13_357_600;
   const segmentBytes = new Uint8Array(segmentLength);
   segmentBytes.fill(0xa5);
+  // .woff2 现在进入伪 TS 归一化路径：前 512 字节探测无法证明有 TS 外壳，
+  // 所以首个完整 GET 原样流式转发；Range 也按缓存透传分支处理。
   let upstreamFetches = 0;
 
   const firstFull = await handleProxy(
@@ -8125,7 +8135,7 @@ test("streams complete GetAV HLS segments larger than 8 MiB without caching them
         headers: {
           "content-range": `bytes 1024-1535/${segmentLength}`,
           "content-length": "512",
-          "content-type": "video/mp2t",
+          "content-type": "application/octet-stream",
         },
       });
     },
@@ -8135,7 +8145,7 @@ test("streams complete GetAV HLS segments larger than 8 MiB without caching them
   assert.equal(secondRange.status, 206);
   assert.equal(
     secondRange.headers.get("content-range"),
-    `bytes 1024-1535/${segmentLength}`,
+    "bytes 1024-1535/13357600",
   );
   assert.equal(secondRange.headers.get("content-length"), "512");
   assert.deepEqual(
