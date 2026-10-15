@@ -3933,6 +3933,34 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth, options = 
   return output.join("\n");
 }
 
+// rewriteHlsManifest 的带缓存包装：输出只依赖「部署源 + 目标清单地址 + depth
+// + 输入清单内容」，前三个进缓存键，最后一个在命中时按内容复核。清单是一次
+// 解析就固定的字符串，复核等价于一次长度 + 内容比较（V8 对等长字符串走
+// memcmp），比重新改写一千多行便宜得多。没命中就照常改并写回。
+// 两个计数器只用于测试与排查：能直接证明同一份清单的重复改写被省掉。
+let rewrittenHlsCacheHits = 0;
+let rewrittenHlsCacheMisses = 0;
+
+function rewriteHlsManifestCached(playlist, manifestUrl, requestUrl, depth) {
+  const source = String(playlist || "");
+  let origin = "";
+  try {
+    origin = new URL(String(requestUrl || "")).origin;
+  } catch {
+    origin = "";
+  }
+  const key = `${origin}|${hlsRewriteDepth(depth)}|${String(manifestUrl || "")}`;
+  const cached = REWRITTEN_HLS_CACHE.read(key);
+  if (cached && cached.playlist === source) {
+    rewrittenHlsCacheHits += 1;
+    return cached.output;
+  }
+  rewrittenHlsCacheMisses += 1;
+  const output = rewriteHlsManifest(source, manifestUrl, requestUrl, depth);
+  REWRITTEN_HLS_CACHE.write(key, { playlist: source, output });
+  return output;
+}
+
 function isGetavPrefetchMediaUrl(value) {
   try {
     const url = value instanceof URL ? value : new URL(String(value || ""));
@@ -4327,7 +4355,7 @@ async function proxyMediaResponse(
   }
 
   const finalUrl = upstream.url || sourceUrl;
-  const rewritten = rewriteHlsManifest(text, finalUrl, request.url, depth);
+  const rewritten = rewriteHlsManifestCached(text, finalUrl, request.url, depth);
   scheduleGetavHlsPrefetch(
     text,
     finalUrl,
@@ -4859,6 +4887,27 @@ const MAX_CACHED_MEDIA_SEGMENT_BYTES = 8 * 1024 * 1024;
 const MEDIA_SEGMENT_BODY_CACHE_MAX_TOTAL_BYTES = 8 * 1024 * 1024;
 const MEDIA_SEGMENT_RANGE_CACHE_MAX_TOTAL_BYTES = 12 * 1024 * 1024;
 
+// 清单改写结果缓存（不是分片缓存）。
+// 服务器GG / fcjav / 服务器tiful 的“原版 / 去码版”线路会给出一份上千行的
+// HLS 清单（实测单条 1908 行 / 约 310 KB）。每行分片 URI 都要 new URL()
+// 解析、再把签名参数整体编码进 /emby-media/ 代理地址，单次改写实测约 6.5 ms。
+// 客户端的典型行为是“退出详情页再进来 / 播放器进度条拖动重试 / 多线程加速
+// 播放器并发拉同一份清单”，于是同一份清单会被反复改写；6.5 ms 已经贴着
+// Workers 默认 CPU 预算，冷启动实例叠上解析开销后就会返回 Cloudflare
+// 1102（Worker exceeded resource limits，客户端只看到 503）。
+// 这里把“改写后的清单”按部署源 + 目标清单地址 + depth 记一小段时间，并且
+// 只在输入清单内容与写入时完全一致时才复用，因此重新解析出的新清单不会被
+// 旧结果顶掉。缓存的是字符串（与解析缓存里那份 inlinePlaylist 同量级），
+// 再加一道总字节上限，避免高并发时反过来把内存推高。
+const REWRITTEN_HLS_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_REWRITTEN_HLS_CACHE_ENTRIES = 24;
+const MAX_REWRITTEN_HLS_CACHE_BYTES = 16 * 1024 * 1024;
+
+function rewrittenHlsEntryBytes(entry) {
+  const length = String(entry?.output || "").length;
+  return Number.isSafeInteger(length) && length > 0 ? length : 0;
+}
+
 // 媒体缓存条目都形如 { bytes: Uint8Array, headers, ... }，按实际字节数记账。
 function mediaCacheEntryBytes(record) {
   const length = record?.bytes?.byteLength;
@@ -5038,6 +5087,15 @@ const MEDIA_SEGMENT_RANGE_CACHE = createTtlCache(
   {
     sizeOf: mediaCacheEntryBytes,
     maxTotalBytes: MEDIA_SEGMENT_RANGE_CACHE_MAX_TOTAL_BYTES,
+  },
+);
+// 清单改写结果：同一份上游清单被反复改写时直接复用，省掉上千次 URL 解析。
+const REWRITTEN_HLS_CACHE = createTtlCache(
+  REWRITTEN_HLS_CACHE_TTL_MS,
+  MAX_REWRITTEN_HLS_CACHE_ENTRIES,
+  {
+    sizeOf: rewrittenHlsEntryBytes,
+    maxTotalBytes: MAX_REWRITTEN_HLS_CACHE_BYTES,
   },
 );
 
@@ -12773,7 +12831,7 @@ async function streamResponse(id, request, env, fetchImpl, token, ctx = null) {
       for (const candidate of candidates) {
         if (candidate.inlinePlaylist) {
           const inlineUrl = `${upstreamOrigin(env)}/${encodeURIComponent(id)}.m3u8`;
-          const playlist = rewriteHlsManifest(
+          const playlist = rewriteHlsManifestCached(
             candidate.inlinePlaylist,
             inlineUrl,
             request.url,
@@ -14444,6 +14502,21 @@ export function createEmbyConcurrencyGateForTests(options) {
   return createConcurrencyGate(options);
 }
 
+// 只给单测用：直接驱动“清单改写缓存”，验证同一份清单只改写一次、
+// 而清单内容变化时不会被旧结果顶掉。
+export function rewriteHlsManifestCachedForTests(
+  playlist,
+  manifestUrl,
+  requestUrl,
+  depth,
+) {
+  return rewriteHlsManifestCached(playlist, manifestUrl, requestUrl, depth);
+}
+
+export function rewrittenHlsCacheStatsForTests() {
+  return { hits: rewrittenHlsCacheHits, misses: rewrittenHlsCacheMisses };
+}
+
 export function resetEmbyCachesForTests() {
   MOVIE_CACHE.clear();
   RESOLVE_VIDEO_CACHE.clear();
@@ -14459,6 +14532,9 @@ export function resetEmbyCachesForTests() {
   MEDIA_SEGMENT_BODY_CACHE.clear();
   MEDIA_SEGMENT_PREFIX_CACHE.clear();
   MEDIA_SEGMENT_RANGE_CACHE.clear();
+  REWRITTEN_HLS_CACHE.clear();
+  rewrittenHlsCacheHits = 0;
+  rewrittenHlsCacheMisses = 0;
   GETAV_HLS_PREFETCH_IN_FLIGHT.clear();
   GETAV_HLS_PREFETCH_RECENT.clear();
   GETAV_HLS_NEXT_SEGMENTS.clear();

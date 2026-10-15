@@ -13,6 +13,8 @@ import {
 import {
   createJavdbSignature,
   createEmbyConcurrencyGateForTests,
+  rewriteHlsManifestCachedForTests,
+  rewrittenHlsCacheStatsForTests,
   resetEmbyCachesForTests,
 } from "../src/emby.js";
 import { resetMemoJavCachesForTests } from "../src/memojav.js";
@@ -10717,6 +10719,55 @@ test("concurrency gate releases the slot when the task throws", async () => {
   );
   assert.equal(gate.active, 0);
   assert.equal(await gate.run(async () => "ok"), "ok");
+});
+
+// 服务器GG / fcjav 的“原版 / 去码版”会给出一份上千行的 HLS 清单，每行分片
+// URI 都要解析 + 重新编码成 /emby-media/ 代理地址。客户端“退出详情页再进来 /
+// 拖动进度条重试 / 多线程播放器并发拉清单”会把同一份清单反复送进来，重复
+// 改写是 Cloudflare 1102（Worker resource limit，客户端看到 503）的主要来源。
+// 这里锁两件事：同一份清单只改写一次；清单内容变化时必须重新改写，不能拿旧结果。
+test("rewrites an unchanged inline HLS manifest once and refires when it changes", () => {
+  const manifestUrl = "https://upstream.example/video/42.m3u8";
+  const requestUrl = "https://clone.example/emby/Videos/42/stream.m3u8?api_key=guest";
+  const playlistWith = (segmentHost) => [
+    "#EXTM3U",
+    "#EXT-X-VERSION:3",
+    "#EXT-X-TARGETDURATION:10",
+    "#EXT-X-MEDIA-SEQUENCE:1",
+    "#EXTINF:10.010,",
+    `https://p1-ad-site-sign-sg.${segmentHost}/a/image?x-expires=1813535584&kind=segment`,
+    "#EXTINF:10.010,",
+    `https://p2-ad-site-sign-sg.${segmentHost}/b/image?x-expires=1813535584&kind=segment`,
+    "#EXT-X-ENDLIST",
+    "",
+  ].join("\n");
+
+  const playlistA = playlistWith("tiktokcdn.com");
+  const first = rewriteHlsManifestCachedForTests(playlistA, manifestUrl, requestUrl, 0);
+  const second = rewriteHlsManifestCachedForTests(playlistA, manifestUrl, requestUrl, 0);
+
+  assert.equal(second, first);
+  assert.match(first, /\/emby-media\/\?url=/);
+  assert.deepEqual(rewrittenHlsCacheStatsForTests(), { hits: 1, misses: 1 });
+
+  // 同一份清单的高并发改写只应触发一次真正的改写。
+  const hitsBefore = rewrittenHlsCacheStatsForTests().hits;
+  for (let i = 0; i < 20; i += 1) {
+    assert.equal(
+      rewriteHlsManifestCachedForTests(playlistA, manifestUrl, requestUrl, 0),
+      first,
+    );
+  }
+  assert.equal(rewrittenHlsCacheStatsForTests().misses, 1);
+  assert.equal(rewrittenHlsCacheStatsForTests().hits, hitsBefore + 20);
+
+  // 重新解析出的清单换了分片域名：必须重新改写，不能复用旧结果。
+  const playlistB = playlistWith("creativegrowthworld.site");
+  const changed = rewriteHlsManifestCachedForTests(playlistB, manifestUrl, requestUrl, 0);
+  assert.notEqual(changed, first);
+  assert.match(changed, /creativegrowthworld\.site/);
+  assert.doesNotMatch(changed, /tiktokcdn\.com/);
+  assert.equal(rewrittenHlsCacheStatsForTests().misses, 2);
 });
 
 
