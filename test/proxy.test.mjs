@@ -7248,6 +7248,7 @@ test("rejects a mismatched media Range response without retrying", async () => {
     {},
     upstream,
   );
+  // 上游根本没有包含请求区间，不能伪装成可用分片。
   assert.equal(first.status, 502);
   assert.equal(upstreamFetches, 1);
 
@@ -7590,6 +7591,83 @@ test("proxies resolver CDN Range requests for every current media suffix", async
     assert.equal(response.headers.get("content-type"), "video/mp2t");
     assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
   }
+});
+
+test("trims oversized media range responses to the requested interval", async () => {
+  const sourceUrl = "https://static.worldstatic.com/jux-844/uncensored.mp4";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const response = await handleProxy(
+    new Request(proxyUrl, { headers: { range: "bytes=8-11" } }),
+    {},
+    {},
+    async () => new Response(new Uint8Array(16).fill(0xab), {
+      status: 206,
+      headers: {
+        "content-range": "bytes 4-15/16",
+        "content-type": "video/mp4",
+      },
+    }),
+  );
+
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-range"), "bytes 8-11/16");
+  assert.equal(response.headers.get("content-length"), "4");
+  assert.deepEqual(
+    new Uint8Array(await response.arrayBuffer()),
+    Uint8Array.from([0xab, 0xab, 0xab, 0xab]),
+  );
+});
+
+test("trims a small MP4 tail range from a multi-gigabyte response", async () => {
+  const sourceUrl = "https://static.worldstatic.com/jux-844/uncensored.mp4";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  const response = await handleProxy(
+    new Request(proxyUrl, {
+      headers: { range: "bytes=700000000-700001023" },
+    }),
+    {},
+    {},
+    async () => new Response(new Uint8Array(4096).fill(0xcd), {
+      status: 206,
+      headers: {
+        "content-range": "bytes 700000000-1519137166/1519137167",
+        "content-type": "video/mp4",
+      },
+    }),
+  );
+
+  assert.equal(response.status, 206);
+  assert.equal(
+    response.headers.get("content-range"),
+    "bytes 700000000-700001023/1519137167",
+  );
+  assert.equal(response.headers.get("content-length"), "1024");
+  assert.equal((await response.arrayBuffer()).byteLength, 1024);
+});
+
+test("trims MP4 range responses served from HLS manifest stream URLs", async () => {
+  const sourceUrl = "https://static.worldstatic.com/jux-844/uncensored.mp4";
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby/Videos/0eYvb/stream.m3u8?api_key=bbjavdb-guest&source=${encodeURIComponent(sourceUrl)}&sourceType=video/mp4`,
+      { headers: { range: "bytes=8-11" } },
+    ),
+    {},
+    {},
+    async () => new Response(new Uint8Array(16).fill(0xab), {
+      status: 206,
+      headers: {
+        "content-range": "bytes 4-15/16",
+        "content-type": "video/mp4",
+      },
+    }),
+  );
+
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-range"), "bytes 8-11/16");
+  assert.equal(response.headers.get("content-length"), "4");
 });
 
 test("allows GG HLS media hosts and caches only complete segment GETs", async () => {

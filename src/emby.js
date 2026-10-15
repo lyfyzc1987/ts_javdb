@@ -2200,6 +2200,91 @@ function guardMediaStreamBody(
   });
 }
 
+// 部分 MP4/普通媒体上游会忽略客户端 Range 的结束位置，把请求点后面的整段
+// 文件都发回来。播放器拿到的 Content-Range 却远大于实际需要的 1KB/几 MB，
+// 表现为读取失控、卡顿、退出时连接被拖挂。这里在代理出口把响应体截到
+// 客户端请求的精确区间，并同步修正响应头。
+function trimMediaRangeResponseBody(upstream, request, headers) {
+  const rangeHeader = request.headers.get("range");
+  const contentRange = parseMediaContentRange(
+    headers.get("content-range") || "",
+  );
+  const requestMatch = /^bytes=(\d+)-(\d+)$/i.exec(
+    String(rangeHeader || "").trim(),
+  );
+  const requestedStart = requestMatch ? Number(requestMatch[1]) : NaN;
+  const requestedEnd = requestMatch ? Number(requestMatch[2]) : NaN;
+  if (
+    !contentRange ||
+    !Number.isSafeInteger(requestedStart) ||
+    !Number.isSafeInteger(requestedEnd) ||
+    requestedStart < contentRange.start ||
+    requestedEnd < requestedStart ||
+    requestedEnd > contentRange.end ||
+    requestedEnd >= contentRange.end
+  ) {
+    return { body: upstream.body, status: upstream.status };
+  }
+
+  headers.set(
+    "content-range",
+    `bytes ${requestedStart}-${requestedEnd}/${contentRange.total ?? "*"}`,
+  );
+  headers.set("content-length", String(requestedEnd - requestedStart + 1));
+  headers.delete("transfer-encoding");
+
+  const reader = upstream.body?.getReader();
+  if (!reader) return { body: null, status: 206 };
+  let skip = requestedStart - contentRange.start;
+  let remaining = requestedEnd - requestedStart + 1;
+  const body = new ReadableStream({
+    async pull(controller) {
+      while (skip > 0) {
+        const result = await reader.read();
+        if (result.done) {
+          controller.close();
+          return;
+        }
+        if (result.value.byteLength <= skip) {
+          skip -= result.value.byteLength;
+          continue;
+        }
+        const usable = result.value.subarray(skip);
+        skip = 0;
+        const chunk = remaining < usable.byteLength
+          ? usable.subarray(0, remaining)
+          : usable;
+        remaining -= chunk.byteLength;
+        controller.enqueue(chunk);
+        return;
+      }
+      if (remaining <= 0) {
+        controller.close();
+        await reader.cancel().catch(() => {});
+        return;
+      }
+      const result = await reader.read();
+      if (result.done) {
+        controller.close();
+        return;
+      }
+      const chunk = remaining < result.value.byteLength
+        ? result.value.subarray(0, remaining)
+        : result.value;
+      remaining -= chunk.byteLength;
+      controller.enqueue(chunk);
+      if (remaining <= 0) {
+        controller.close();
+        await reader.cancel().catch(() => {});
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return { body, status: 206 };
+}
+
 function embeddedTsMappedResponse(upstream, metadata, range) {
   if (
     !upstream.body ||
@@ -3380,11 +3465,33 @@ async function fetchMediaUpstreamResponse(
         upstream.headers,
       );
       if (rangeMatches === false) {
-        try {
-          await upstream.body?.cancel();
-        } catch {}
+        // 上游可能返回一个更大的 206 区间（例如把请求点后的整段 MP4 都发回
+        // 来）。这不是媒体错误文档；交给 proxyMediaResponse 修剪成客户端
+        // 请求的精确区间，同时不能写入 Range 缓存。
+        const upstreamRange = parseMediaContentRange(
+          upstream.headers.get("content-range") || "",
+        );
+        const requestedRange = parseSingleByteRange(
+          rangeHeader,
+          upstreamRange?.total ?? upstreamRange?.end + 1 ?? 0,
+        );
+        if (
+          !upstreamRange ||
+          !requestedRange ||
+          requestedRange.invalid ||
+          requestedRange.unsatisfiable ||
+          upstreamRange.start > requestedRange.start ||
+          upstreamRange.end < requestedRange.end
+        ) {
+          try {
+            await upstream.body?.cancel();
+          } catch {}
+          MEDIA_SEGMENT_RANGE_CACHE.forget(rangeKey);
+          return mediaUpstreamInvalidResponse();
+        }
         MEDIA_SEGMENT_RANGE_CACHE.forget(rangeKey);
-        return mediaUpstreamInvalidResponse();
+        upstream.headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
+        return upstream;
       }
       upstream.headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
       return teeMediaRangeResponseBody(
@@ -4194,10 +4301,15 @@ async function proxyMediaResponse(
 
   if (
     !isHlsResponse(upstream, sourceUrl) ||
-    (upstream.status === 206 && !hlsManifestRequest)
+    // 某些上游把整文件 MP4 挂在 .m3u8 形式的 stream URL 后面。这时不能只看
+    // 请求路径是否像清单，要看上游实际 Content-Type：返回视频媒体的 206
+    // 仍然要修剪，否则播放器请求 1KB 会被拖成几百 MB。
+    (upstream.status === 206 && !hlsManifestRequest) ||
+    (upstream.status === 206 && !upstreamType.includes("mpegurl"))
   ) {
-    return new Response(guardMediaStreamBody(upstream.body), {
-      status: upstream.status,
+    const trimmed = trimMediaRangeResponseBody(upstream, request, headers);
+    return new Response(guardMediaStreamBody(trimmed.body), {
+      status: trimmed.status,
       statusText: upstream.statusText,
       headers,
     });
