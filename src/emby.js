@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-16-mpegts-truncation-alignment-63";
+const SERVER_BUILD_ID = "2026-10-16-trusted-cache-fast-reuse-64";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -274,7 +274,7 @@ const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
   429,
 ]);
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v45";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v46";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -8961,45 +8961,71 @@ function forgetPartialResolvedVideo(key) {
   forgetEdgeCache(EDGE_NAMESPACE_VIDEO_PARTIAL, key);
 }
 
-async function peekCachedResolvedVideo(movie, env, fetchImpl, ctx = null) {
+async function peekCachedResolvedVideo(
+  movie,
+  env,
+  fetchImpl,
+  ctx = null,
+  options = {},
+) {
   const key = resolvedVideoCacheKey(movie, env);
   if (!key) return null;
+  // validate === false：可信缓存（多线路，或解析链收尾时写过标记的单线路）
+  // 直接复用，不再回源重抓 HLS 清单 + 探测分片。
+  //
+  // 每次命中缓存都同步跑一遍 validatedResolvedVideo 是 PlaybackInfo 把 isolate
+  // 顶爆（Cloudflare exceededCpu → 503 / 1102）的主要来源：一次校验要给 5~8 条
+  // 线路各抓一份清单、再各取一个分片，CPU 与上游压力都远大于“读缓存 + 生成
+  // DTO”。死源改由 30 分钟缓存 TTL、播放失败时的定向失效
+  // （forgetResolveVideoCache）以及后台刷新兜底。
+  const fastReuse = options.validate === false;
   const memory = RESOLVE_VIDEO_CACHE.read(key);
   if (isUsableResolvedVideo(memory)) {
-    const validated = await validateCachedResolvedVideo(
-      memory,
-      env,
-      key,
-      fetchImpl,
-      "memory",
-    );
-    if (validated) {
-      RESOLVE_VIDEO_CACHE.write(key, validated);
-      return validated;
+    if (fastReuse && resolvedVideoCacheIsTrustworthy(memory)) {
+      return memory;
+    }
+    if (!fastReuse) {
+      const validated = await validateCachedResolvedVideo(
+        memory,
+        env,
+        key,
+        fetchImpl,
+        "memory",
+      );
+      if (validated) {
+        RESOLVE_VIDEO_CACHE.write(key, validated);
+        return validated;
+      }
     }
   }
   try {
     const shared = await edgeCacheRead(EDGE_NAMESPACE_VIDEO, key);
     if (isUsableResolvedVideo(shared)) {
-      const validated = await validateCachedResolvedVideo(
-        shared,
-        env,
-        key,
-        fetchImpl,
-        "edge",
-      );
-      if (validated) {
-        await settleCacheWrite(
-          edgeCacheWrite(
-            EDGE_NAMESPACE_VIDEO,
-            key,
-            validated,
-            RESOLVE_CACHE_TTL_MS / 1000,
-          ),
-          ctx,
+      if (fastReuse && resolvedVideoCacheIsTrustworthy(shared)) {
+        RESOLVE_VIDEO_CACHE.write(key, shared);
+        return shared;
+      }
+      if (!fastReuse) {
+        const validated = await validateCachedResolvedVideo(
+          shared,
+          env,
+          key,
+          fetchImpl,
+          "edge",
         );
-        RESOLVE_VIDEO_CACHE.write(key, validated);
-        return validated;
+        if (validated) {
+          await settleCacheWrite(
+            edgeCacheWrite(
+              EDGE_NAMESPACE_VIDEO,
+              key,
+              validated,
+              RESOLVE_CACHE_TTL_MS / 1000,
+            ),
+            ctx,
+          );
+          RESOLVE_VIDEO_CACHE.write(key, validated);
+          return validated;
+        }
       }
     }
   } catch {
@@ -9011,16 +9037,22 @@ async function peekCachedResolvedVideo(movie, env, fetchImpl, ctx = null) {
       persisted &&
       Date.now() - persisted.savedAt <= RESOLVED_VIDEO_PERSIST_TTL_MS
     ) {
-      const validated = await validateCachedResolvedVideo(
-        persisted.video,
-        env,
-        key,
-        fetchImpl,
-        "persisted",
-      );
-      if (validated) {
-        RESOLVE_VIDEO_CACHE.write(key, validated);
-        return validated;
+      if (fastReuse && resolvedVideoCacheIsTrustworthy(persisted.video)) {
+        RESOLVE_VIDEO_CACHE.write(key, persisted.video);
+        return persisted.video;
+      }
+      if (!fastReuse) {
+        const validated = await validateCachedResolvedVideo(
+          persisted.video,
+          env,
+          key,
+          fetchImpl,
+          "persisted",
+        );
+        if (validated) {
+          RESOLVE_VIDEO_CACHE.write(key, validated);
+          return validated;
+        }
       }
     }
   } catch {
@@ -9235,11 +9267,15 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
   // 复用会让“点开详情页只出现一个播放源、退出再进才变多”变成长期状态
   // （内存 / 边缘缓存 30 分钟）。丢掉这层缓存值让下面的 coalesce 重新跑解析链，但保留
   // 同一 key 正在进行的解析，不影响并发去重。
+  //
+  // 可信的完整缓存（多线路，或解析链收尾时写过标记的单线路）则直接返回：
+  // 命中后不再跑任何 HLS 校验，避免把 PlaybackInfo 的前台预算烧在“给缓存的
+  // 每条线路重抓一遍清单 + 分片”上——那是 exceededCpu / 503 / 1102 的主因。
   const memoryCached = RESOLVE_VIDEO_CACHE.read(key);
-  if (
-    memoryCached !== undefined &&
-    !resolvedVideoCacheIsTrustworthy(memoryCached)
-  ) {
+  if (memoryCached !== undefined) {
+    if (resolvedVideoCacheIsTrustworthy(memoryCached)) {
+      return memoryCached;
+    }
     RESOLVE_VIDEO_CACHE.forgetEntry(key);
   }
   const session = RESOLVE_VIDEO_CACHE.read(key) === undefined
@@ -9272,60 +9308,38 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
   return RESOLVE_VIDEO_CACHE.coalesce(key, async () => {
     const shared = await edgeCacheRead(EDGE_NAMESPACE_VIDEO, key);
     if (isUsableResolvedVideo(shared)) {
-      if (!resolvedVideoCacheIsTrustworthy(shared)) {
-        // 边缘缓存里只剩单线路残次品（没有“解析收尾”标记）：不为此花 HLS
-        // 校验预算去探测，直接丢弃这层缓存，让下面的解析链重新给出完整线路。
-        forgetEdgeCache(EDGE_NAMESPACE_VIDEO, key);
-      } else {
-        const validated = await validateCachedResolvedVideo(
-          shared,
-          env,
-          key,
-          fetchImpl,
-          "edge",
-        );
-        if (validated && resolvedVideoCacheIsTrustworthy(validated)) {
-          await settleCacheWrite(
-            edgeCacheWrite(
-              EDGE_NAMESPACE_VIDEO,
-              key,
-              validated,
-              RESOLVE_CACHE_TTL_MS / 1000,
-            ),
-            ctx,
-          );
-          RESOLVE_VIDEO_CACHE.write(key, validated);
-          return validated;
-        }
+      if (resolvedVideoCacheIsTrustworthy(shared)) {
+        // 可信完整缓存：直接复用，不再重抓 HLS 做校验（CPU 大头就在这里）。
+        RESOLVE_VIDEO_CACHE.write(key, shared);
+        return shared;
       }
+      // 边缘缓存里只剩单线路残次品（没有“解析收尾”标记）：不为此花 HLS
+      // 校验预算去探测，直接丢弃这层缓存，让下面的解析链重新给出完整线路。
+      forgetEdgeCache(EDGE_NAMESPACE_VIDEO, key);
     }
     let persisted = await readPersistedResolvedVideo(env, key);
     if (
       persisted &&
       Date.now() - persisted.savedAt <= RESOLVE_CACHE_TTL_MS
     ) {
-      const validated = await validateCachedResolvedVideo(
-        persisted.video,
-        env,
-        key,
-        fetchImpl,
-        "persisted",
-      );
-      if (validated && resolvedVideoCacheIsTrustworthy(validated)) {
+      if (resolvedVideoCacheIsTrustworthy(persisted.video)) {
+        // 持久层里的完整结果同样直接复用：先把它回填到边缘 + 内存，
+        // 后续请求连 D1 都不必再读。30 分钟新鲜度窗口由上面的
+        // RESOLVE_CACHE_TTL_MS 判定，死源由播放失败时的定向失效兜底。
         await settleCacheWrite(
           edgeCacheWrite(
             EDGE_NAMESPACE_VIDEO,
             key,
-            validated,
+            persisted.video,
             RESOLVE_CACHE_TTL_MS / 1000,
           ),
           ctx,
         );
-        RESOLVE_VIDEO_CACHE.write(key, validated);
-        return validated;
+        RESOLVE_VIDEO_CACHE.write(key, persisted.video);
+        return persisted.video;
       }
-      // 这层旧结果已经被验证为不可播放；若后面解析失败，也不能再把它
-      // 当作兜底结果返回，否则客户端会重新拿到同一个死源。
+      // 这层旧结果只剩单线路残次品：既不能当命中，也不能在后面解析失败时
+      // 当作兜底返回，否则客户端会长期拿到同一条（可能已死的）线路。
       persisted = null;
     }
 
@@ -9621,7 +9635,10 @@ async function resolveVideoForResponse(
   );
   const stale = firstPeekBudgetMs > 0
     ? await withTimeout(
-      peekCachedResolvedVideo(movie, env, fetchImpl, ctx),
+      // 首屏只看缓存、不做 HLS 校验：校验会同步抓 5~8 份清单 + 分片，
+      // 正是把 isolate 顶爆的 CPU 大头。可信缓存直接复用，死源交给
+      // 播放失败时的定向失效与 30 分钟 TTL。
+      peekCachedResolvedVideo(movie, env, fetchImpl, ctx, { validate: false }),
       firstPeekBudgetMs,
     ).catch(() => null)
     : null;
@@ -9750,7 +9767,7 @@ async function resolveVideoForResponse(
     );
     const fallback = fallbackBudgetMs > 0
       ? await withTimeout(
-        peekCachedResolvedVideo(movie, env, fetchImpl, ctx),
+        peekCachedResolvedVideo(movie, env, fetchImpl, ctx, { validate: false }),
         fallbackBudgetMs,
       ).catch(() => null)
       : null;
@@ -9776,7 +9793,7 @@ async function resolveVideoForResponse(
   );
   const fallback = fallbackBudgetMs > 0
     ? await withTimeout(
-      peekCachedResolvedVideo(movie, env, fetchImpl, ctx),
+      peekCachedResolvedVideo(movie, env, fetchImpl, ctx, { validate: false }),
       fallbackBudgetMs,
     ).catch(() => null)
     : null;

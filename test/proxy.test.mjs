@@ -591,7 +591,12 @@ test("serves Emby system metadata without contacting the upstream", async () => 
     response.headers.get("x-bbjavdb-build"),
     response.headers.get("x-emby-build"),
   );
-  assert.match(response.headers.get("x-bbjavdb-build") || "", /truncation-alignment-63/);
+  // 只断言构建号格式（YYYY-MM-DD-<slug>），不再钉死具体版本：
+  // 每次修复都会 bump SERVER_BUILD_ID，钉死具体串只会让无关改动打挂测试。
+  assert.match(
+    response.headers.get("x-bbjavdb-build") || "",
+    /^\d{4}-\d{2}-\d{2}-[a-z0-9-]+$/,
+  );
   assert.equal((await response.json()).ProductName, "Emby Compatible Server");
 });
 
@@ -1912,6 +1917,69 @@ test("returns a placeholder playback session while PlaybackInfo resolution conti
   assert.equal(second.status, 200);
   assert.ok(secondPayload.PlaySessionId);
   assert.equal(secondPayload.MediaSources.length, 4);
+});
+
+test("reuses a complete PlaybackInfo source snapshot without another upstream probe", async () => {
+  const db = createPlaybackD1();
+  const fixture = createGatedMultiSourceResolve();
+  let upstreamFetches = 0;
+  const trackedFetch = (url, init) => {
+    upstreamFetches += 1;
+    return fixture.fetchImpl(url, init);
+  };
+  const env = {
+    PLAYBACK_DB: db,
+    PLAYBACK_INFO_RESOLVE_BUDGET_MS: 40,
+  };
+
+  const warming = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", { method: "POST" }),
+    env,
+    {},
+    trackedFetch,
+  );
+  assert.equal(warming.status, 200);
+  assert.equal((await warming.json()).MediaSources.length, 1);
+
+  await fixture.resolverStarted;
+  fixture.releaseResolver();
+  const resolved = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", { method: "POST" }),
+    { ...env, PLAYBACK_INFO_RESOLVE_BUDGET_MS: 2000 },
+    {},
+    trackedFetch,
+  );
+  const resolvedPayload = await resolved.json();
+  assert.equal(resolved.status, 200);
+  assert.equal(resolvedPayload.MediaSources.length, 4);
+  assert.ok(upstreamFetches > 0);
+
+  const sourceSnapshot = (payload) => payload.MediaSources.map((source) => ({
+    MediaSourceId: source.MediaSourceId,
+    Name: source.Name,
+    Container: source.Container,
+    DirectStreamUrl: source.DirectStreamUrl,
+  }));
+  const fetchCountAfterResolve = upstreamFetches;
+  const cached = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", { method: "POST" }),
+    env,
+    {},
+    async (url) => {
+      throw new Error(`trusted cache must not probe upstream again: ${url}`);
+    },
+  );
+  const cachedPayload = await cached.json();
+
+  assert.equal(cached.status, 200);
+  assert.equal(upstreamFetches, fetchCountAfterResolve);
+  assert.deepEqual(sourceSnapshot(cachedPayload), sourceSnapshot(resolvedPayload));
+  assert.equal(
+    cachedPayload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
 });
 
 test("keeps a playable on-demand placeholder instead of PlayAccess=None when resolution completes empty", async () => {
