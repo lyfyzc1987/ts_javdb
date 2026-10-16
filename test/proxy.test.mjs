@@ -591,7 +591,7 @@ test("serves Emby system metadata without contacting the upstream", async () => 
     response.headers.get("x-bbjavdb-build"),
     response.headers.get("x-emby-build"),
   );
-  assert.match(response.headers.get("x-bbjavdb-build") || "", /prefetch-pressure-62/);
+  assert.match(response.headers.get("x-bbjavdb-build") || "", /truncation-alignment-63/);
   assert.equal((await response.json()).ProductName, "Emby Compatible Server");
 });
 
@@ -8123,6 +8123,84 @@ test("serves a complete vendorconnection.shop pseudo media object intact", async
   assert.deepEqual(
     new Uint8Array(await response.arrayBuffer()),
     rawBytes.slice(prefixLength),
+  );
+});
+
+test("keeps a chunked pseudo TS segment whose packet-aligned body is complete", async () => {
+  const prefixLength = 70;
+  const packetCount = 8;
+  const rawBytes = new Uint8Array(prefixLength + packetCount * 188);
+  rawBytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  for (let offset = prefixLength; offset < rawBytes.length; offset += 188) {
+    rawBytes[offset] = 0x47;
+  }
+  const sourceUrl =
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/aligned-chunked.image?token=ok";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+
+  const response = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(rawBytes.slice(0, 700));
+          controller.enqueue(rawBytes.slice(700));
+          controller.close();
+        },
+      }),
+      {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      },
+    ),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "video/mp2t");
+  assert.deepEqual(
+    new Uint8Array(await response.arrayBuffer()),
+    rawBytes.slice(prefixLength),
+  );
+});
+
+test("errors a chunked pseudo TS segment when its body is not packet-aligned", async () => {
+  const prefixLength = 70;
+  const rawBytes = new Uint8Array(prefixLength + 8 * 188 + 5);
+  rawBytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  for (let offset = prefixLength; offset + 2 < rawBytes.length; offset += 188) {
+    rawBytes[offset] = 0x47;
+  }
+  const sourceUrl =
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/truncated-chunked.image?token=bad";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+
+  const response = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(rawBytes.slice(0, 900));
+          controller.enqueue(rawBytes.slice(900));
+          controller.close();
+        },
+      }),
+      {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      },
+    ),
+  );
+
+  assert.equal(response.status, 200);
+  await assert.rejects(
+    response.arrayBuffer(),
+    /not MPEG-TS aligned/,
   );
 });
 

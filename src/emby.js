@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-16-hls-cache-prefetch-pressure-62";
+const SERVER_BUILD_ID = "2026-10-16-mpegts-truncation-alignment-63";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -1037,6 +1037,35 @@ function embeddedMpegTsOffset(bytes) {
 
 function bytesLookLikeMpegTs(bytes) {
   return embeddedMpegTsOffset(bytes) >= 0;
+}
+
+// MPEG-TS 在 HLS 里是定长包序列：188 字节（标准），少见 192/204（BDAV/FEC）。
+// 因此一段完整分片的字节数一定能被包长整除。上游（尤其是不给 Content-Length
+// 的 chunked 响应）中途断流时，客户端会拿到“看起来正常、其实少了一截”的分片，
+// 解码出来就是花屏 + 跳段，而且位置每次都不一样。这里用包对齐做完整性判定：
+// 长度对不齐 = 上游截断，宁可让播放器重试这一段，也不把半段数据当完整片喂进去。
+const MPEG_TS_PACKET_SIZES = [188, 192, 204];
+
+function mpegTsLengthAligned(length) {
+  const size = Math.max(0, Math.floor(Number(length) || 0));
+  if (size <= 0) return true;
+  return MPEG_TS_PACKET_SIZES.some((packet) => size % packet === 0);
+}
+
+// 太短的负载不做判定：单元测试/占位响应可能只有几字节，真人分片不可能短于
+// 几个 TS 包。设个下限避免把非媒体小响应误判成“截断”。
+const MPEG_TS_MIN_JUDGE_BYTES = MPEG_TS_PACKET_SIZES[0] * 4;
+
+function mpegTsLengthTruncated(length) {
+  const size = Math.max(0, Math.floor(Number(length) || 0));
+  if (size < MPEG_TS_MIN_JUDGE_BYTES) return false;
+  return !mpegTsLengthAligned(size);
+}
+
+function mpegTsStreamTruncated(bytes) {
+  if (!bytes || bytes.byteLength < MPEG_TS_MIN_JUDGE_BYTES) return false;
+  if (bytes[0] !== 0x47) return false;
+  return mpegTsLengthTruncated(bytes.byteLength);
 }
 
 function responseLooksLikeTextDocument(bytes) {
@@ -2197,6 +2226,42 @@ function guardMediaStreamBody(
   });
 }
 
+// 带空闲超时地把上游响应体整段读完。
+//  - complete=false 表示中途断流或长时间不吐字节（挂死连接）：调用方必须按
+//    失败处理。旧实现直接 await upstream.arrayBuffer()，挂死连接会一直吊着这次
+//    请求（最后客户端弹 Connection timeout），而 chunked 上游断流时 arrayBuffer()
+//    会把半段数据当成完整响应返回，正是“花屏 + 跳段”的来源。
+async function readMediaBodyFullyWithIdleTimeout(upstream) {
+  if (!upstream?.body) return { bytes: new Uint8Array(), complete: true };
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
+      if (result.done) break;
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value);
+      if (!chunk.byteLength) continue;
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+  } catch (error) {
+    try {
+      await reader.cancel(error);
+    } catch {}
+    return { bytes: null, complete: false };
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes, complete: true };
+}
+
 // 部分 MP4/普通媒体上游会忽略客户端 Range 的结束位置，把请求点后面的整段
 // 文件都发回来。播放器拿到的 Content-Range 却远大于实际需要的 1KB/几 MB，
 // 表现为读取失控、卡顿、退出时连接被拖挂。这里在代理出口把响应体截到
@@ -2357,13 +2422,22 @@ async function bufferMediaSegmentResponse(upstream, sourceUrl) {
     upstream.headers.get("content-type") || "",
   ).split(";")[0].trim().toLowerCase();
 
-  const bytes = new Uint8Array(await upstream.arrayBuffer());
+  // 带空闲超时地整段读完（见 readMediaBodyFullyWithIdleTimeout）。上游挂死或
+  // chunked 断流都返回 truncated，调用方不会再把它当完整分片下发/缓存。
+  const buffered = await readMediaBodyFullyWithIdleTimeout(upstream);
+  if (!buffered.complete || !buffered.bytes) {
+    return { truncated: true };
+  }
+  const bytes = buffered.bytes;
   const errorDocument = mediaPayloadLooksLikeErrorDocument(
     bytes,
     originalContentType,
   );
   const embeddedOffset = embeddedMpegTsOffset(bytes);
   const normalized = normalizedMediaSegmentBytes(bytes, originalContentType);
+  // 剥掉 PNG/图片外壳后如果是一段 MPEG-TS，就必须包对齐；对不齐说明上游把
+  // 分片截断了，返回 truncated 让上层重取或回可重试错误，而不是喂半段数据。
+  const truncated = mpegTsStreamTruncated(normalized.bytes);
   let pathname = "";
   try {
     pathname = new URL(sourceUrl).pathname;
@@ -2409,6 +2483,7 @@ async function bufferMediaSegmentResponse(upstream, sourceUrl) {
     upstream.status === 200 &&
     !(imageCandidate && !normalized.embedded);
   const cacheable = rangeable &&
+    !truncated &&
     bytes.byteLength > 0 &&
     bytes.byteLength <= MAX_CACHED_MEDIA_SEGMENT_BYTES;
 
@@ -2425,6 +2500,7 @@ async function bufferMediaSegmentResponse(upstream, sourceUrl) {
     embeddedOffset,
     errorDocument,
     originalContentType,
+    truncated,
   };
 }
 
@@ -2546,6 +2622,9 @@ function streamMediaBodyWithPrefix(
   const cacheStatus = Number(options.cacheStatus) || 200;
   const cacheStatusText = String(options.cacheStatusText || "OK");
   const cacheContentRange = String(options.cacheContentRange || "");
+  // 只有“已经确认是 MPEG-TS”的流才做包对齐校验：上游不给 Content-Length
+  // 时 expectedBytes=0，旧实现没有任何长度可核对，chunked 断流会被静默放过。
+  const expectMpegTs = options.expectMpegTs === true;
   const canCache = Boolean(
     cacheKey &&
     expectedBytes > 0 &&
@@ -2588,6 +2667,26 @@ function streamMediaBodyWithPrefix(
     });
   };
 
+  // 流结束时判定分片是否被上游截断：
+  //  - expectedBytes>0（有 Content-Length / Content-Range）：按声明长度核对；
+  //  - expectedBytes=0（chunked 上游）：改用 MPEG-TS 包对齐核对。返回非空即
+  //    表示“这段不完整”，调用方让流失败，播放器会重试这一段。
+  const truncationError = () => {
+    if (expectedBytes > 0 && delivered < expectedBytes) {
+      return new Error(`media segment truncated: ${delivered}/${expectedBytes}`);
+    }
+    if (
+      expectedBytes === 0 &&
+      expectMpegTs &&
+      mpegTsLengthTruncated(delivered)
+    ) {
+      return new Error(
+        `media segment truncated: ${delivered}B not MPEG-TS aligned`,
+      );
+    }
+    return null;
+  };
+
   const body = new ReadableStream({
     async pull(controller) {
       if (!prefixSent) {
@@ -2607,10 +2706,10 @@ function streamMediaBodyWithPrefix(
         return;
       }
       if (streamComplete) {
-        if (expectedBytes > 0 && delivered < expectedBytes) {
-          controller.error(
-            new Error(`media segment truncated: ${delivered}/${expectedBytes}`),
-          );
+        const truncatedError = truncationError();
+        if (truncatedError) {
+          cacheComplete = false;
+          controller.error(truncatedError);
           return;
         }
         storeCache();
@@ -2630,10 +2729,10 @@ function streamMediaBodyWithPrefix(
       }
       if (result.done) {
         streamComplete = true;
-        if (expectedBytes > 0 && delivered < expectedBytes) {
-          controller.error(
-            new Error(`media segment truncated: ${delivered}/${expectedBytes}`),
-          );
+        const truncatedError = truncationError();
+        if (truncatedError) {
+          cacheComplete = false;
+          controller.error(truncatedError);
           return;
         }
         storeCache();
@@ -2768,6 +2867,9 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
     prefixResult.complete,
     {
       expectedBytes: normalizedBodyBytes,
+      // 已确认是 MPEG-TS（embeddedOffset>=0 找到过包序列）。当上游不给
+      // Content-Length（normalizedBodyBytes=0）时，靠包对齐兜底检测截断。
+      expectMpegTs: true,
       cacheKey,
       cacheLimit: MAX_CACHED_MEDIA_SEGMENT_BYTES,
       cacheHeaders: headers,
@@ -3497,17 +3599,26 @@ async function fetchMediaUpstreamResponse(
         MAX_CACHED_MEDIA_SEGMENT_RANGE_BYTES,
       );
     }
-    const upstream = await fetchUpstreamWithRetry();
-    const response = streamCompleteMediaSegmentResponse(upstream, cacheKey);
-    if (response) return response;
-    const result = await bufferMediaSegmentResponse(upstream, sourceUrl);
-    if (result?.errorDocument) return mediaUpstreamInvalidResponse();
-    if (result?.record) {
-      if (result.cacheable) {
-        MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, result.record);
+    // 非 Range 的整段请求：有 Content-Length 时走流式（能精确检测截断），
+    // 否则整段缓冲并按 MPEG-TS 包对齐校验完整性。上游中途断流（chunked 断流
+    // 时旧实现会静默把半段数据当完整分片下发）时换一条连接重取一次；仍失败就
+    // 回可重试的 502，让播放器重试这一段，而不是解码出花屏 + 跳段。
+    let bufferedResult = null;
+    for (let attempt = 0; attempt < 2 && !bufferedResult; attempt += 1) {
+      const upstream = await fetchUpstreamWithRetry();
+      const response = streamCompleteMediaSegmentResponse(upstream, cacheKey);
+      if (response) return response;
+      const result = await bufferMediaSegmentResponse(upstream, sourceUrl);
+      if (result?.errorDocument) return mediaUpstreamInvalidResponse();
+      if (!result?.truncated) {
+        bufferedResult = result;
       }
-      return cachedMediaSegmentResponse(result.record, request);
     }
+    if (!bufferedResult?.record) return mediaUpstreamInvalidResponse();
+    if (bufferedResult.cacheable) {
+      MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, bufferedResult.record);
+    }
+    return cachedMediaSegmentResponse(bufferedResult.record, request);
   }
 
   const cacheEmbeddedTsResult = (result, upstreamContentRange = "") => {
