@@ -148,13 +148,10 @@ const INLINE_HLS_CONTENT_TYPES = new Set([
 // 旧上限会把稍大的备用线路直接过滤掉，客户端就只剩一条播放源。
 const MAX_INLINE_HLS_LENGTH = 12_000_000;
 const MAX_HLS_REWRITE_DEPTH = 8;
-// GetAV 的分片在首次从上游 CDN 边缘取回时很慢：实测同一分片冷取 0.24~2.21MB/s，
-// 读完后被上游边缘缓存后可达 50~414MB/s。HLS 清单返回后，后台读掉开头几段，
-// 让播放器真正请求这些分片时命中热对象。这里必须限制并发、数量和总预算：
-//   - 4K 单段约 13.4MB，数量过多会浪费上游流量；
-//   - 后台任务通过 ctx.waitUntil 运行，不能超过 Worker 的生命周期预算；
-//   - 失败静默处理，绝不改变正常清单或阻塞播放请求。
-const GETAV_HLS_PREFETCH_SEGMENTS = 1;
+// GetAV 的分片首次从上游 CDN 取回时可能很慢，但后台读取会和播放器请求争抢
+// 上游连接、CPU 与 isolate 内存，反而更容易在播放中触发 1102。默认关闭，
+// 仅在显式配置 GETAV_HLS_PREFETCH_SEGMENTS 时启用，供线路稳定时做定向优化。
+const GETAV_HLS_PREFETCH_SEGMENTS = 0;
 const GETAV_HLS_PREFETCH_CONCURRENCY = 2;
 const GETAV_HLS_PREFETCH_BUDGET_MS = 15 * 1000;
 const GETAV_HLS_PREFETCH_RECENT_MS = 60 * 1000;
@@ -200,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-14-first-screen-full-sources-61";
+const SERVER_BUILD_ID = "2026-10-16-hls-cache-prefetch-pressure-62";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -4897,15 +4894,22 @@ const MEDIA_SEGMENT_RANGE_CACHE_MAX_TOTAL_BYTES = 12 * 1024 * 1024;
 // 1102（Worker exceeded resource limits，客户端只看到 503）。
 // 这里把“改写后的清单”按部署源 + 目标清单地址 + depth 记一小段时间，并且
 // 只在输入清单内容与写入时完全一致时才复用，因此重新解析出的新清单不会被
-// 旧结果顶掉。缓存的是字符串（与解析缓存里那份 inlinePlaylist 同量级），
-// 再加一道总字节上限，避免高并发时反过来把内存推高。
+// 旧结果顶掉。缓存同时持有原始清单和改写结果，必须按两份字符串合计记账，
+// 再加一道 8 MB 总字节上限，避免高并发时反过来把 isolate 内存推高。
 const REWRITTEN_HLS_CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_REWRITTEN_HLS_CACHE_ENTRIES = 24;
-const MAX_REWRITTEN_HLS_CACHE_BYTES = 16 * 1024 * 1024;
+const MAX_REWRITTEN_HLS_CACHE_BYTES = 8 * 1024 * 1024;
 
 function rewrittenHlsEntryBytes(entry) {
-  const length = String(entry?.output || "").length;
-  return Number.isSafeInteger(length) && length > 0 ? length : 0;
+  const playlistLength = String(entry?.playlist || "").length;
+  const outputLength = String(entry?.output || "").length;
+  const playlistBytes = Number.isSafeInteger(playlistLength) && playlistLength > 0
+    ? playlistLength
+    : 0;
+  const outputBytes = Number.isSafeInteger(outputLength) && outputLength > 0
+    ? outputLength
+    : 0;
+  return playlistBytes + outputBytes;
 }
 
 // 媒体缓存条目都形如 { bytes: Uint8Array, headers, ... }，按实际字节数记账。
@@ -13541,6 +13545,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
   if (path === "/System/Info/Public" || path === "/System/Info") {
     return jsonResponse(systemInfo(request.url, env), 200, {
       "x-emby-build": SERVER_BUILD_ID,
+      "x-bbjavdb-build": SERVER_BUILD_ID,
     });
   }
   if (path === "/System/Endpoint") {
@@ -14515,6 +14520,10 @@ export function rewriteHlsManifestCachedForTests(
 
 export function rewrittenHlsCacheStatsForTests() {
   return { hits: rewrittenHlsCacheHits, misses: rewrittenHlsCacheMisses };
+}
+
+export function rewrittenHlsEntryBytesForTests(entry) {
+  return rewrittenHlsEntryBytes(entry);
 }
 
 export function resetEmbyCachesForTests() {

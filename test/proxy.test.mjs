@@ -14,6 +14,7 @@ import {
   createJavdbSignature,
   createEmbyConcurrencyGateForTests,
   rewriteHlsManifestCachedForTests,
+  rewrittenHlsEntryBytesForTests,
   rewrittenHlsCacheStatsForTests,
   resetEmbyCachesForTests,
 } from "../src/emby.js";
@@ -586,6 +587,11 @@ test("serves Emby system metadata without contacting the upstream", async () => 
   );
 
   assert.equal(response.status, 200);
+  assert.equal(
+    response.headers.get("x-bbjavdb-build"),
+    response.headers.get("x-emby-build"),
+  );
+  assert.match(response.headers.get("x-bbjavdb-build") || "", /prefetch-pressure-62/);
   assert.equal((await response.json()).ProductName, "Emby Compatible Server");
 });
 
@@ -6822,7 +6828,7 @@ test("prewarms the first GetAV HLS segments in the background", async () => {
     new Request(
       `https://clone.example/emby-media/?url=${encodeURIComponent(manifestUrl)}&hls=1&kind=manifest`,
     ),
-    {},
+    { GETAV_HLS_PREFETCH_SEGMENTS: "1" },
     context,
     fetchImpl,
   );
@@ -6836,6 +6842,40 @@ test("prewarms the first GetAV HLS segments in the background", async () => {
   assert.equal(calls[0], manifestUrl);
   assert.deepEqual(calls.slice(1).sort(), segmentUrls.slice(0, 1).sort());
   assert.equal(maxActiveFetches, 1);
+});
+
+test("does not prewarm GetAV HLS segments by default", async () => {
+  const manifestUrl = "https://static.worldstatic.com/getav/default/index.m3u8";
+  const segmentUrl = "https://static.worldstatic.com/getav/default/seg-0.woff2?e=1";
+  const manifest = [
+    "#EXTM3U",
+    "#EXTINF:6,",
+    "seg-0.woff2?e=1",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+  const calls = [];
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(manifestUrl)}&hls=1&kind=manifest`,
+    ),
+    {},
+    {
+      waitUntil() {
+        throw new Error("default prefetch must not schedule background work");
+      },
+    },
+    async (url) => {
+      calls.push(String(url));
+      return new Response(manifest, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    },
+  );
+
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.deepEqual(calls, [manifestUrl]);
+  assert.ok(!calls.includes(segmentUrl));
 });
 
 test("does not prewarm later GetAV HLS segments as playback advances", async () => {
@@ -10768,6 +10808,15 @@ test("rewrites an unchanged inline HLS manifest once and refires when it changes
   assert.match(changed, /creativegrowthworld\.site/);
   assert.doesNotMatch(changed, /tiktokcdn\.com/);
   assert.equal(rewrittenHlsCacheStatsForTests().misses, 2);
+});
+
+test("accounts for both stored HLS manifest strings in cache byte limits", () => {
+  assert.equal(
+    rewrittenHlsEntryBytesForTests({ playlist: "abc", output: "12345" }),
+    8,
+  );
+  assert.equal(rewrittenHlsEntryBytesForTests({ playlist: "", output: "" }), 0);
+  assert.equal(rewrittenHlsEntryBytesForTests(undefined), 0);
 });
 
 
