@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-16-trusted-cache-fast-reuse-64";
+const SERVER_BUILD_ID = "2026-10-17-virtual-hls-68";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -260,6 +260,38 @@ const MEDIA_UPSTREAM_RETRY_DELAY_MS = 120;
 // 连续这么多毫秒没有新字节就主动让流失败：播放器会把这一段当作失败重试
 // （多线程 / 断点续传逻辑生效），实例也不再被吊住。
 const MEDIA_SEGMENT_STREAM_IDLE_TIMEOUT_MS = 15000;
+// 伪 TS 分片（PNG 外壳里塞 MPEG-TS）在上游 CDN 上是“按连接限速”的：实测 4.1MB
+// 的分片单连接要 60~70 秒才下完，而这一段只有 10 秒时长 —— 播放器永远追不上，
+// 表现就是一直缓冲 + 花屏跳段。同一条分片改用 4 路并行 Range，总耗时降到约 1/4。
+// 并发上限固定 4：再往上（实测 8 路）会开始出现边缘连接被掐断（UND_ERR_SOCKET），
+// 反而把 503/1102 放大。小于 1MB 的请求保持单连接透传，断点续传/小 Range 不受影响。
+const MEDIA_PARALLEL_RANGE_MAX_CHUNKS = 4;
+const MEDIA_PARALLEL_RANGE_MIN_CHUNK_BYTES = 512 * 1024;
+const MEDIA_PARALLEL_RANGE_MIN_BYTES = 1024 * 1024;
+// 并行分片要按顺序拼成一段连续字节，必须在内存里暂存：上限设成和整段缓存一样
+// 的 8MB，超过这个体积的分片退回单连接流式透传，避免把 Worker 内存打爆。
+const MEDIA_PARALLEL_RANGE_MAX_TOTAL_BYTES = 8 * 1024 * 1024;
+// 同一个上游主机连续失败两次就临时关掉并行：对“不支持 Range”的站点，每段都
+// 白跑 4 次请求会把 503/1102 放大成雪崩。
+const MEDIA_PARALLEL_RANGE_FAILURE_LIMIT = 2;
+const MEDIA_PARALLEL_RANGE_DISABLE_MS = 5 * 60 * 1000;
+const MEDIA_PARALLEL_RANGE_FAILURES = new Map();
+// 诊断头：线上排查“服务端并行 Range 到底走了哪条路”用。客户端会忽略未知头，
+// 但必须能被客户端读到，否则并行回退了也看不出来。
+const MEDIA_PARALLEL_RANGE_HEADER = "x-catemby-parallel-range";
+// 虚拟 HLS 分段：伪 TS 分片除了上游→Worker 慢，Worker→客户端这条单响应
+// 通路同样是瓶颈（实测 4.1MB / 10 秒的分片，整段下载 40~50 秒，而同样四条
+// 并行的小 Range 请求只要 1/4 左右）。播放器只对清单里的“分片”做并发，
+// 因此这里在清单改写阶段就把一个伪 TS 分片拆成 N 条等长子区间：每条子区间是
+// 同一上游地址 + vsplit/vpart 参数，服务端按固定字节区间精确返回。只对必须
+// 经过 Worker 剥壳的伪 TS 分片生效，普通直连分片 / AES 加密分片 / 带
+// EXT-X-DISCONTINUITY 的分片一律保持原样。
+const HLS_VIRTUAL_SPLIT_PARTS = 4;
+const HLS_VIRTUAL_SPLIT_MAX_PARTS = 16;
+const HLS_VIRTUAL_SPLIT_COUNT_PARAM = "vsplit";
+const HLS_VIRTUAL_SPLIT_PART_PARAM = "vpart";
+// 诊断头：线上确认“这条分片请求到底是不是虚拟子区间、第几段”。
+const HLS_VIRTUAL_SPLIT_HEADER = "x-catemby-virtual-split";
 // 合成超时响应用的标记头：带上它表示“是我们主动放弃的”，
 // 上层据此跳过 5xx 立即重试，避免又多等一个超时周期。
 const MEDIA_UPSTREAM_TIMEOUT_HEADER = "x-catemby-upstream-timeout";
@@ -885,6 +917,7 @@ function mergeResolverVariants(payloads) {
 const INLINE_HLS_SEGMENT_PATTERN = /\.(?:ts|m4s|mp4|aac|m4a)(?:[?#]|$)/i;
 const GOOGLE_DRIVE_MEDIA_PATH_PATTERN = /^\/d\/[^/?#]+=d(?:[?#]|$)/i;
 const HLS_EMBEDDED_TS_IMAGE_PATTERN = /\.image(?:[?#]|$)/i;
+const HLS_EXTINF_PATTERN = /^#EXTINF:/i;
 const INLINE_HLS_RESOURCE_PATTERN =
   /[/_.-](?:thumb|cover|css|js)(?:[?#]|$)|[?&](?:contentType|response-content-type)=image\//i;
 const HLS_FONT_RESOURCE_PATTERN = /\.(?:woff2?|ttf|otf)(?:[?#]|$)/i;
@@ -2142,6 +2175,85 @@ function embeddedTsVirtualRange(value, metadata) {
   return parseSingleByteRange(value, virtualTotal);
 }
 
+// 解析清单改写时写进代理地址的 vsplit/vpart。任何不合法组合都返回 null，
+// 调用方按“普通整段请求”处理，绝不会把错位的字节区间当成子分片返回。
+function normalizeHlsVirtualPart(value) {
+  if (!value) return null;
+  const split = Math.floor(Number(value.split));
+  const part = Math.floor(Number(value.part));
+  if (
+    !Number.isSafeInteger(split) ||
+    !Number.isSafeInteger(part) ||
+    split < 2 ||
+    split > HLS_VIRTUAL_SPLIT_MAX_PARTS ||
+    part < 0 ||
+    part >= split
+  ) {
+    return null;
+  }
+  return { split, part };
+}
+
+// 把“虚拟总长度”按与实际分块完全相同的规则切成 N 段：
+// 前 N-1 段取等长的 floor(total/N)，最后一段吃掉余数，保证各段首尾相接、
+// 拼起来与整段逐字节一致（这也是测试里拼接校验的前提）。
+function hlsVirtualPartBounds(part, total) {
+  if (!part) return null;
+  const size = Math.floor(Number(total));
+  if (!Number.isSafeInteger(size) || size <= 0) return null;
+  const base = Math.floor(size / part.split);
+  if (base <= 0) return null;
+  const start = base * part.part;
+  if (start >= size) return null;
+  const end = part.part === part.split - 1 ? size - 1 : start + base - 1;
+  if (end < start) return null;
+  return { start, end, length: end - start + 1 };
+}
+
+function hlsVirtualPartRangeHeader(part, total, requestedRangeHeader = "") {
+  const bounds = hlsVirtualPartBounds(part, total);
+  if (!bounds) return "";
+  const requested = requestedRangeHeader
+    ? parseSingleByteRange(requestedRangeHeader, bounds.length)
+    : null;
+  if (requested && !requested.invalid && !requested.unsatisfiable) {
+    return {
+      header: `bytes=${bounds.start + requested.start}-${
+        bounds.start + requested.end
+      }`,
+      bounds,
+      total: Math.floor(Number(total)),
+    };
+  }
+  return {
+    header: `bytes=${bounds.start}-${bounds.end}`,
+    bounds,
+    total: Math.floor(Number(total)),
+  };
+}
+
+// 从“已经整段缓冲好的记录”里切出 [start, end]：探测拿不到总长度时
+// （上游既不回 Content-Range 也不回 Content-Length）的降级路径，
+// 结果字节仍然精确，只是走一次单连接下载。
+function mediaRecordSliceResponse(record, start, end) {
+  if (!record?.bytes) return null;
+  const size = record.bytes.byteLength;
+  if (size <= 0) return null;
+  const from = Math.max(0, Math.min(size - 1, Math.floor(Number(start) || 0)));
+  const to = Math.max(from, Math.min(size - 1, Math.floor(Number(end) || 0)));
+  const body = record.bytes.slice(from, to + 1);
+  const headers = new Headers(record.headers || []);
+  headers.set("accept-ranges", "bytes");
+  headers.set("content-range", `bytes ${from}-${to}/${size}`);
+  headers.set("content-length", String(body.byteLength));
+  headers.set("cache-control", "no-store");
+  return new Response(body, {
+    status: 206,
+    statusText: "Partial Content",
+    headers,
+  });
+}
+
 function embeddedTsMappedRange(range, metadata) {
   return `bytes=${range.start + metadata.prefixLength}-${
     range.end + metadata.prefixLength
@@ -2166,6 +2278,30 @@ function embeddedTsRangeResponse(body, metadata, range) {
   });
 }
 
+// 和 embeddedTsRangeResponse 语义完全一致，只是响应体由“已经按顺序排好的
+// 并行分块缓冲”组成：长度/区间/类型都由 metadata 推导，不依赖上游原始头。
+function embeddedTsParallelRangeResponse(parallel, metadata, range) {
+  const total = parallel.total;
+  const headers = new Headers({
+    "accept-ranges": "bytes",
+    "cache-control": "no-store",
+    "content-length": String(total),
+    "content-range": `bytes ${range.start}-${range.end}/${
+      metadata.upstreamTotal - metadata.prefixLength
+    }`,
+    "content-type": metadata.contentType || "video/mp2t",
+    [MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER]: "1",
+  });
+  if (parallel.timing) {
+    headers.set(MEDIA_PARALLEL_RANGE_HEADER, `range;${parallel.timing}`);
+  }
+  return new Response(streamFromMediaPartBuffers(parallel.parts), {
+    status: 206,
+    statusText: "Partial Content",
+    headers,
+  });
+}
+
 // 空闲超时的生效值：生产默认 MEDIA_SEGMENT_STREAM_IDLE_TIMEOUT_MS；测试用
 // env 覆盖成几十毫秒，才跑得出“上游挂着不吐字节”的场景（和 RESOLVE_DEBUG
 // 一样由 handleEmbyInternal 在每次请求开始时刷新）。
@@ -2177,6 +2313,25 @@ function applyMediaStreamEnv(env) {
     "MEDIA_SEGMENT_STREAM_IDLE_TIMEOUT_MS",
     MEDIA_SEGMENT_STREAM_IDLE_TIMEOUT_MS,
   );
+}
+
+// 虚拟 HLS 分段的段数：默认 4，可用 HLS_VIRTUAL_SPLIT_PARTS 覆盖。
+// 传 1（或更小）等于关闭虚拟分段，用于线上快速回退到“一个分片一条请求”。
+let hlsVirtualSplitParts = HLS_VIRTUAL_SPLIT_PARTS;
+function applyHlsVirtualSplitEnv(env) {
+  const raw = env?.HLS_VIRTUAL_SPLIT_PARTS;
+  if (raw === undefined || raw === null || raw === "") {
+    hlsVirtualSplitParts = HLS_VIRTUAL_SPLIT_PARTS;
+    return;
+  }
+  const value = Math.floor(Number(raw));
+  if (!Number.isFinite(value)) {
+    hlsVirtualSplitParts = HLS_VIRTUAL_SPLIT_PARTS;
+    return;
+  }
+  hlsVirtualSplitParts = value <= 1
+    ? 0
+    : Math.min(HLS_VIRTUAL_SPLIT_MAX_PARTS, value);
 }
 
 // 带空闲超时的 read：超过 idleTimeoutMs 没有新字节就 reject，避免挂死的上游
@@ -2224,6 +2379,307 @@ function guardMediaStreamBody(
       return reader.cancel(reason);
     },
   });
+}
+
+// 精确透传一段媒体数据：上游必须至少提供 expectedBytes 个字节。
+// 上游提前结束会让流失败，避免把截断分片静默交给播放器；上游多送时只转发
+// 请求区间并取消剩余流，避免错误长度污染响应。
+function guardExactMediaStreamBody(body, expectedBytes) {
+  const expected = Math.max(
+    0,
+    Math.floor(Number(expectedBytes) || 0),
+  );
+  if (!body || expected <= 0) return body;
+  const reader = body.getReader();
+  let delivered = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      if (delivered >= expected) {
+        controller.close();
+        return;
+      }
+      let result;
+      try {
+        result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
+      } catch (error) {
+        try {
+          await reader.cancel(error);
+        } catch {}
+        controller.error(error);
+        return;
+      }
+      if (result.done) {
+        controller.error(
+          new Error(`media range truncated: ${delivered}/${expected}`),
+        );
+        return;
+      }
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value);
+      if (!chunk.byteLength) return;
+      const remaining = expected - delivered;
+      const output = chunk.byteLength > remaining
+        ? chunk.subarray(0, remaining)
+        : chunk;
+      delivered += output.byteLength;
+      controller.enqueue(output);
+      if (delivered >= expected) {
+        try {
+          await reader.cancel("media range complete");
+        } catch {}
+        controller.close();
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
+// 把一段连续字节切成最多 MEDIA_PARALLEL_RANGE_MAX_CHUNKS 个等长子区间。
+// 返回 null 表示“这段不值得/不允许并行”，调用方回退单连接。
+function mediaParallelRangePlan(start, end, options = {}) {
+  const first = Math.floor(Number(start));
+  const last = Math.floor(Number(end));
+  if (
+    !Number.isSafeInteger(first) ||
+    !Number.isSafeInteger(last) ||
+    first < 0 ||
+    last < first
+  ) {
+    return null;
+  }
+  const total = last - first + 1;
+  const maxChunks = Math.max(
+    1,
+    Math.floor(Number(options.maxChunks) || MEDIA_PARALLEL_RANGE_MAX_CHUNKS),
+  );
+  const minChunkBytes = Math.max(
+    1,
+    Math.floor(
+      Number(options.minChunkBytes) || MEDIA_PARALLEL_RANGE_MIN_CHUNK_BYTES,
+    ),
+  );
+  const minBytes = Math.max(
+    1,
+    Math.floor(Number(options.minBytes) || MEDIA_PARALLEL_RANGE_MIN_BYTES),
+  );
+  const maxTotalBytes = Math.max(
+    1,
+    Math.floor(
+      Number(options.maxTotalBytes) || MEDIA_PARALLEL_RANGE_MAX_TOTAL_BYTES,
+    ),
+  );
+  if (maxChunks < 2 || total < minBytes || total > maxTotalBytes) return null;
+  const chunkCount = Math.min(
+    maxChunks,
+    Math.max(2, Math.ceil(total / minChunkBytes)),
+  );
+  if (chunkCount < 2) return null;
+  const base = Math.floor(total / chunkCount);
+  const remainder = total - base * chunkCount;
+  const parts = [];
+  let cursor = first;
+  for (let index = 0; index < chunkCount; index += 1) {
+    const length = base + (index < remainder ? 1 : 0);
+    parts.push({
+      start: cursor,
+      end: cursor + length - 1,
+      length,
+    });
+    cursor += length;
+  }
+  return parts;
+}
+
+// 把已经按顺序排好的分块缓冲“按需吐给上层”。因为块已经在内存里，
+// 不需要再拼成一个大 Uint8Array，省掉一次整段拷贝。
+function streamFromMediaPartBuffers(parts) {
+  let index = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (index >= parts.length) {
+        controller.close();
+        return;
+      }
+      const part = parts[index];
+      index += 1;
+      if (part?.byteLength) controller.enqueue(part);
+    },
+  });
+}
+
+// 并行分块的响应头必须精确证明“这就是我请求的那一段”：状态 206、带
+// Content-Range、区间与请求一致、长度一致、不是错误文档。任何一条不满足都
+// 说明这条上游在糊弄 Range，直接放弃并行（回退单连接），绝不把错位字节拼进去。
+function parallelMediaRangePartFailure(response, part, expectedTotal = 0) {
+  if (!response) return "no-response";
+  if (response.status !== 206) return `status-${response.status}`;
+  if (!response.body) return "no-body";
+  if (response.headers.has("content-encoding")) {
+    return `content-encoding-${response.headers.get("content-encoding")}`;
+  }
+  if (
+    mediaContentTypeLooksLikeErrorDocument(
+      response.headers.get("content-type") || "",
+    )
+  ) {
+    return `error-document-${response.headers.get("content-type")}`;
+  }
+  const contentRange = parseMediaContentRange(
+    response.headers.get("content-range") || "",
+  );
+  if (!contentRange) {
+    return `bad-content-range-${response.headers.get("content-range") || ""}`;
+  }
+  if (contentRange.start !== part.start || contentRange.end !== part.end) {
+    return `range-mismatch-${contentRange.start}-${contentRange.end}`;
+  }
+  if (expectedTotal > 0 && contentRange.total !== expectedTotal) {
+    return `total-mismatch-${contentRange.total}-${expectedTotal}`;
+  }
+  const contentLength = Number(response.headers.get("content-length"));
+  if (
+    Number.isSafeInteger(contentLength) &&
+    contentLength > 0 &&
+    contentLength !== part.length
+  ) {
+    return `length-mismatch-${contentLength}-${part.length}`;
+  }
+  return "";
+}
+
+function parallelMediaRangePartMatches(response, part, expectedTotal = 0) {
+  return !parallelMediaRangePartFailure(response, part, expectedTotal);
+}
+
+function mediaParallelRangeHostAllowed(host) {
+  if (!host) return true;
+  const entry = MEDIA_PARALLEL_RANGE_FAILURES.get(host);
+  if (!entry) return true;
+  if (entry.until > Date.now()) return false;
+  // 只有“禁用窗口已经过期”才清空计数。若无条件 delete，失败次数会在每次
+  // 读取时被重置，阈值永远到不了，等于没有负缓存。
+  if (entry.until > 0) MEDIA_PARALLEL_RANGE_FAILURES.delete(host);
+  return true;
+}
+
+function noteMediaParallelRangeFailure(host) {
+  if (!host) return;
+  const entry = MEDIA_PARALLEL_RANGE_FAILURES.get(host) || {
+    failures: 0,
+    until: 0,
+  };
+  entry.failures += 1;
+  if (entry.failures >= MEDIA_PARALLEL_RANGE_FAILURE_LIMIT) {
+    entry.until = Date.now() + MEDIA_PARALLEL_RANGE_DISABLE_MS;
+  }
+  MEDIA_PARALLEL_RANGE_FAILURES.set(host, entry);
+}
+
+function noteMediaParallelRangeSuccess(host) {
+  if (host) MEDIA_PARALLEL_RANGE_FAILURES.delete(host);
+}
+
+function mediaUpstreamHostOf(sourceUrl) {
+  try {
+    return new URL(String(sourceUrl || "")).host || "";
+  } catch {
+    return "";
+  }
+}
+
+// 有上限的并行 Range 拉取：计划 → 并发拿响应头 → 并发读完整块 → 按顺序返回。
+// 全部块一起读（而不是顺序读）是为了让每条连接都保持活跃：顺序读会让后面的
+// 连接一直空等，容易被上游当作空闲连接掐断。任何一块失败都返回 null，
+// 由调用方回退到原来那条已经建好的单连接流。
+async function fetchParallelMediaRangeParts(
+  start,
+  end,
+  fetchRange,
+  options = {},
+) {
+  const plan = mediaParallelRangePlan(start, end, options);
+  if (!plan || typeof fetchRange !== "function") {
+    return { error: "not-planned" };
+  }
+  const host = String(options.host || "");
+  if (!mediaParallelRangeHostAllowed(host)) {
+    return { error: "host-disabled" };
+  }
+  const expectedTotal = Math.floor(Number(options.expectedTotal) || 0);
+  const startedAt = Date.now();
+  const responses = await Promise.all(plan.map(async (part) => {
+    let response = null;
+    const partStartedAt = Date.now();
+    try {
+      response = await fetchRange(`bytes=${part.start}-${part.end}`);
+    } catch (error) {
+      return {
+        part,
+        response: null,
+        headerMs: Date.now() - partStartedAt,
+        failure: `fetch-error-${error?.name || "unknown"}`,
+      };
+    }
+    const failure = parallelMediaRangePartFailure(
+      response,
+      part,
+      expectedTotal,
+    );
+    return {
+      part,
+      response,
+      headerMs: Date.now() - partStartedAt,
+      failure,
+    };
+  }));
+  const cancelAll = async () => {
+    await Promise.all(responses.map(async (item) => {
+      try {
+        await item.response?.body?.cancel?.();
+      } catch {}
+    }));
+  };
+  const invalid = responses.find((item) => item.failure);
+  if (invalid) {
+    await cancelAll();
+    noteMediaParallelRangeFailure(host);
+    return {
+      error: invalid.failure || "invalid-response",
+      status: invalid.response?.status || 0,
+      contentRange: invalid.response?.headers?.get("content-range") || "",
+    };
+  }
+  const buffered = await Promise.all(responses.map((item) =>
+    readMediaBodyFullyWithIdleTimeout(item.response)
+  ));
+  const doneMs = Date.now() - startedAt;
+  const complete = buffered.every((item, index) =>
+    item?.complete &&
+    item.bytes?.byteLength === responses[index].part.length
+  );
+  if (!complete) {
+    noteMediaParallelRangeFailure(host);
+    return {
+      error: buffered
+        .map((item, index) =>
+          `${index}:${item?.complete ? "ok" : "incomplete"}:${
+            item?.bytes?.byteLength || 0
+          }/${responses[index].part.length}`
+        )
+        .join(","),
+    };
+  }
+  noteMediaParallelRangeSuccess(host);
+  return {
+    parts: buffered.map((item) => item.bytes),
+    total: plan.reduce((sum, part) => sum + part.length, 0),
+    timing: responses
+      .map((item) => `${item.headerMs}+${doneMs}`)
+      .join("|"),
+  };
 }
 
 // 带空闲超时地把上游响应体整段读完。
@@ -2302,9 +2758,20 @@ function trimMediaRangeResponseBody(upstream, request, headers) {
   const body = new ReadableStream({
     async pull(controller) {
       while (skip > 0) {
-        const result = await reader.read();
+        let result;
+        try {
+          result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
+        } catch (error) {
+          try {
+            await reader.cancel(error);
+          } catch {}
+          controller.error(error);
+          return;
+        }
         if (result.done) {
-          controller.close();
+          controller.error(
+            new Error(`media range truncated before requested start`),
+          );
           return;
         }
         if (result.value.byteLength <= skip) {
@@ -2325,9 +2792,24 @@ function trimMediaRangeResponseBody(upstream, request, headers) {
         await reader.cancel().catch(() => {});
         return;
       }
-      const result = await reader.read();
+      let result;
+      try {
+        result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
+      } catch (error) {
+        try {
+          await reader.cancel(error);
+        } catch {}
+        controller.error(error);
+        return;
+      }
       if (result.done) {
-        controller.close();
+        controller.error(
+          new Error(
+            `media range truncated: ${
+              requestedEnd - requestedStart + 1 - remaining
+            }/${requestedEnd - requestedStart + 1}`,
+          ),
+        );
         return;
       }
       const chunk = remaining < result.value.byteLength
@@ -2375,11 +2857,17 @@ function embeddedTsMappedResponse(upstream, metadata, range) {
   );
   headers.set("content-type", metadata.contentType || "video/mp2t");
   headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
-  return new Response(guardMediaStreamBody(upstream.body), {
-    status: 206,
-    statusText: "Partial Content",
-    headers,
-  });
+  return new Response(
+    guardExactMediaStreamBody(
+      upstream.body,
+      range.end - range.start + 1,
+    ),
+    {
+      status: 206,
+      statusText: "Partial Content",
+      headers,
+    },
+  );
 }
 
 function normalizedMediaSegmentBytes(bytes, contentType = "") {
@@ -2429,6 +2917,19 @@ async function bufferMediaSegmentResponse(upstream, sourceUrl) {
     return { truncated: true };
   }
   const bytes = buffered.bytes;
+  const expectedUpstreamBytes = expectedUpstreamBodyBytes(upstream.headers);
+  if (
+    expectedUpstreamBytes > 0 &&
+    bytes.byteLength !== expectedUpstreamBytes
+  ) {
+    // 即使截断长度刚好满足 MPEG-TS 包对齐，也不能把声明区间之外的数据
+    // 当成完整分片：一旦写入缓存，后续重试会一直播放同一段坏数据。
+    return {
+      expectedUpstreamBytes,
+      receivedUpstreamBytes: bytes.byteLength,
+      truncated: true,
+    };
+  }
   const errorDocument = mediaPayloadLooksLikeErrorDocument(
     bytes,
     originalContentType,
@@ -2860,23 +3361,69 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
   const normalizedPrefix = embeddedOffset > 0
     ? prefix.slice(embeddedOffset)
     : prefix;
-  const body = streamMediaBodyWithPrefix(
-    normalizedPrefix,
-    prefixResult.remainder,
-    prefixResult.reader,
-    prefixResult.complete,
-    {
-      expectedBytes: normalizedBodyBytes,
-      // 已确认是 MPEG-TS（embeddedOffset>=0 找到过包序列）。当上游不给
-      // Content-Length（normalizedBodyBytes=0）时，靠包对齐兜底检测截断。
-      expectMpegTs: true,
-      cacheKey,
-      cacheLimit: MAX_CACHED_MEDIA_SEGMENT_BYTES,
-      cacheHeaders: headers,
-      cacheStatus: upstream.status,
-      cacheStatusText: upstream.statusText,
-    },
-  );
+  // 已确认是 MPEG-TS（embeddedOffset>=0 找到过包序列）。当上游不给
+  // Content-Length（normalizedBodyBytes=0）时，靠包对齐兜底检测截断。
+  const cacheOptions = {
+    expectedBytes: normalizedBodyBytes,
+    expectMpegTs: true,
+    cacheKey,
+    cacheLimit: MAX_CACHED_MEDIA_SEGMENT_BYTES,
+    cacheHeaders: headers,
+    cacheStatus: upstream.status,
+    cacheStatusText: upstream.statusText,
+  };
+  let body = null;
+  // 整段伪 TS 请求（HLS 播放器通常直接 GET 整段）是单连接限速的最大受害者：
+  // 4.1MB 的分片单连接要 60~70 秒，而这一段只有 10 秒时长。这里用已经探测到
+  // 的真实长度把 TS 负载（去掉图片前缀后的部分）按固定上限并行拉回来，再按
+  // 顺序交给同一套“长度 + 包对齐 + 缓存”逻辑下发。并行失败就继续用原来这条
+  // 已经建好的单连接流，行为与旧实现完全一致。
+  if (
+    upstream.status === 200 &&
+    !contentEncoded &&
+    upstreamTotal > 0 &&
+    normalizedBodyBytes > 0
+  ) {
+    const parallel = await fetchParallelMediaRangeParts(
+      embeddedOffset,
+      upstreamTotal - 1,
+      options.fetchParallelRange,
+      {
+        expectedTotal: upstreamTotal,
+        host: options.parallelHost || "",
+      },
+    );
+    if (parallel?.total === normalizedBodyBytes) {
+      headers.set(
+        MEDIA_PARALLEL_RANGE_HEADER,
+        `hit;${parallel.timing || ""}`,
+      );
+      try {
+        await prefixResult.reader?.cancel?.();
+      } catch {}
+      body = streamMediaBodyWithPrefix(
+        new Uint8Array(0),
+        null,
+        streamFromMediaPartBuffers(parallel.parts).getReader(),
+        false,
+        cacheOptions,
+      );
+    } else {
+      headers.set(
+        MEDIA_PARALLEL_RANGE_HEADER,
+        `fallback-${parallel?.error || "null"}`,
+      );
+    }
+  }
+  if (!body) {
+    body = streamMediaBodyWithPrefix(
+      normalizedPrefix,
+      prefixResult.remainder,
+      prefixResult.reader,
+      prefixResult.complete,
+      cacheOptions,
+    );
+  }
   return {
     embedded: true,
     prefixLength: embeddedOffset,
@@ -3105,7 +3652,14 @@ function streamCompleteMediaSegmentResponse(upstream, cacheKey) {
     return null;
   }
   if (contentLength > MAX_CACHED_MEDIA_SEGMENT_BYTES) {
-    return upstream;
+    return new Response(
+      guardExactMediaStreamBody(upstream.body, contentLength),
+      {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: mediaProxyResponseHeaders(upstream),
+      },
+    );
   }
   const contentType = upstream.headers.get("content-type") || "";
   if (mediaContentTypeLooksLikeErrorDocument(contentType)) {
@@ -3163,6 +3717,16 @@ function streamCompleteMediaSegmentResponse(upstream, cacheKey) {
         }
       }
       delivered += chunk.byteLength;
+      if (delivered > contentLength) {
+        cacheComplete = false;
+        try {
+          await reader.cancel("media segment length exceeded");
+        } catch {}
+        controller.error(
+          new Error(`media segment exceeded: ${delivered}/${contentLength}`),
+        );
+        return;
+      }
       if (cacheComplete) {
         if (cacheOffset + chunk.byteLength <= cacheBytes.byteLength) {
           cacheBytes.set(chunk, cacheOffset);
@@ -3501,6 +4065,172 @@ async function fetchMediaUpstreamResponse(
   // 这里保留别名，调用方语义不变。
   const fetchUpstreamWithRetry = (requestHeaders = headers) =>
     fetchUpstream(requestHeaders);
+
+  // 虚拟 HLS 子分片：清单里已经把一条伪 TS 分片拆成 vsplit 条等长子区间。
+  // 这里把虚拟偏移映射回「PNG / 字体外壳之后」的真实上游字节。任一环节
+  // 不能证明区间精确时直接落回原有整段逻辑，绝不拼接错位数据。
+  const virtualPart = normalizeHlsVirtualPart({
+    split: requestUrl.searchParams.get(HLS_VIRTUAL_SPLIT_COUNT_PARAM),
+    part: requestUrl.searchParams.get(HLS_VIRTUAL_SPLIT_PART_PARAM),
+  });
+  if (virtualPart && requestEncrypted === false) {
+    let virtualPath = "";
+    try {
+      virtualPath = new URL(sourceUrl).pathname;
+    } catch {}
+    if (hlsVirtualSplitPathEligible(virtualPath)) {
+      const virtualCacheKey = mediaSegmentCacheKey(sourceUrl);
+      let virtualMetadata = MEDIA_SEGMENT_PREFIX_CACHE.read(virtualCacheKey);
+      if (!virtualMetadata) {
+        const probeHeaders = new Headers(headers);
+        probeHeaders.set(
+          "range",
+          `bytes=0-${Math.max(0, REMOTE_MEDIA_PROBE_BYTES - 1)}`,
+        );
+        const probe = await fetchUpstreamWithRetry(probeHeaders);
+        const probePrefix = await readMediaResponsePrefix(
+          probe,
+          REMOTE_MEDIA_PROBE_BYTES,
+        );
+        const probeOffset = embeddedMpegTsOffset(probePrefix.bytes);
+        const probeRange = parseMediaContentRange(
+          probe.headers.get("content-range") || "",
+        );
+        const probeLength = Number(probe.headers.get("content-length"));
+        const probeTotal = probeRange?.total ??
+          (probe.status === 200 &&
+            Number.isSafeInteger(probeLength)
+            ? probeLength
+            : null);
+        if (
+          probeOffset >= 0 &&
+          probeTotal &&
+          (!probeRange || probeRange.start === 0)
+        ) {
+          virtualMetadata = mediaSegmentPrefixMetadata(
+            probeOffset,
+            probeTotal,
+            "video/mp2t",
+          );
+          if (virtualMetadata) {
+            MEDIA_SEGMENT_PREFIX_CACHE.write(
+              virtualCacheKey,
+              virtualMetadata,
+            );
+          }
+        }
+      }
+
+      if (virtualMetadata) {
+        const virtualTotal = virtualMetadata.upstreamTotal -
+          virtualMetadata.prefixLength;
+        const partBounds = hlsVirtualPartBounds(virtualPart, virtualTotal);
+        if (partBounds) {
+          const requestedRangeHeader = request.headers.get("range");
+          const virtualRange = requestedRangeHeader
+            ? parseSingleByteRange(requestedRangeHeader, partBounds.length)
+            : { start: 0, end: partBounds.length - 1 };
+          if (virtualRange?.unsatisfiable) {
+            return new Response(null, {
+              status: 416,
+              statusText: "Range Not Satisfiable",
+              headers: {
+                "accept-ranges": "bytes",
+                "content-length": "0",
+                "content-range": `bytes */${partBounds.length}`,
+              },
+            });
+          }
+          if (
+            virtualRange &&
+            !virtualRange.invalid &&
+            virtualRange.start >= 0 &&
+            virtualRange.end < partBounds.length
+          ) {
+            const mappedStart = virtualMetadata.prefixLength +
+              partBounds.start + virtualRange.start;
+            const mappedEnd = virtualMetadata.prefixLength +
+              partBounds.start + virtualRange.end;
+            const expectedLength = virtualRange.end - virtualRange.start + 1;
+            const mappedHeaders = new Headers(headers);
+            for (const name of [
+              "if-range",
+              "if-none-match",
+              "if-modified-since",
+            ]) {
+              mappedHeaders.delete(name);
+            }
+            mappedHeaders.set("range", `bytes=${mappedStart}-${mappedEnd}`);
+            const partUpstream = await fetchUpstreamWithRetry(mappedHeaders);
+            const partRange = parseMediaContentRange(
+              partUpstream.headers.get("content-range") || "",
+            );
+            const partLength = Number(
+              partUpstream.headers.get("content-length"),
+            );
+            const partRangeMatches = partRange &&
+              partRange.start === mappedStart &&
+              partRange.end === mappedEnd &&
+              (partRange.total === null ||
+                partRange.total === virtualMetadata.upstreamTotal);
+            const partLengthMatches = !Number.isSafeInteger(partLength) ||
+              partLength === expectedLength;
+            if (
+              partUpstream.status === 206 &&
+              partUpstream.body &&
+              !partUpstream.headers.has("content-encoding") &&
+              partRangeMatches &&
+              partLengthMatches &&
+              !mediaContentTypeLooksLikeErrorDocument(
+                partUpstream.headers.get("content-type") || "",
+              )
+            ) {
+              const responseHeaders = mediaProxyResponseHeaders(partUpstream);
+              responseHeaders.set("accept-ranges", "bytes");
+              responseHeaders.set("cache-control", "no-store");
+              responseHeaders.set("content-type", "video/mp2t");
+              responseHeaders.set("content-length", String(expectedLength));
+              responseHeaders.set(
+                MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER,
+                "1",
+              );
+              responseHeaders.set(
+                HLS_VIRTUAL_SPLIT_HEADER,
+                `hit;${virtualPart.part + 1}/${virtualPart.split}`,
+              );
+              if (requestedRangeHeader) {
+                responseHeaders.set(
+                  "content-range",
+                  `bytes ${virtualRange.start}-${virtualRange.end}/${
+                    partBounds.length
+                  }`,
+                );
+              } else {
+                responseHeaders.delete("content-range");
+              }
+              return new Response(
+                guardExactMediaStreamBody(
+                  partUpstream.body,
+                  expectedLength,
+                ),
+                {
+                  status: requestedRangeHeader ? 206 : 200,
+                  statusText: requestedRangeHeader
+                    ? "Partial Content"
+                    : "OK",
+                  headers: responseHeaders,
+                },
+              );
+            }
+            try {
+              await partUpstream.body?.cancel();
+            } catch {}
+          }
+        }
+      }
+    }
+  }
+
   if (!usesMediaSegmentCache) {
     return fetchUpstreamWithRetry();
   }
@@ -3654,13 +4384,26 @@ async function fetchMediaUpstreamResponse(
       );
     });
 
+  // 服务端并行 Range 用的取数函数：沿用同一条线路的请求头（origin / referer /
+  // user-agent），只替换 Range。条件请求头必须去掉，否则内部换区间的请求会被
+  // 上游按“条件不满足”回 304 / 空体。
+  const fetchParallelRange = (rangeHeader) => {
+    const parallelHeaders = new Headers(headers);
+    for (const name of ["if-range", "if-none-match", "if-modified-since"]) {
+      parallelHeaders.delete(name);
+    }
+    parallelHeaders.set("range", rangeHeader);
+    return fetchUpstreamWithRetry(parallelHeaders);
+  };
+  const parallelHost = mediaUpstreamHostOf(sourceUrl);
+
   const requestedRangeHeader = request.headers.get("range");
   if (!requestedRangeHeader) {
     const upstream = await fetchUpstreamWithRetry();
     const result = await streamEmbeddedTsMediaResponse(
       upstream,
       sourceUrl,
-      { cacheKey },
+      { cacheKey, fetchParallelRange, parallelHost },
     );
     if (result?.response) return result.response;
     return upstream;
@@ -3767,11 +4510,28 @@ async function fetchMediaUpstreamResponse(
     }
   }
 
+  const mappedStart = range.start + metadata.prefixLength;
+  const mappedEnd = range.end + metadata.prefixLength;
+  // 播放器有时会用一次 Range 请求取整段（bytes=0-）。这种大区间走单连接同样
+  // 会被限速拖死，所以先试一次服务端并行；并行不可用/任一子块校验失败时，
+  // 下面这段原有的单连接逻辑照旧兜底。
+  const parallelParts = await fetchParallelMediaRangeParts(
+    mappedStart,
+    mappedEnd,
+    fetchParallelRange,
+    { expectedTotal: metadata.upstreamTotal, host: parallelHost },
+  );
+  if (parallelParts?.total === range.end - range.start + 1) {
+    return embeddedTsParallelRangeResponse(
+      parallelParts,
+      metadata,
+      range,
+    );
+  }
+
   const mappedHeaders = new Headers(headers);
   mappedHeaders.set("range", embeddedTsMappedRange(range, metadata));
   const mappedUpstream = await fetchUpstreamWithRetry(mappedHeaders);
-  const mappedStart = range.start + metadata.prefixLength;
-  const mappedEnd = range.end + metadata.prefixLength;
   const mappedRange = parseMediaContentRange(
     mappedUpstream.headers.get("content-range") || "",
   );
@@ -3840,6 +4600,16 @@ function mediaProxyResponseHeaders(upstream, options = {}) {
   }
   if (upstream.headers.get(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER) === "1") {
     headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
+  }
+  // 透传并行 Range 诊断头：内部响应（来自 streamEmbeddedTsMediaResponse）
+  // 打的标记会在这里被重新组装头部时丢掉，导致线上无法判断是命中还是回退。
+  const parallelDiagnostic = upstream.headers.get(MEDIA_PARALLEL_RANGE_HEADER);
+  if (parallelDiagnostic) {
+    headers.set(MEDIA_PARALLEL_RANGE_HEADER, parallelDiagnostic);
+  }
+  const virtualDiagnostic = upstream.headers.get(HLS_VIRTUAL_SPLIT_HEADER);
+  if (virtualDiagnostic) {
+    headers.set(HLS_VIRTUAL_SPLIT_HEADER, virtualDiagnostic);
   }
   // fetch 通常已经解压响应体；继续转发压缩前的 Content-Length 会让
   // 客户端读到错误长度并卡在播放器缓冲阶段。
@@ -3912,6 +4682,18 @@ function hlsProxyUrl(value, baseUrl, requestUrl, depth, options = {}) {
   }
   if (options.encrypted) {
     proxyUrl.searchParams.set("encrypted", "1");
+  }
+  // 虚拟 HLS 子区间：同一个上游地址 + 段号，服务端按固定字节区间返回。
+  const virtualPart = normalizeHlsVirtualPart(options.virtualPart);
+  if (virtualPart) {
+    proxyUrl.searchParams.set(
+      HLS_VIRTUAL_SPLIT_COUNT_PARAM,
+      String(virtualPart.split),
+    );
+    proxyUrl.searchParams.set(
+      HLS_VIRTUAL_SPLIT_PART_PARAM,
+      String(virtualPart.part),
+    );
   }
   return proxyUrl.toString();
 }
@@ -3990,15 +4772,104 @@ function hlsSegmentDirectUrl(line, baseUrl, requestUrl, depth, encrypted) {
   return target.toString();
 }
 
+function hlsExtInfSeconds(line) {
+  const match = /^#EXTINF:\s*([^,]+)/i.exec(String(line || ""));
+  if (!match) return 0;
+  const duration = Number(match[1]);
+  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+}
+
+function hlsSegmentHandleBreakingTag(line) {
+  return /^#EXT-X-(?:BYTERANGE|KEY|MAP|DISCONTINUITY|GAP)(?::|\s|$)/i.test(
+    String(line || ""),
+  );
+}
+
+function formatHlsDuration(value) {
+  const micros = Math.round(Number(value) * 1_000_000);
+  if (!Number.isSafeInteger(micros) || micros < 0) {
+    return "0.000000";
+  }
+  const whole = Math.floor(micros / 1_000_000);
+  const fraction = String(micros % 1_000_000).padStart(6, "0");
+  return `${whole}.${fraction}`;
+}
+
+function hlsVirtualSplitPathEligible(pathname) {
+  return HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname) ||
+    HLS_FONT_RESOURCE_PATTERN.test(pathname) ||
+    HLS_IMAGE_RESOURCE_PATTERN.test(pathname);
+}
+
+// 只拆分必须经过 Worker 剥外壳、且 URI 形状明确是伪 TS 的分片。普通媒体
+// 分片继续直连或整段透传，AES/带 BYTERANGE 的片也不拆分，避免字节错位。
+function hlsVirtualSplitForSegment(
+  line,
+  baseUrl,
+  encrypted,
+  duration,
+  splitParts,
+) {
+  if (encrypted) return null;
+  const parts = Math.floor(Number(splitParts));
+  if (!Number.isSafeInteger(parts) || parts < 2 ||
+      parts > HLS_VIRTUAL_SPLIT_MAX_PARTS) {
+    return null;
+  }
+  let target;
+  try {
+    target = new URL(line, baseUrl);
+  } catch {
+    return null;
+  }
+  if (target.protocol !== "https:" && target.protocol !== "http:") {
+    return null;
+  }
+  if (!hlsSegmentShouldProxy(target)) return null;
+  if (!hlsVirtualSplitPathEligible(target.pathname)) return null;
+
+  const durationMicros = Math.round(Number(duration) * 1_000_000);
+  if (
+    !Number.isSafeInteger(durationMicros) ||
+    durationMicros < parts
+  ) {
+    return null;
+  }
+  const baseMicros = Math.floor(durationMicros / parts);
+  if (baseMicros <= 0) return null;
+  const result = [];
+  for (let part = 0; part < parts; part += 1) {
+    const partMicros = part === parts - 1
+      ? durationMicros - baseMicros * (parts - 1)
+      : baseMicros;
+    result.push({
+      part: { split: parts, part },
+      duration: partMicros / 1_000_000,
+    });
+  }
+  return result;
+}
+
 function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth, options = {}) {
   const source = String(playlist || "");
   if (!source.trimStart().startsWith("#EXTM3U")) {
     return source;
   }
   const baseUrl = String(manifestUrl || upstreamOrigin({}));
+  const splitParts = options.virtualSplit === false
+    ? 0
+    : hlsVirtualSplitParts;
   const output = [];
   let encrypted = false;
+  let segmentProtected = false;
+  let segmentDiscontinuity = false;
+  let segmentMap = false;
+  let segmentByteRange = false;
   let nextUriKind = "";
+  // 待处理的 #EXTINF：记下它在 output 里的下标与时长。等真正读到分片 URI 时
+  // 再决定“原样保留一行”还是“替换成 N 条虚拟子区间”。只有中间没有出现
+  // EXT-X-BYTERANGE / KEY / MAP / DISCONTINUITY 时才算“可安全拆分”。
+  let pendingExtInf = null;
   for (const rawLine of source.replace(/\r\n?/g, "\n").split("\n")) {
     const line = rawLine.trim();
     if (!line) {
@@ -4015,11 +4886,35 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth, options = 
         const attributes = parseHlsAttributeList(
           line.replace(/^#EXT-X-KEY:/i, ""),
         );
-        encrypted = String(attributes.METHOD || "").trim().toUpperCase() ===
-          "AES-128";
+        const method = String(attributes.METHOD || "").trim().toUpperCase();
+        encrypted = method === "AES-128";
+        segmentProtected = Boolean(method) && method !== "NONE";
+      }
+      if (/^#EXT-X-MAP:/i.test(line)) {
+        segmentMap = true;
+      }
+      if (/^#EXT-X-DISCONTINUITY(?::|\s|$)/i.test(line)) {
+        segmentDiscontinuity = true;
+      }
+      if (/^#EXT-X-BYTERANGE:/i.test(line)) {
+        segmentByteRange = true;
       }
       if (/^#EXT-X-STREAM-INF:/i.test(line)) {
         nextUriKind = "manifest";
+      }
+      if (HLS_EXTINF_PATTERN.test(line)) {
+        pendingExtInf = {
+          index: output.length - 1,
+          duration: hlsExtInfSeconds(line),
+          splittable: !segmentProtected &&
+            !segmentDiscontinuity &&
+            !segmentMap &&
+            !segmentByteRange,
+        };
+      } else if (pendingExtInf && hlsSegmentHandleBreakingTag(line)) {
+        // BYTERANGE / KEY / MAP / DISCONTINUITY 都会改变“这一段字节从哪开始”，
+        // 此时再按等长切区间会算错偏移，直接放弃拆分。
+        pendingExtInf = null;
       }
       continue;
     }
@@ -4028,7 +4923,32 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth, options = 
     if (kind === "segment") {
       // 普通媒体文件（.ts/.m4s/.mp4…）直连 CDN 省流量，伪 HLS 分片走本地代理
       // 剥掉 PNG/字体外壳后回 video/mp2t（详见 hlsSegmentShouldProxy 注释）。
-      output.push(hlsSegmentDirectUrl(line, baseUrl, requestUrl, depth, encrypted));
+      const split = splitParts >= 2 && pendingExtInf?.splittable
+        ? hlsVirtualSplitForSegment(
+          line,
+          baseUrl,
+          encrypted,
+          pendingExtInf.duration,
+          splitParts,
+        )
+        : null;
+      if (split) {
+        // 先把原来的单条 #EXTINF 移除，再展开成 N 条等长子区间。
+        if (pendingExtInf.index < output.length) {
+          output.splice(pendingExtInf.index, 1);
+        }
+        for (const entry of split) {
+          output.push(`#EXTINF:${formatHlsDuration(entry.duration)},`);
+          output.push(hlsProxyUrl(line, baseUrl, requestUrl, depth, {
+            hls: true,
+            kind: "segment",
+            encrypted,
+            virtualPart: entry.part,
+          }));
+        }
+      } else {
+        output.push(hlsSegmentDirectUrl(line, baseUrl, requestUrl, depth, encrypted));
+      }
     } else {
       // 子清单（master -> variant）仍走代理，便于继续重写子清单。
       output.push(hlsProxyUrl(line, baseUrl, requestUrl, depth, {
@@ -4037,6 +4957,9 @@ function rewriteHlsManifest(playlist, manifestUrl, requestUrl, depth, options = 
         encrypted,
       }));
     }
+    pendingExtInf = null;
+    segmentDiscontinuity = false;
+    segmentByteRange = false;
   }
   return output.join("\n");
 }
@@ -13619,6 +14542,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
   edgeCacheOrigin = url.origin;
   applyResolveDebugEnv(env);
   applyMediaStreamEnv(env);
+  applyHlsVirtualSplitEnv(env);
   if (browserPageBlocked(request)) {
     return notFoundPage();
   }
@@ -14669,6 +15593,7 @@ export function resetEmbyCachesForTests() {
   MEDIA_SEGMENT_BODY_CACHE.clear();
   MEDIA_SEGMENT_PREFIX_CACHE.clear();
   MEDIA_SEGMENT_RANGE_CACHE.clear();
+  MEDIA_PARALLEL_RANGE_FAILURES.clear();
   REWRITTEN_HLS_CACHE.clear();
   rewrittenHlsCacheHits = 0;
   rewrittenHlsCacheMisses = 0;

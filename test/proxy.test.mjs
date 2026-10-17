@@ -6903,7 +6903,9 @@ test("prewarms the first GetAV HLS segments in the background", async () => {
 
   assert.equal(response.status, 200);
   const rewritten = await response.text();
-  assert.equal((rewritten.match(/\/emby-media\//g) || []).length, 5);
+  // Each pseudo-TS segment is expanded into four byte-range subsegments for the
+  // client, but background prefetch still warms only the first original segment.
+  assert.equal((rewritten.match(/\/emby-media\//g) || []).length, 20);
   assert.equal(backgroundTasks.length, 1);
   await Promise.all(backgroundTasks);
 
@@ -8036,6 +8038,601 @@ test("maps pseudo PNG ranges beyond the prefix probe without a full download", a
   );
 });
 
+test("errors a mapped pseudo PNG range when the upstream body is short", async () => {
+  const prefixLength = 70;
+  const rawBytes = new Uint8Array(prefixLength + 8 * 188);
+  rawBytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  for (let offset = prefixLength; offset < rawBytes.byteLength; offset += 188) {
+    rawBytes[offset] = 0x47;
+  }
+  const sourceUrl =
+    "https://p19-ad-site-sign-sg.tiktokcdn.com/video/short-mapped-range.image?token=truncated";
+  let fetches = 0;
+
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`,
+      { headers: { range: "bytes=300-487" } },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      fetches += 1;
+      const range = String(init.headers.get("range") || "");
+      if (fetches === 1) {
+        assert.equal(range, "bytes=0-511");
+        return new Response(rawBytes.slice(0, 512), {
+          status: 206,
+          headers: {
+            "content-length": "512",
+            "content-range": `bytes 0-511/${rawBytes.byteLength}`,
+            "content-type": "image/png",
+          },
+        });
+      }
+      assert.equal(range, "bytes=370-557");
+      return new Response(rawBytes.slice(370, 370 + 141), {
+        status: 206,
+        headers: {
+          "content-length": "188",
+          "content-range": `bytes 370-557/${rawBytes.byteLength}`,
+          "content-type": "image/png",
+        },
+      });
+    },
+  );
+
+  assert.equal(fetches, 2);
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-length"), "188");
+  await assert.rejects(
+    response.arrayBuffer(),
+    /media range truncated: 141\/188/,
+  );
+});
+
+test("clips a mapped pseudo PNG range when the upstream body is too long", async () => {
+  const prefixLength = 70;
+  const rawBytes = new Uint8Array(prefixLength + 8 * 188);
+  rawBytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  for (let offset = prefixLength; offset < rawBytes.byteLength; offset += 188) {
+    rawBytes[offset] = 0x47;
+  }
+  const sourceUrl =
+    "https://p19-ad-site-sign-sg.tiktokcdn.com/video/long-mapped-range.image?token=overrun";
+  let fetches = 0;
+
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`,
+      { headers: { range: "bytes=300-487" } },
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      fetches += 1;
+      const range = String(init.headers.get("range") || "");
+      if (fetches === 1) {
+        assert.equal(range, "bytes=0-511");
+        return new Response(rawBytes.slice(0, 512), {
+          status: 206,
+          headers: {
+            "content-length": "512",
+            "content-range": `bytes 0-511/${rawBytes.byteLength}`,
+            "content-type": "image/png",
+          },
+        });
+      }
+      assert.equal(range, "bytes=370-557");
+      return new Response(rawBytes.slice(370, 746), {
+        status: 206,
+        headers: {
+          "content-length": "188",
+          "content-range": `bytes 370-557/${rawBytes.byteLength}`,
+          "content-type": "image/png",
+        },
+      });
+    },
+  );
+
+  assert.equal(fetches, 2);
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-length"), "188");
+  assert.deepEqual(
+    new Uint8Array(await response.arrayBuffer()),
+    rawBytes.slice(370, 558),
+  );
+});
+
+// 上游 CDN 对单条连接限速是伪 TS 分片卡顿/跳段的根因：4MB 分片单连接要
+// 60~70 秒，而这一段只有 10 秒时长。这一组测试锁住“固定上限的并行 Range
+// 合并”：并发不越界、按顺序拼接、长度不匹配就整体放弃并回退单连接。
+function pseudoPngTsBytes(prefixLength, packetCount) {
+  const bytes = new Uint8Array(prefixLength + packetCount * 188);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  for (let index = 0; index < packetCount; index += 1) {
+    const offset = prefixLength + index * 188;
+    bytes[offset] = 0x47;
+    bytes[offset + 1] = index & 0xff;
+    bytes[offset + 2] = (index >> 8) & 0xff;
+  }
+  return bytes;
+}
+
+function rangeServerFor(bytes, onRange) {
+  return async (_url, init = {}) => {
+    const range = init.headers.get("range");
+    if (!range) {
+      return new Response(bytes.slice(), {
+        status: 200,
+        headers: {
+          "content-length": String(bytes.byteLength),
+          "content-type": "image/png",
+        },
+      });
+    }
+    const match = /^bytes=(\d+)-(\d+)$/.exec(String(range));
+    assert.ok(match, `expected a single upstream Range, got ${range}`);
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    const slice = bytes.slice(start, end + 1);
+    onRange?.(start, end, slice);
+    return new Response(slice, {
+      status: 206,
+      headers: {
+        "content-length": String(slice.byteLength),
+        "content-range": `bytes ${start}-${end}/${bytes.byteLength}`,
+        "content-type": "image/png",
+      },
+    });
+  };
+}
+
+function assertContiguousRanges(ranges, from, to) {
+  const sorted = ranges
+    .map((range) => /^bytes=(\d+)-(\d+)$/.exec(range))
+    .map((match) => ({ start: Number(match[1]), end: Number(match[2]) }))
+    .sort((a, b) => a.start - b.start);
+  let cursor = from;
+  for (const item of sorted) {
+    assert.equal(item.start, cursor);
+    cursor = item.end + 1;
+  }
+  assert.equal(cursor, to);
+}
+
+test("expands pseudo TS segments into exact virtual HLS ranges", async () => {
+  const manifestUrl = "https://p16-ad-site-sign-sg.tiktokcdn.com/virtual/index.m3u8";
+  const segmentUrl =
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/virtual/part-0.image?token=virtual";
+  const playlist = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    "#EXTINF:6.000001,",
+    "part-0.image?token=virtual",
+    "#EXT-X-ENDLIST",
+  ].join("\n");
+
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${
+        encodeURIComponent(manifestUrl)
+      }&hls=1&kind=manifest`,
+    ),
+    { HLS_VIRTUAL_SPLIT_PARTS: "4" },
+    {},
+    async (url) => {
+      assert.equal(String(url), manifestUrl);
+      return new Response(playlist, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    },
+  );
+
+  assert.equal(response.status, 200);
+  const rewritten = await response.text();
+  const lines = rewritten.split(/\r?\n/);
+  const durations = lines
+    .filter((line) => /^#EXTINF:/i.test(line))
+    .map((line) => Number(/^#EXTINF:\s*([^,]+)/i.exec(line)[1]));
+  assert.equal(durations.length, 4);
+  assert.equal(
+    durations.reduce((sum, value) => sum + value, 0),
+    6.000001,
+  );
+
+  const segmentLines = lines.filter((line) =>
+    line && !line.startsWith("#")
+  );
+  assert.equal(segmentLines.length, 4);
+  for (let part = 0; part < segmentLines.length; part += 1) {
+    const proxyUrl = new URL(segmentLines[part]);
+    assert.equal(proxyUrl.pathname, "/emby-media/");
+    assert.equal(proxyUrl.searchParams.get("hls"), "1");
+    assert.equal(proxyUrl.searchParams.get("kind"), "segment");
+    assert.equal(proxyUrl.searchParams.get("vsplit"), "4");
+    assert.equal(proxyUrl.searchParams.get("vpart"), String(part));
+    assert.equal(
+      proxyUrl.searchParams.get("url"),
+      segmentUrl,
+    );
+  }
+});
+
+test("does not virtual-split protected or non-pseudo HLS segments", async () => {
+  const cases = [
+    {
+      name: "AES-128",
+      segmentUrl:
+        "https://p16-ad-site-sign-sg.tiktokcdn.com/virtual/aes.image?token=aes",
+      tags: [
+        "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x1",
+      ],
+    },
+    {
+      name: "byte range",
+      segmentUrl:
+        "https://p16-ad-site-sign-sg.tiktokcdn.com/virtual/byte.image?token=byte",
+      tags: ["#EXT-X-BYTERANGE:188@0"],
+    },
+    {
+      name: "initialization map",
+      segmentUrl:
+        "https://p16-ad-site-sign-sg.tiktokcdn.com/virtual/map.image?token=map",
+      tags: ["#EXT-X-MAP:URI=\"init.mp4\""],
+    },
+    {
+      name: "discontinuity",
+      segmentUrl:
+        "https://p16-ad-site-sign-sg.tiktokcdn.com/virtual/disc.image?token=disc",
+      tags: ["#EXT-X-DISCONTINUITY"],
+    },
+    {
+      name: "ordinary TS",
+      segmentUrl:
+        "https://p16-ad-site-sign-sg.tiktokcdn.com/virtual/plain.ts?token=plain",
+      tags: [],
+      direct: true,
+    },
+  ];
+
+  for (let index = 0; index < cases.length; index += 1) {
+    const item = cases[index];
+    const manifestUrl =
+      `https://p16-ad-site-sign-sg.tiktokcdn.com/virtual/case-${index}.m3u8`;
+    const playlist = [
+      "#EXTM3U",
+      ...item.tags,
+      "#EXTINF:4,",
+      new URL(item.segmentUrl).pathname.split("/").pop() +
+      new URL(item.segmentUrl).search,
+      "#EXT-X-ENDLIST",
+    ].join("\n");
+    const response = await handleProxy(
+      new Request(
+        `https://clone.example/emby-media/?url=${
+          encodeURIComponent(manifestUrl)
+        }&hls=1&kind=manifest`,
+      ),
+      { HLS_VIRTUAL_SPLIT_PARTS: "4" },
+      {},
+      async () =>
+        new Response(playlist, {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        }),
+    );
+    assert.equal(response.status, 200, item.name);
+    const rewritten = await response.text();
+    const segmentLine = rewritten
+      .split(/\r?\n/)
+      .find((line) => line && !line.startsWith("#"));
+    assert.ok(segmentLine, item.name);
+
+    if (item.direct) {
+      assert.equal(segmentLine, item.segmentUrl, item.name);
+      continue;
+    }
+    const proxyUrl = new URL(segmentLine);
+    assert.equal(proxyUrl.pathname, "/emby-media/", item.name);
+    assert.equal(proxyUrl.searchParams.has("vsplit"), false, item.name);
+    assert.equal(proxyUrl.searchParams.has("vpart"), false, item.name);
+  }
+});
+
+test("serves virtual HLS parts from prefix-free TS bytes", async () => {
+  const prefixLength = 70;
+  const rawBytes = pseudoPngTsBytes(prefixLength, 8);
+  const sourceUrl =
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/virtual-parts.image?token=parts";
+  const virtualTotal = rawBytes.byteLength - prefixLength;
+  const mappedRanges = [];
+  const fetchImpl = rangeServerFor(rawBytes, (start, end) => {
+    if (start >= prefixLength) {
+      mappedRanges.push(`bytes=${start}-${end}`);
+    }
+  });
+
+  const bodies = [];
+  for (let part = 0; part < 4; part += 1) {
+    const response = await handleProxy(
+      new Request(
+        `https://clone.example/emby-media/?url=${
+          encodeURIComponent(sourceUrl)
+        }&hls=1&kind=segment&vsplit=4&vpart=${part}`,
+      ),
+      { HLS_VIRTUAL_SPLIT_PARTS: "4" },
+      {},
+      fetchImpl,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(
+      response.headers.get("x-catemby-virtual-split"),
+      `hit;${part + 1}/4`,
+    );
+    assert.equal(response.headers.get("content-type"), "video/mp2t");
+    assert.equal(response.headers.get("content-range"), null);
+    const body = new Uint8Array(await response.arrayBuffer());
+    assert.equal(response.headers.get("content-length"), String(body.byteLength));
+    bodies.push(body);
+  }
+
+  const concatenated = new Uint8Array(
+    bodies.reduce((sum, body) => sum + body.byteLength, 0),
+  );
+  let offset = 0;
+  for (const body of bodies) {
+    concatenated.set(body, offset);
+    offset += body.byteLength;
+  }
+  assert.deepEqual(concatenated, rawBytes.slice(prefixLength));
+  assert.equal(concatenated.byteLength, virtualTotal);
+  assertContiguousRanges(mappedRanges, prefixLength, rawBytes.byteLength);
+
+  const ranged = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${
+        encodeURIComponent(sourceUrl)
+      }&hls=1&kind=segment&vsplit=4&vpart=1`,
+      { headers: { range: "bytes=10-99" } },
+    ),
+    { HLS_VIRTUAL_SPLIT_PARTS: "4" },
+    {},
+    fetchImpl,
+  );
+  assert.equal(ranged.status, 206);
+  assert.equal(ranged.headers.get("x-catemby-virtual-split"), "hit;2/4");
+  assert.equal(
+    ranged.headers.get("content-range"),
+    `bytes 10-99/${Math.floor(virtualTotal / 4)}`,
+  );
+  assert.deepEqual(
+    new Uint8Array(await ranged.arrayBuffer()),
+    rawBytes.slice(
+      prefixLength + Math.floor(virtualTotal / 4) + 10,
+      prefixLength + Math.floor(virtualTotal / 4) + 100,
+    ),
+  );
+});
+
+test("streams a whole pseudo PNG segment with bounded parallel upstream ranges", async () => {
+  const prefixLength = 70;
+  // ≈2.6MB：大于单块下限，正好切成服务端上限的 4 路。
+  const rawBytes = pseudoPngTsBytes(prefixLength, 14000);
+  const sourceUrl =
+    "https://p19-ad-site-sign-sg.tiktokcdn.com/video/parallel-whole.image?token=parallel";
+  const upstreamRanges = [];
+
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`,
+    ),
+    {},
+    {},
+    rangeServerFor(rawBytes, (start, end) => {
+      upstreamRanges.push(`bytes=${start}-${end}`);
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(
+    response.headers.get("content-length"),
+    String(rawBytes.byteLength - prefixLength),
+  );
+  assert.equal(upstreamRanges.length, 4);
+  assertContiguousRanges(upstreamRanges, prefixLength, rawBytes.byteLength);
+  assert.deepEqual(
+    new Uint8Array(await response.arrayBuffer()),
+    rawBytes.slice(prefixLength),
+  );
+});
+
+test("streams an all-segment Range request with bounded parallel upstream ranges", async () => {
+  const prefixLength = 70;
+  const rawBytes = pseudoPngTsBytes(prefixLength, 14000);
+  const sourceUrl =
+    "https://p19-ad-site-sign-sg.tiktokcdn.com/video/parallel-range.image?token=parallel-range";
+  const upstreamRanges = [];
+
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`,
+      { headers: { range: "bytes=0-" } },
+    ),
+    {},
+    {},
+    rangeServerFor(rawBytes, (start, end) => {
+      // 前缀探测（bytes=0-511）不算并行分块。
+      if (start >= prefixLength) upstreamRanges.push(`bytes=${start}-${end}`);
+    }),
+  );
+
+  assert.equal(response.status, 206);
+  assert.equal(
+    response.headers.get("content-range"),
+    `bytes 0-${rawBytes.byteLength - prefixLength - 1}/${
+      rawBytes.byteLength - prefixLength
+    }`,
+  );
+  assert.equal(
+    response.headers.get("content-length"),
+    String(rawBytes.byteLength - prefixLength),
+  );
+  // 探测（bytes=0-511）+ 4 路并行，请求数不会随分片变大而膨胀。
+  assert.equal(upstreamRanges.length, 4);
+  assertContiguousRanges(upstreamRanges, prefixLength, rawBytes.byteLength);
+  assert.deepEqual(
+    new Uint8Array(await response.arrayBuffer()),
+    rawBytes.slice(prefixLength),
+  );
+});
+
+test("falls back to the single upstream stream when a parallel range is invalid", async () => {
+  const prefixLength = 70;
+  const rawBytes = pseudoPngTsBytes(prefixLength, 14000);
+  const sourceUrl =
+    "https://p19-ad-site-sign-sg.tiktokcdn.com/video/parallel-invalid.image?token=invalid";
+  let parallelAttempts = 0;
+
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`,
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      const range = init.headers.get("range");
+      if (!range) {
+        return new Response(rawBytes.slice(), {
+          status: 200,
+          headers: {
+            "content-length": String(rawBytes.byteLength),
+            "content-type": "image/png",
+          },
+        });
+      }
+      parallelAttempts += 1;
+      // 上游根本不认 Range：回整段 + 200。并行必须整体放弃。
+      return new Response(rawBytes.slice(), {
+        status: 200,
+        headers: {
+          "content-length": String(rawBytes.byteLength),
+          "content-type": "image/png",
+        },
+      });
+    },
+  );
+
+  assert.equal(parallelAttempts, 4);
+  assert.equal(response.status, 200);
+  assert.equal(
+    response.headers.get("content-length"),
+    String(rawBytes.byteLength - prefixLength),
+  );
+  assert.deepEqual(
+    new Uint8Array(await response.arrayBuffer()),
+    rawBytes.slice(prefixLength),
+  );
+});
+
+test("falls back when a parallel pseudo PNG range short-reads", async () => {
+  const prefixLength = 70;
+  const rawBytes = pseudoPngTsBytes(prefixLength, 14000);
+  const sourceUrl =
+    "https://p16-ad-site-sign-sg.tiktokcdn.com/video/parallel-short.image?token=short";
+  let parallelAttempts = 0;
+
+  const response = await handleProxy(
+    new Request(
+      `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`,
+    ),
+    {},
+    {},
+    async (_url, init = {}) => {
+      const range = init.headers.get("range");
+      if (!range) {
+        return new Response(rawBytes.slice(), {
+          status: 200,
+          headers: {
+            "content-length": String(rawBytes.byteLength),
+            "content-type": "image/png",
+          },
+        });
+      }
+      parallelAttempts += 1;
+      const match = /^bytes=(\d+)-(\d+)$/.exec(String(range));
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      const slice = rawBytes.slice(start, end + 1);
+      // 响应头声明了完整长度，响应体只送一半：更小的缓冲区里再拼其它块就会
+      // 让播放器拿到错位的字节，所以这里必须整体放弃并行。
+      return new Response(slice.slice(0, Math.floor(slice.byteLength / 2)), {
+        status: 206,
+        headers: {
+          "content-length": String(slice.byteLength),
+          "content-range": `bytes ${start}-${end}/${rawBytes.byteLength}`,
+          "content-type": "image/png",
+        },
+      });
+    },
+  );
+
+  assert.equal(parallelAttempts, 4);
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    new Uint8Array(await response.arrayBuffer()),
+    rawBytes.slice(prefixLength),
+  );
+});
+
+test("stops attempting parallel ranges after repeated failures on a host", async () => {
+  const prefixLength = 70;
+  const rawBytes = pseudoPngTsBytes(prefixLength, 14000);
+  const host = "https://p16-ad-site-sign-sg.tiktokcdn.com";
+  let parallelAttempts = 0;
+  const fetchImpl = async (_url, init = {}) => {
+    const range = init.headers.get("range");
+    if (!range) {
+      return new Response(rawBytes.slice(), {
+        status: 200,
+        headers: {
+          "content-length": String(rawBytes.byteLength),
+          "content-type": "image/png",
+        },
+      });
+    }
+    parallelAttempts += 1;
+    return new Response(new Uint8Array(0), {
+      status: 206,
+      headers: {
+        "content-length": "0",
+        "content-range": "bytes 0-0/1",
+        "content-type": "image/png",
+      },
+    });
+  };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await handleProxy(
+      new Request(
+        `https://clone.example/emby-media/?url=${
+          encodeURIComponent(`${host}/video/parallel-disable-${attempt}.image`)
+        }&kind=segment&hls=1`,
+      ),
+      {},
+      {},
+      fetchImpl,
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(
+      new Uint8Array(await response.arrayBuffer()),
+      rawBytes.slice(prefixLength),
+    );
+  }
+
+  // 前两次各发 4 个并行子请求，失败累计到阈值后第三次直接回退单连接。
+  assert.equal(parallelAttempts, 8);
+});
+
 test("answers HEAD on a pseudo PNG segment with video/mp2t and prefix-free length", async () => {
   const sourceUrl =
     "https://p16-ad-site-sign-sg.tiktokcdn.com/video/head-probe.image?token=head";
@@ -8695,6 +9292,56 @@ test("errors the proxied body when the upstream truncates a media Range response
   // 静默短读会让播放器把半段分片当成完整分片，卡在解码/缓冲上；
   // 现在必须显式失败，客户端才会重试这一段。
   await assert.rejects(response.arrayBuffer(), /truncated/);
+});
+
+test("rejects an aligned full segment whose body is shorter than Content-Range", async () => {
+  const sourceUrl =
+    "https://fast-stream.jav.si/video/aligned-truncated-full.ts";
+  const proxyUrl =
+    `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`;
+  let fetches = 0;
+
+  const response = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    async () => {
+      fetches += 1;
+      // 188 字节正好是一个 MPEG-TS 包，仅靠包对齐无法发现截断；必须以
+      // Content-Range 声明的 376 字节为准。
+      return new Response(new Uint8Array(188), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-375/376",
+          "content-type": "video/mp2t",
+        },
+      });
+    },
+  );
+
+  assert.equal(fetches, 2);
+  assert.equal(response.status, 502);
+  assert.match(await response.text(), /invalid media response/i);
+
+  let retryFetches = 0;
+  const retryResponse = await handleProxy(
+    new Request(proxyUrl),
+    {},
+    {},
+    async () => {
+      retryFetches += 1;
+      return new Response(new Uint8Array(188), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-375/376",
+          "content-type": "video/mp2t",
+        },
+      });
+    },
+  );
+
+  assert.equal(retryFetches, 2);
+  assert.equal(retryResponse.status, 502);
 });
 
 test("keeps the media Range cache under its total byte budget", async () => {
