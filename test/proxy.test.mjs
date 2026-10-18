@@ -13,6 +13,8 @@ import {
 import {
   createJavdbSignature,
   createEmbyConcurrencyGateForTests,
+  createMediaUpstreamSchedulerForTests,
+  mediaSegmentCacheKeyForTests,
   mediaSourceIdForIndexForTests,
   mediaSourceIdsForVariantsForTests,
   rewriteHlsManifestCachedForTests,
@@ -7612,6 +7614,29 @@ test("does not cache a disguised media error document", async () => {
   assert.equal(upstreamFetches, 2);
 });
 
+test("normalizes rotating media signatures without merging distinct segments", () => {
+  const first = mediaSegmentCacheKeyForTests(
+    "https://p16.example/video/seg-001.ts?token=one&segment=1&x-expires=100",
+  );
+  const second = mediaSegmentCacheKeyForTests(
+    "https://p16.example/video/seg-001.ts?segment=1&token=two&x-expires=200",
+  );
+  const reordered = mediaSegmentCacheKeyForTests(
+    "https://p16.example/video/seg-001.ts?x-expires=300&segment=1&token=three",
+  );
+  const otherSegment = mediaSegmentCacheKeyForTests(
+    "https://p16.example/video/seg-002.ts?segment=2&token=one&x-expires=100",
+  );
+  const otherIdentity = mediaSegmentCacheKeyForTests(
+    "https://p16.example/video/seg-001.ts?segment=2&token=one&x-expires=100",
+  );
+
+  assert.equal(first, second);
+  assert.equal(first, reordered);
+  assert.notEqual(first, otherSegment);
+  assert.notEqual(first, otherIdentity);
+});
+
 test("serves a repeated identical media Range request from the range cache without a second upstream fetch", async () => {
   const sourceUrl = "https://fast-stream.jav.si/video/range-repeat.ts";
   const proxyUrl =
@@ -7653,6 +7678,55 @@ test("serves a repeated identical media Range request from the range cache witho
   assert.equal(second.status, 206);
   assert.equal(second.headers.get("content-range"), "bytes 4-7/20");
   assert.deepEqual(new Uint8Array(await second.arrayBuffer()), partialBytes);
+});
+
+test("reuses a media Range after only the temporary token rotates", async () => {
+  const requestedRange = "bytes=4-7";
+  const partialBytes = Uint8Array.from([4, 3, 2, 1]);
+  let upstreamFetches = 0;
+  const proxyUrlFor = (token) => {
+    const sourceUrl =
+      `https://fast-stream.jav.si/video/token-rotation.ts?segment=1&token=${token}`;
+    return `https://clone.example/emby-media/?url=${
+      encodeURIComponent(sourceUrl)
+    }&kind=segment&hls=1`;
+  };
+  const upstream = async () => {
+    upstreamFetches += 1;
+    return new Response(partialBytes, {
+      status: 206,
+      headers: {
+        "content-length": String(partialBytes.length),
+        "content-range": "bytes 4-7/20",
+        "content-type": "video/mp2t",
+        etag: '"token-rotation-v1"',
+      },
+    });
+  };
+
+  const first = await handleProxy(
+    new Request(proxyUrlFor("first"), { headers: { range: requestedRange } }),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(first.status, 206);
+  assert.deepEqual(new Uint8Array(await first.arrayBuffer()), partialBytes);
+  assert.equal(upstreamFetches, 1);
+
+  const second = await handleProxy(
+    new Request(proxyUrlFor("second"), { headers: { range: requestedRange } }),
+    {},
+    {},
+    upstream,
+  );
+  assert.equal(second.status, 206);
+  assert.deepEqual(new Uint8Array(await second.arrayBuffer()), partialBytes);
+  assert.equal(
+    upstreamFetches,
+    1,
+    "a rotated temporary token must not force a second download",
+  );
 });
 
 test("bypasses a cached media Range when If-Range identifies another representation", async () => {
@@ -9567,7 +9641,11 @@ test("stops attempting parallel ranges after repeated failures on a host", async
       });
     }
     parallelAttempts += 1;
-    return new Response(new Uint8Array(0), {
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.close();
+      },
+    }), {
       status: 206,
       headers: {
         "content-length": "0",
@@ -12521,6 +12599,91 @@ test("concurrency gate releases the slot when the task throws", async () => {
   assert.equal(await gate.run(async () => "ok"), "ok");
 });
 
+test("media scheduler enforces one global connection budget across hosts", async () => {
+  const scheduler = createMediaUpstreamSchedulerForTests({ queueLimit: 8 });
+  const env = {
+    MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1",
+    MEDIA_UPSTREAM_CONNECTIONS_GLOBAL: "2",
+  };
+  const releaseFirst = await scheduler.acquire("host-a.example", env);
+  const releaseSecond = await scheduler.acquire("host-b.example", env);
+  let thirdGranted = false;
+  const third = scheduler
+    .acquire("host-c.example", env, { waitMs: 500 })
+    .then((release) => {
+      thirdGranted = true;
+      return release;
+    });
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(thirdGranted, false);
+  assert.equal(scheduler.active, 2);
+  assert.equal(scheduler.waiting, 1);
+
+  releaseFirst();
+  const releaseThird = await third;
+  assert.equal(thirdGranted, true);
+  assert.equal(scheduler.active, 2);
+
+  releaseSecond();
+  releaseThird();
+  assert.equal(scheduler.active, 0);
+  assert.equal(scheduler.waiting, 0);
+});
+
+test("media scheduler skips a host-blocked waiter instead of blocking the queue", async () => {
+  const scheduler = createMediaUpstreamSchedulerForTests({ queueLimit: 8 });
+  const env = {
+    MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1",
+    MEDIA_UPSTREAM_CONNECTIONS_GLOBAL: "2",
+  };
+  const releaseA = await scheduler.acquire("host-a.example", env);
+  const releaseB = await scheduler.acquire("host-b.example", env);
+  const blockedB = scheduler.acquire("host-b.example", env, { waitMs: 500 });
+  const pendingC = scheduler.acquire("host-c.example", env, {
+    waitMs: 500,
+  });
+
+  assert.equal(scheduler.active, 2);
+  releaseA();
+  const releaseC = await pendingC;
+  releaseB();
+  const releaseBlockedB = await blockedB;
+  assert.equal(scheduler.active, 2);
+
+  releaseC();
+  releaseBlockedB();
+  assert.equal(scheduler.active, 0);
+});
+
+test("media scheduler removes cancelled and timed-out waiters", async () => {
+  const scheduler = createMediaUpstreamSchedulerForTests({ queueLimit: 8 });
+  const env = {
+    MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1",
+    MEDIA_UPSTREAM_CONNECTIONS_GLOBAL: "1",
+  };
+  const release = await scheduler.acquire("host-a.example", env);
+
+  const controller = new AbortController();
+  const cancelled = scheduler.acquire("host-b.example", env, {
+    waitMs: 500,
+    signal: controller.signal,
+  });
+  controller.abort("client closed");
+  await assert.rejects(cancelled, /wait aborted/);
+  assert.equal(scheduler.waiting, 0);
+
+  await assert.rejects(
+    scheduler.acquire("host-c.example", env, { waitMs: 10 }),
+    /wait timed out/,
+  );
+  assert.equal(scheduler.waiting, 0);
+  assert.equal(scheduler.active, 1);
+
+  release();
+  assert.equal(scheduler.active, 0);
+});
+
 // ---------- 媒体上游“每主机一条连接”租约 ----------
 
 function mediaLeaseBytes(marker = 0) {
@@ -12552,16 +12715,27 @@ function completeMediaLeaseResponse(bytes) {
   });
 }
 
-function controlledMediaLeaseResponse(bytes) {
+function controlledMediaLeaseResponse(
+  bytes,
+  initialLength = bytes.byteLength,
+) {
   let controllerRef;
   let cancelReason = null;
+  let finished = false;
+  const firstLength = Math.max(
+    0,
+    Math.min(bytes.byteLength, Math.floor(Number(initialLength) || 0)),
+  );
   const response = new Response(new ReadableStream({
     start(controller) {
       controllerRef = controller;
-      controller.enqueue(bytes);
+      if (firstLength > 0) {
+        controller.enqueue(bytes.slice(0, firstLength));
+      }
     },
     cancel(reason) {
       cancelReason = reason;
+      finished = true;
     },
   }), {
     status: 200,
@@ -12572,8 +12746,16 @@ function controlledMediaLeaseResponse(bytes) {
   });
   return {
     response,
-    close() {
+    finish() {
+      if (finished) return;
+      finished = true;
+      if (firstLength < bytes.byteLength) {
+        controllerRef.enqueue(bytes.slice(firstLength));
+      }
       controllerRef.close();
+    },
+    close() {
+      this.finish();
     },
     get cancelReason() {
       return cancelReason;
@@ -12595,7 +12777,10 @@ test("media leases serialize requests to one upstream host", async () => {
   const firstRequest = mediaLeaseRequest(hostname, "lease-serial-first");
   const secondRequest = mediaLeaseRequest(hostname, "lease-serial-second");
   const responses = [mediaLeaseBytes(1), mediaLeaseBytes(2)];
-  const firstUpstream = controlledMediaLeaseResponse(responses[0]);
+  const firstUpstream = controlledMediaLeaseResponse(
+    responses[0],
+    Math.floor(responses[0].byteLength / 2),
+  );
   let fetches = 0;
   const fetchImpl = async () => (
     fetches++ === 0
@@ -12618,7 +12803,7 @@ test("media leases serialize requests to one upstream host", async () => {
 
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.equal(fetches, 1);
-  firstUpstream.close();
+  firstUpstream.finish();
   assert.deepEqual(new Uint8Array(await first.arrayBuffer()), responses[0]);
 
   await waitForMediaLeaseCondition(() => fetches === 2);
@@ -12673,7 +12858,10 @@ test("client cancellation releases a media lease", async () => {
   const firstRequest = mediaLeaseRequest(hostname, "lease-cancel-first");
   const secondRequest = mediaLeaseRequest(hostname, "lease-cancel-second");
   const responses = [mediaLeaseBytes(5), mediaLeaseBytes(6)];
-  const firstUpstream = controlledMediaLeaseResponse(responses[0]);
+  const firstUpstream = controlledMediaLeaseResponse(
+    responses[0],
+    Math.floor(responses[0].byteLength / 2),
+  );
   let fetches = 0;
   const fetchImpl = async () => (
     fetches++ === 0
@@ -12703,6 +12891,58 @@ test("client cancellation releases a media lease", async () => {
   const second = await secondPending;
   assert.equal(second.status, 200);
   assert.deepEqual(new Uint8Array(await second.arrayBuffer()), responses[1]);
+});
+
+test("client cancellation while queued ends a media request without a synthetic 504", async () => {
+  const firstRequest = mediaLeaseRequest(
+    "p24b-ad-site-sign-sg.tiktokcdn.com",
+    "lease-queued-cancel-first",
+  );
+  const secondRequest = mediaLeaseRequest(
+    "p24c-ad-site-sign-sg.tiktokcdn.com",
+    "lease-queued-cancel-second",
+  );
+  const heldBytes = mediaLeaseBytes(6);
+  const firstUpstream = controlledMediaLeaseResponse(
+    heldBytes,
+    Math.floor(heldBytes.byteLength / 2),
+  );
+  let fetches = 0;
+  const fetchImpl = async () => {
+    fetches += 1;
+    return firstUpstream.response;
+  };
+  const env = {
+    MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1",
+    MEDIA_UPSTREAM_CONNECTIONS_GLOBAL: "1",
+  };
+
+  const first = await handleProxy(
+    firstRequest.request,
+    env,
+    {},
+    fetchImpl,
+  );
+  const controller = new AbortController();
+  const abortableSecond = new Request(secondRequest.request.url, {
+    signal: controller.signal,
+  });
+  const secondPending = handleProxy(
+    abortableSecond,
+    env,
+    {},
+    fetchImpl,
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(fetches, 1);
+  controller.abort("client closed while queued");
+
+  const second = await secondPending;
+  assert.equal(second.status, 499);
+  assert.equal(fetches, 1);
+
+  await first.body.cancel("test cleanup");
 });
 
 test("media lease read errors release the upstream connection", async () => {
@@ -12747,15 +12987,17 @@ test("media lease read errors release the upstream connection", async () => {
   assert.deepEqual(new Uint8Array(await second.arrayBuffer()), mediaBytes);
 });
 
-test("media lease short reads release the upstream connection", async () => {
+test("media lease short reads resume from the exact missing byte", async () => {
   const hostname = "p26-ad-site-sign-sg.tiktokcdn.com";
   const firstRequest = mediaLeaseRequest(hostname, "lease-short-first");
   const secondRequest = mediaLeaseRequest(hostname, "lease-short-second");
   const mediaBytes = mediaLeaseBytes(8);
   let fetches = 0;
-  const fetchImpl = async () => {
+  const continuationRanges = [];
+  const fetchImpl = async (_url, init = {}) => {
     fetches += 1;
-    if (fetches === 1) {
+    const range = init.headers?.get?.("range") || null;
+    if (!range) {
       return new Response(new ReadableStream({
         start(controller) {
           controller.enqueue(mediaBytes.slice(0, 100));
@@ -12769,7 +13011,20 @@ test("media lease short reads release the upstream connection", async () => {
         },
       });
     }
-    return completeMediaLeaseResponse(mediaBytes);
+    continuationRanges.push(range);
+    const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+    assert.ok(match, `expected a continuation Range, got ${range}`);
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    const bytes = mediaBytes.slice(start, end + 1);
+    return new Response(bytes, {
+      status: 206,
+      headers: {
+        "content-length": String(bytes.byteLength),
+        "content-range": `bytes ${start}-${end}/${mediaBytes.byteLength}`,
+        "content-type": "video/mp2t",
+      },
+    });
   };
 
   const first = await handleProxy(
@@ -12778,7 +13033,14 @@ test("media lease short reads release the upstream connection", async () => {
     {},
     fetchImpl,
   );
-  await assert.rejects(first.arrayBuffer(), /media segment truncated/);
+  assert.deepEqual(
+    new Uint8Array(await first.arrayBuffer()),
+    mediaBytes,
+  );
+  assert.deepEqual(
+    continuationRanges,
+    [`bytes=100-${mediaBytes.byteLength - 1}`],
+  );
 
   const second = await handleProxy(
     secondRequest.request,
@@ -12788,6 +13050,471 @@ test("media lease short reads release the upstream connection", async () => {
   );
   assert.equal(second.status, 200);
   assert.deepEqual(new Uint8Array(await second.arrayBuffer()), mediaBytes);
+  assert.equal(fetches, 4);
+});
+
+test("resumes across consecutive short media reads without duplicating bytes", async () => {
+  const hostname = "p26b-ad-site-sign-sg.tiktokcdn.com";
+  const firstRequest = mediaLeaseRequest(
+    hostname,
+    "lease-consecutive-short-first",
+  );
+  const mediaBytes = mediaLeaseBytes(11);
+  for (let index = 2; index < mediaBytes.byteLength; index += 1) {
+    mediaBytes[index] = index & 0xff;
+  }
+  const continuationRanges = [];
+  const fetchImpl = async (_url, init = {}) => {
+    const range = init.headers?.get?.("range") || null;
+    if (!range) {
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(mediaBytes.slice(0, 50));
+            controller.close();
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-length": String(mediaBytes.byteLength),
+            "content-type": "video/mp2t",
+          },
+        },
+      );
+    }
+
+    continuationRanges.push(range);
+    if (continuationRanges.length === 1) {
+      assert.equal(range, "bytes=50-187");
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(mediaBytes.slice(50, 100));
+            controller.close();
+          },
+        }),
+        {
+          status: 206,
+          headers: {
+            "content-length": "138",
+            "content-range": "bytes 50-187/188",
+            "content-type": "video/mp2t",
+          },
+        },
+      );
+    }
+
+    assert.equal(range, "bytes=100-187");
+    return new Response(mediaBytes.slice(100), {
+      status: 206,
+      headers: {
+        "content-length": "88",
+        "content-range": "bytes 100-187/188",
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const first = await handleProxy(
+    firstRequest.request,
+    { MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1" },
+    {},
+    fetchImpl,
+  );
+
+  assert.deepEqual(new Uint8Array(await first.arrayBuffer()), mediaBytes);
+  assert.deepEqual(continuationRanges, [
+    "bytes=50-187",
+    "bytes=100-187",
+  ]);
+});
+
+test("zero-byte continuation responses consume the failure budget", async () => {
+  const hostname = "p26b0-ad-site-sign-sg.tiktokcdn.com";
+  const request = mediaLeaseRequest(
+    hostname,
+    "lease-zero-byte-continuation",
+  );
+  const mediaBytes = mediaLeaseBytes(17);
+  let continuationFetches = 0;
+  const continuationRanges = [];
+  const fetchImpl = async (_url, init = {}) => {
+    const range = init.headers?.get?.("range") || null;
+    if (!range) {
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(mediaBytes.slice(0, 20));
+            controller.close();
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-length": String(mediaBytes.byteLength),
+            "content-type": "video/mp2t",
+          },
+        },
+      );
+    }
+
+    continuationFetches += 1;
+    continuationRanges.push(range);
+    const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+    assert.ok(match, `expected a continuation Range, got ${range}`);
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    return new Response(new ReadableStream({
+      pull(controller) {
+        controller.close();
+      },
+    }), {
+      status: 206,
+      headers: {
+        "content-range": `bytes ${start}-${end}/${mediaBytes.byteLength}`,
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const response = await handleProxy(
+    request.request,
+    {
+      MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1",
+      MEDIA_SEGMENT_STREAM_IDLE_TIMEOUT_MS: "100",
+    },
+    {},
+    fetchImpl,
+  );
+
+  await assert.rejects(
+    response.arrayBuffer(),
+    /media continuation ended without new bytes/,
+  );
+  assert.equal(continuationFetches, 3, continuationRanges.join(", "));
+});
+
+test("keeps exact media resumable after transient failures and more than three successful continuations", async () => {
+  const hostname = "p26b1-ad-site-sign-sg.tiktokcdn.com";
+  const request = mediaLeaseRequest(
+    hostname,
+    "lease-repeat-resume-progress",
+  );
+  const mediaBytes = mediaLeaseBytes(14);
+  const goodContinuationRanges = [];
+  let failNextContinuation = true;
+  let continuationFetches = 0;
+  const fetchImpl = async (_url, init = {}) => {
+    const range = init.headers?.get?.("range") || null;
+    if (!range) {
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(mediaBytes.slice(0, 20));
+            controller.close();
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-length": String(mediaBytes.byteLength),
+            "content-type": "video/mp2t",
+          },
+        },
+      );
+    }
+
+    continuationFetches += 1;
+    const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+    assert.ok(match, `expected a continuation Range, got ${range}`);
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    if (failNextContinuation) {
+      failNextContinuation = false;
+      return new Response(mediaBytes.slice(start, start + 1), {
+        status: 206,
+        headers: {
+          "content-range": `bytes ${start}-${end}/${mediaBytes.byteLength + 1}`,
+          "content-type": "video/mp2t",
+        },
+      });
+    }
+
+    failNextContinuation = true;
+    goodContinuationRanges.push(range);
+    const bytes = mediaBytes.slice(start, Math.min(end + 1, start + 28));
+    return new Response(bytes, {
+      status: 206,
+      headers: {
+        "content-range": `bytes ${start}-${end}/${mediaBytes.byteLength}`,
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const response = await handleProxy(
+    request.request,
+    { MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1" },
+    {},
+    fetchImpl,
+  );
+
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), mediaBytes);
+  assert.equal(goodContinuationRanges.length, 6);
+  assert.equal(continuationFetches, 12);
+  assert.deepEqual(goodContinuationRanges, [
+    "bytes=20-187",
+    "bytes=48-187",
+    "bytes=76-187",
+    "bytes=104-187",
+    "bytes=132-187",
+    "bytes=160-187",
+  ]);
+});
+
+test("rejects invalid continuation totals, ranges, and HTML error documents", async () => {
+  const mediaBytes = mediaLeaseBytes(15);
+  const cases = [
+    {
+      name: "bad-total",
+      headers: {
+        "content-range": "bytes 20-187/999",
+        "content-type": "video/mp2t",
+      },
+      error: /continuation rejected: total-mismatch-999-188/,
+    },
+    {
+      name: "bad-range",
+      headers: {
+        "content-range": "bytes 21-187/188",
+        "content-type": "video/mp2t",
+      },
+      error: /continuation rejected: range-mismatch-21-187/,
+    },
+    {
+      name: "html-error",
+      headers: {
+        "content-range": "bytes 20-187/188",
+        "content-type": "text/html; charset=utf-8",
+      },
+      error: /continuation rejected: error-document/,
+    },
+  ];
+
+  for (const item of cases) {
+    const request = mediaLeaseRequest(
+      "p26b2-ad-site-sign-sg.tiktokcdn.com",
+      `lease-invalid-continuation-${item.name}`,
+    );
+    let continuationFetches = 0;
+    const fetchImpl = async (_url, init = {}) => {
+      const range = init.headers?.get?.("range") || null;
+      if (!range) {
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(mediaBytes.slice(0, 20));
+              controller.close();
+            },
+          }),
+          {
+            status: 200,
+            headers: {
+              "content-length": String(mediaBytes.byteLength),
+              "content-type": "video/mp2t",
+            },
+          },
+        );
+      }
+
+      continuationFetches += 1;
+      return new Response(mediaBytes.slice(20, 40), {
+        status: 206,
+        headers: item.headers,
+      });
+    };
+
+    const response = await handleProxy(
+      request.request,
+      { MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1" },
+      {},
+      fetchImpl,
+    );
+    await assert.rejects(response.arrayBuffer(), item.error);
+    assert.equal(continuationFetches, 3);
+  }
+});
+
+test("never caches an incomplete segment after continuation validation fails", async () => {
+  const hostname = "p26b3-ad-site-sign-sg.tiktokcdn.com";
+  const request = mediaLeaseRequest(
+    hostname,
+    "lease-incomplete-not-cached",
+  );
+  const mediaBytes = mediaLeaseBytes(16);
+  let completeFetches = 0;
+  let continuationFetches = 0;
+  const fetchImpl = async (_url, init = {}) => {
+    const range = init.headers?.get?.("range") || null;
+    if (!range) {
+      completeFetches += 1;
+      if (completeFetches === 1) {
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(mediaBytes.slice(0, 20));
+              controller.close();
+            },
+          }),
+          {
+            status: 200,
+            headers: {
+              "content-length": String(mediaBytes.byteLength),
+              "content-type": "video/mp2t",
+            },
+          },
+        );
+      }
+      return completeMediaLeaseResponse(mediaBytes);
+    }
+
+    continuationFetches += 1;
+    return new Response(mediaBytes.slice(20, 40), {
+      status: 206,
+      headers: {
+        "content-range": "bytes 20-187/999",
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const first = await handleProxy(
+    request.request,
+    { MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1" },
+    {},
+    fetchImpl,
+  );
+  await assert.rejects(first.arrayBuffer(), /total-mismatch/);
+  assert.equal(continuationFetches, 3);
+
+  const retry = await handleProxy(
+    request.request,
+    { MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1" },
+    {},
+    fetchImpl,
+  );
+  assert.deepEqual(new Uint8Array(await retry.arrayBuffer()), mediaBytes);
+  assert.equal(
+    completeFetches,
+    2,
+    "the failed partial segment must not be replayed from cache",
+  );
+});
+
+test("accepts an exact identity continuation without Content-Length", async () => {
+  const hostname = "p26c-ad-site-sign-sg.tiktokcdn.com";
+  const request = mediaLeaseRequest(
+    hostname,
+    "lease-identity-continuation",
+  );
+  const mediaBytes = mediaLeaseBytes(12);
+  const continuationRanges = [];
+  const fetchImpl = async (_url, init = {}) => {
+    const range = init.headers?.get?.("range") || null;
+    if (!range) {
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(mediaBytes.slice(0, 40));
+            controller.close();
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-length": String(mediaBytes.byteLength),
+            "content-type": "video/mp2t",
+          },
+        },
+      );
+    }
+
+    continuationRanges.push(range);
+    assert.equal(range, "bytes=40-187");
+    return new Response(mediaBytes.slice(40), {
+      status: 206,
+      headers: {
+        "content-encoding": "identity",
+        "content-range": "bytes 40-187/188",
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const response = await handleProxy(
+    request.request,
+    { MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1" },
+    {},
+    fetchImpl,
+  );
+
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), mediaBytes);
+  assert.deepEqual(continuationRanges, ["bytes=40-187"]);
+});
+
+test("rejects a compressed continuation instead of mixing encoded bytes", async () => {
+  const hostname = "p26d-ad-site-sign-sg.tiktokcdn.com";
+  const request = mediaLeaseRequest(
+    hostname,
+    "lease-compressed-continuation",
+  );
+  const mediaBytes = mediaLeaseBytes(13);
+  let continuationFetches = 0;
+  const fetchImpl = async (_url, init = {}) => {
+    const range = init.headers?.get?.("range") || null;
+    if (!range) {
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(mediaBytes.slice(0, 40));
+            controller.close();
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-length": String(mediaBytes.byteLength),
+            "content-type": "video/mp2t",
+          },
+        },
+      );
+    }
+
+    continuationFetches += 1;
+    return new Response(mediaBytes.slice(40), {
+      status: 206,
+      headers: {
+        "content-encoding": "gzip",
+        "content-length": "148",
+        "content-range": "bytes 40-187/188",
+        "content-type": "video/mp2t",
+      },
+    });
+  };
+
+  const response = await handleProxy(
+    request.request,
+    { MEDIA_UPSTREAM_CONNECTIONS_PER_HOST: "1" },
+    {},
+    fetchImpl,
+  );
+
+  await assert.rejects(
+    response.arrayBuffer(),
+    /continuation rejected: content-encoding-gzip/,
+  );
+  assert.equal(continuationFetches, 3);
 });
 
 test("upstream fetch failures release the media lease immediately", async () => {

@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-18-serial-upstream-79";
+const SERVER_BUILD_ID = "2026-10-18-exact-media-resume-82";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -284,11 +284,12 @@ const MEDIA_PARALLEL_RANGE_FULL_REQUEST_RATIO = 0.9;
 // 诊断头：线上排查“服务端并行 Range 到底走了哪条路”用。客户端会忽略未知头，
 // 但必须能被客户端读到，否则并行回退了也看不出来。
 const MEDIA_PARALLEL_RANGE_HEADER = "x-catemby-parallel-range";
-// 实测 TikTok CDN 对“同一源站主机”的并发连接非常敏感：同一分片开 4 路 Range，
-// 再叠加播放器自己的并发分片请求，会出现 TLS 被上游主动关闭、503/1102、短读和
-// 花屏。这里按源站主机共享一个有界连接闸门，生产默认一次只放行一条媒体连接；
-// 不同主机各自独立，不会因为一个慢 CDN 阻塞另一个 CDN。
+// 实测 TikTok CDN 对媒体并发连接非常敏感：同一分片开 4 路 Range，再叠加播放器
+// 自己的并发分片请求，会出现 TLS 被上游主动关闭、503/1102、短读和花屏。
+// 生产默认每主机 1 条，同时整个 isolate 总数也不超过 2 条。只限制单主机并不够：
+// p16 / p19 等不同 CDN 主机可以各自开一条长连接，合起来仍会超过实例预算。
 const MEDIA_UPSTREAM_CONNECTION_MAX = 1;
+const MEDIA_UPSTREAM_CONNECTION_GLOBAL_MAX = 2;
 // 显式开启实验性服务端并行 Range 时，初始窗口本身就要 4 条连接；给内部拆分的
 // 原始响应留 1 条余量，避免探针连接和初始窗口互相等待。生产默认不启用并行。
 const MEDIA_UPSTREAM_CONNECTION_PARALLEL_MAX = 5;
@@ -298,7 +299,8 @@ const MEDIA_UPSTREAM_CONNECTION_OVERLOAD =
   "media upstream connection queue overloaded";
 const MEDIA_UPSTREAM_CONNECTION_WAIT_TIMEOUT =
   "media upstream connection wait timed out";
-const MEDIA_UPSTREAM_CONNECTION_GATES = new Map();
+const MEDIA_UPSTREAM_CONNECTION_WAIT_ABORTED =
+  "media upstream connection wait aborted";
 // 虚拟 HLS 分段：伪 TS 分片除了上游→Worker 慢，Worker→客户端这条单响应
 // 默认不把一条 TS 分片拆成多个 HLS 条目。即使切点落在 188 字节包边界，
 // 后续条目仍可能缺少 PAT/PMT 或从非关键帧开始，HLS.js 会报
@@ -1140,6 +1142,13 @@ function mediaContentTypeLooksLikeErrorDocument(contentType) {
     normalized === "application/xhtml+xml" ||
     normalized === "application/json" ||
     normalized.endsWith("+json");
+}
+
+function mediaResponseBodyIsEncoded(headers) {
+  const encoding = String(headers?.get?.("content-encoding") || "")
+    .trim()
+    .toLowerCase();
+  return Boolean(encoding && encoding !== "identity");
 }
 
 function mediaPayloadLooksLikeErrorDocument(bytes, contentType = "") {
@@ -2116,6 +2125,10 @@ function mediaProxyRequestHeaders(request, env, sourceUrl = "", options = {}) {
   const headers = new Headers({
     accept: request.headers.get("accept") ||
       "application/vnd.apple.mpegurl,application/x-mpegurl,video/*,*/*;q=0.8",
+    // Exact media ranges are only meaningful for the on-wire representation.
+    // Ask for identity encoding so Content-Length / Content-Range continue to
+    // describe the bytes we forward and can resume after a short read.
+    "accept-encoding": "identity",
     origin: getavMedia?.origin || upstream,
     "user-agent": getavMedia?.userAgent ||
       request.headers.get("user-agent") ||
@@ -2160,8 +2173,73 @@ function requestUsesMediaSegmentCache(request, sourceUrl, options = {}) {
     HLS_EMBEDDED_TS_IMAGE_PATTERN.test(pathname);
 }
 
+// 临时签名参数会在分片重试 / seek 时轮换，但字节对象并没有变化。过去直接对完整
+// URL 做哈希，token 一变就 miss，播放器会对同一分片反复回源，既增加 503 概率，
+// 也会放大偶发短读造成的花屏。这里只剥离明确的鉴权参数，保留 path 和其余查询
+// 参数，并对参数排序；像 segment=、range=、quality= 这类决定对象身份的字段仍
+// 参与 key，避免不同分片错误串缓存。
+const MEDIA_SEGMENT_VOLATILE_QUERY_PARAMS = new Set([
+  "auth",
+  "authorization",
+  "download_token",
+  "expire",
+  "expires",
+  "expires_at",
+  "expiration",
+  "hdntl",
+  "hdnts",
+  "jwt",
+  "key-pair-id",
+  "play_token",
+  "policy",
+  "sig",
+  "signature",
+  "token",
+  "x-expires",
+  "x-amz-algorithm",
+  "x-amz-credential",
+  "x-amz-date",
+  "x-amz-expires",
+  "x-amz-security-token",
+  "x-amz-signature",
+  "x-amz-signedheaders",
+  "x-goog-algorithm",
+  "x-goog-credential",
+  "x-goog-date",
+  "x-goog-expires",
+  "x-goog-security-token",
+  "x-goog-signature",
+  "x-goog-signedheaders",
+]);
+
+function mediaSegmentCacheUrl(sourceUrl) {
+  const raw = String(sourceUrl || "");
+  try {
+    const url = new URL(raw);
+    url.hash = "";
+    const stableParams = [];
+    for (const [name, value] of url.searchParams) {
+      if (MEDIA_SEGMENT_VOLATILE_QUERY_PARAMS.has(name.toLowerCase())) {
+        continue;
+      }
+      stableParams.push([name, value]);
+    }
+    stableParams.sort(([leftName, leftValue], [rightName, rightValue]) => {
+      const byName = leftName.localeCompare(rightName);
+      return byName !== 0 ? byName : leftValue.localeCompare(rightValue);
+    });
+    url.search = "";
+    for (const [name, value] of stableParams) {
+      url.searchParams.append(name, value);
+    }
+    return url.toString();
+  } catch {
+    return raw;
+  }
+}
+
 function mediaSegmentCacheKey(sourceUrl) {
-  return `media-segment-v1|${md5(String(sourceUrl || ""))}`;
+  return `media-segment-v2|${md5(mediaSegmentCacheUrl(sourceUrl))}`;
 }
 
 function mediaSegmentNeedsEmbeddedTsNormalization(sourceUrl, encrypted = false) {
@@ -2483,7 +2561,8 @@ function applyHlsVirtualSplitEnv(env) {
 }
 
 // 带空闲超时的 read：超过 idleTimeoutMs 没有新字节就 reject，避免挂死的上游
-// 把这次请求（以及实例）一起吊住。
+// 把这次请求（以及实例）一起吊住。取消底层 reader 由调用方统一处理，避免
+// reader.cancel() 反过来触发当前 ReadableStream 的 cancel 生命周期。
 function readMediaStreamChunk(reader, idleTimeoutMs) {
   if (!(idleTimeoutMs > 0)) return reader.read();
   let timer = null;
@@ -2495,6 +2574,480 @@ function readMediaStreamChunk(reader, idleTimeoutMs) {
   });
   return Promise.race([reader.read(), idle]).finally(() => {
     if (timer !== null) clearTimeout(timer);
+  });
+}
+
+// A long media response may survive several independent CDN disconnects. Once a
+// continuation starts delivering new bytes it has made progress and must not
+// consume the same budget as three consecutive rejected continuation attempts.
+// Keep both a failure fuse and a generous absolute fuse so a malicious or broken
+// upstream cannot keep one Worker request alive by endlessly making no progress.
+const MEDIA_STREAM_RESUME_MAX_CONSECUTIVE_FAILURES = 3;
+const MEDIA_STREAM_RESUME_MAX_SUCCESSES = 32;
+const MEDIA_UPSTREAM_CONTINUATION_FETCHERS = new WeakMap();
+
+function rememberMediaContinuationFetcher(response, fetchRange) {
+  if (response && typeof fetchRange === "function") {
+    MEDIA_UPSTREAM_CONTINUATION_FETCHERS.set(response, fetchRange);
+  }
+  return response;
+}
+
+function mediaContinuationFetcherFor(response) {
+  return response
+    ? MEDIA_UPSTREAM_CONTINUATION_FETCHERS.get(response) || null
+    : null;
+}
+
+function mediaContinuationResponseFailure(
+  response,
+  start,
+  end,
+  expectedTotal = 0,
+) {
+  if (!response) return "no-response";
+  if (response.status !== 206) return `status-${response.status}`;
+  if (!response.body) return "no-body";
+  if (mediaResponseBodyIsEncoded(response.headers)) {
+    return `content-encoding-${response.headers.get("content-encoding")}`;
+  }
+  if (
+    mediaContentTypeLooksLikeErrorDocument(
+      response.headers.get("content-type") || "",
+    )
+  ) {
+    return `error-document-${response.headers.get("content-type")}`;
+  }
+  const contentRange = parseMediaContentRange(
+    response.headers.get("content-range") || "",
+  );
+  if (!contentRange) return "missing-content-range";
+  if (contentRange.start !== start || contentRange.end !== end) {
+    return `range-mismatch-${contentRange.start}-${contentRange.end}`;
+  }
+  if (expectedTotal > 0) {
+    if (contentRange.total === null) {
+      return "missing-content-range-total";
+    }
+    if (contentRange.total !== expectedTotal) {
+      return `total-mismatch-${contentRange.total}-${expectedTotal}`;
+    }
+  }
+  const expectedLength = end - start + 1;
+  if (response.headers.has("content-length")) {
+    const rawContentLength = String(
+      response.headers.get("content-length") || "",
+    ).trim();
+    const contentLength = Number(rawContentLength);
+    if (
+      !/^\d+$/.test(rawContentLength) ||
+      !Number.isSafeInteger(contentLength) ||
+      contentLength !== expectedLength
+    ) {
+      return `length-mismatch-${rawContentLength}-${expectedLength}`;
+    }
+  }
+  return "";
+}
+
+async function cancelMediaResponseBody(response, reason = undefined) {
+  try {
+    await response?.body?.cancel?.(reason);
+  } catch {}
+}
+
+// 将已经探测过的前缀、剩余块和原始 reader 合成一条连续的初始流。后续若发生
+// 短读，由 resumableExactMediaStreamBody 从当前绝对偏移继续，而不是重复前缀。
+function mediaBodyFromInitialChunks(
+  prefix,
+  remainder,
+  reader,
+  complete,
+) {
+  let prefixOffset = 0;
+  let remainderOffset = 0;
+  let sourceComplete = complete === true;
+  return new ReadableStream({
+    async pull(controller) {
+      if (prefixOffset < (prefix?.byteLength || 0)) {
+        const chunk = prefix.subarray(prefixOffset);
+        prefixOffset = prefix.byteLength;
+        controller.enqueue(chunk);
+        return;
+      }
+      if (remainderOffset < (remainder?.byteLength || 0)) {
+        const chunk = remainder.subarray(remainderOffset);
+        remainderOffset = remainder.byteLength;
+        controller.enqueue(chunk);
+        return;
+      }
+      if (sourceComplete || !reader) {
+        controller.close();
+        return;
+      }
+      let result;
+      try {
+        result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
+      } catch (error) {
+        try {
+          await reader.cancel(error);
+        } catch {}
+        controller.error(error);
+        return;
+      }
+      if (result.done) {
+        sourceComplete = true;
+        controller.close();
+        return;
+      }
+      controller.enqueue(result.value);
+    },
+    cancel(reason) {
+      return reader?.cancel?.(reason);
+    },
+  });
+}
+
+// 字节精确、可续传的媒体流。已经发送给客户端的字节永远不会重发：
+// 短读或读错误后，用 Range 从 delivered 对应的绝对偏移重新获取剩余区间。
+// 续传响应必须严格匹配请求区间、总长度和 Content-Length，否则整条流失败。
+function resumableExactMediaStreamBody(body, expectedBytes, options = {}) {
+  const expected = Math.max(0, Math.floor(Number(expectedBytes) || 0));
+  const absoluteStart = Math.floor(Number(options.absoluteStart) || 0);
+  const skipBytes = Math.max(0, Math.floor(Number(options.skipBytes) || 0));
+  const expectedTotal = Math.max(
+    0,
+    Math.floor(Number(options.expectedTotal) || 0),
+  );
+  const requestedMaxConsecutiveFailures = Number(
+    options.maxConsecutiveResumeFailures ?? options.maxResumes,
+  );
+  const maxConsecutiveFailures =
+    Number.isFinite(requestedMaxConsecutiveFailures)
+      ? Math.max(0, Math.floor(requestedMaxConsecutiveFailures))
+      : MEDIA_STREAM_RESUME_MAX_CONSECUTIVE_FAILURES;
+  const requestedMaxSuccessfulResumes = Number(
+    options.maxSuccessfulResumes,
+  );
+  const maxSuccessfulResumes =
+    Number.isFinite(requestedMaxSuccessfulResumes)
+      ? Math.max(0, Math.floor(requestedMaxSuccessfulResumes))
+      : MEDIA_STREAM_RESUME_MAX_SUCCESSES;
+  const fetchRange = typeof options.fetchRange === "function"
+    ? options.fetchRange
+    : null;
+  const onChunk = typeof options.onChunk === "function"
+    ? options.onChunk
+    : null;
+  const onComplete = typeof options.onComplete === "function"
+    ? options.onComplete
+    : null;
+  const validateComplete = typeof options.validateComplete === "function"
+    ? options.validateComplete
+    : null;
+  const validateChunk = typeof options.validateChunk === "function"
+    ? options.validateChunk
+    : null;
+  const signal = options.signal || null;
+  const absoluteEnd = expected > 0
+    ? absoluteStart + skipBytes + expected - 1
+    : -1;
+  if (
+    expected > 0 &&
+    (
+      !Number.isSafeInteger(absoluteStart) ||
+      absoluteStart < 0 ||
+      !Number.isSafeInteger(absoluteEnd)
+    )
+  ) {
+    return new ReadableStream({
+      start(controller) {
+        controller.error(new Error("invalid media stream byte range"));
+      },
+    });
+  }
+
+  let reader = body?.getReader?.() || null;
+  let delivered = 0;
+  let skipRemaining = skipBytes;
+  let consecutiveResumeFailures = 0;
+  let successfulResumes = 0;
+  let continuationAwaitingProgress = false;
+  let finished = false;
+  let primaryError = null;
+  let continuationValidationError = null;
+  let truncationError = null;
+  let lastError = null;
+
+  const resumeFailure = (fallback) => {
+    return primaryError ||
+      continuationValidationError ||
+      truncationError ||
+      lastError ||
+      fallback;
+  };
+
+  const fail = async (controller, error) => {
+    if (finished) return;
+    finished = true;
+    try {
+      await reader?.cancel?.(error);
+    } catch {}
+    reader = null;
+    controller.error(error);
+  };
+
+  const noteContinuationProgress = () => {
+    if (!continuationAwaitingProgress) return;
+    continuationAwaitingProgress = false;
+    primaryError = null;
+    continuationValidationError = null;
+    truncationError = null;
+    lastError = null;
+    successfulResumes += 1;
+    consecutiveResumeFailures = 0;
+  };
+
+  const noteContinuationWithoutProgress = () => {
+    if (!continuationAwaitingProgress) return;
+    continuationAwaitingProgress = false;
+    consecutiveResumeFailures += 1;
+    continuationValidationError =
+      new Error("media continuation ended without new bytes");
+    lastError = continuationValidationError;
+  };
+
+  const resume = async () => {
+    if (!fetchRange || expected <= 0 || delivered >= expected) return false;
+    const targetStart = absoluteStart +
+      (skipBytes - skipRemaining) +
+      delivered;
+    if (targetStart > absoluteEnd) return false;
+    while (
+      consecutiveResumeFailures < maxConsecutiveFailures &&
+      successfulResumes < maxSuccessfulResumes
+    ) {
+      if (signal?.aborted) {
+        lastError = new Error("media stream aborted");
+        primaryError = primaryError || lastError;
+        return false;
+      }
+      try {
+        await reader?.cancel?.("media continuation requested");
+      } catch {}
+      reader = null;
+      let response = null;
+      try {
+        response = await fetchRange(targetStart, absoluteEnd);
+      } catch (error) {
+        consecutiveResumeFailures += 1;
+        lastError = error;
+        continue;
+      }
+      const failure = mediaContinuationResponseFailure(
+        response,
+        targetStart,
+        absoluteEnd,
+        expectedTotal,
+      );
+      if (failure) {
+        consecutiveResumeFailures += 1;
+        const rejectedRange = parseMediaContentRange(
+          response?.headers?.get?.("content-range") || "",
+        );
+        const ignoredContinuationRange =
+          rejectedRange &&
+          targetStart !== absoluteStart &&
+          rejectedRange.start === absoluteStart &&
+          rejectedRange.end === absoluteEnd;
+        const transportFailure =
+          failure.startsWith("status-") || failure === "no-response";
+        continuationValidationError = ignoredContinuationRange ||
+            transportFailure
+          ? continuationValidationError
+          : new Error(`media continuation rejected: ${failure}`);
+        lastError = new Error(
+          ignoredContinuationRange
+            ? `media continuation ignored range: ${failure}`
+            : `media continuation rejected: ${failure}`,
+        );
+        await cancelMediaResponseBody(response, failure);
+        continue;
+      }
+      reader = response.body.getReader();
+      // A validated 206 only opens a candidate continuation. It becomes a
+      // successful resume after the first newly delivered byte; otherwise a
+      // zero-length 206 could refresh the failure budget forever.
+      continuationAwaitingProgress = true;
+      return true;
+    }
+    if (successfulResumes >= maxSuccessfulResumes) {
+      lastError = new Error(
+        `media continuation limit reached: ${successfulResumes}`,
+      );
+    }
+    return false;
+  };
+
+  return new ReadableStream({
+    async pull(controller) {
+      while (!finished) {
+        if (delivered >= expected && expected > 0) {
+          finished = true;
+          try {
+            await reader?.cancel?.("media stream complete");
+          } catch {}
+          reader = null;
+          try {
+            await onComplete?.();
+          } catch (error) {
+            controller.error(error);
+            return;
+          }
+          controller.close();
+          return;
+        }
+        if (!reader) {
+          if (expected <= 0) {
+            finished = true;
+            try {
+              await onComplete?.();
+            } catch (error) {
+              controller.error(error);
+              return;
+            }
+            controller.close();
+            return;
+          }
+          if (!await resume()) {
+            await fail(
+              controller,
+              resumeFailure(
+                new Error(`media range truncated: ${delivered}/${expected}`),
+              ),
+            );
+            return;
+          }
+          continue;
+        }
+
+        let result;
+        try {
+          result = await readMediaStreamChunk(
+            reader,
+            options.idleTimeoutMs ?? mediaStreamIdleTimeoutMs,
+          );
+        } catch (error) {
+          if (finished) return;
+          noteContinuationWithoutProgress();
+          lastError = error;
+          primaryError = error;
+          try {
+            await reader.cancel(error);
+          } catch {}
+          reader = null;
+          if (!await resume()) {
+            await fail(
+              controller,
+              resumeFailure(
+                new Error(`media range interrupted: ${delivered}/${expected}`),
+              ),
+            );
+            return;
+          }
+          continue;
+        }
+
+        // A client may cancel while readMediaStreamChunk() is waiting on the
+        // upstream. That read can resolve after cancellation, so do not let it
+        // start a continuation request for a playback session that already ended.
+        if (finished) return;
+        if (result.done) {
+          noteContinuationWithoutProgress();
+          reader = null;
+          if (expected > 0 && delivered < expected) {
+            truncationError =
+              new Error(`media range truncated: ${delivered}/${expected}`);
+            if (!await resume()) {
+              await fail(
+                controller,
+                resumeFailure(
+                  new Error(
+                    `media range truncated: ${delivered}/${expected}`,
+                  ),
+                ),
+              );
+              return;
+            }
+            continue;
+          }
+          if (expected <= 0) {
+            finished = true;
+            try {
+              validateComplete?.(delivered);
+              await onComplete?.();
+            } catch (error) {
+              controller.error(error);
+              return;
+            }
+            controller.close();
+          }
+          return;
+        }
+
+        const rawChunk = result.value instanceof Uint8Array
+          ? result.value
+          : new Uint8Array(result.value);
+        if (!rawChunk.byteLength) continue;
+        let chunk = rawChunk;
+        if (skipRemaining > 0) {
+          if (chunk.byteLength <= skipRemaining) {
+            skipRemaining -= chunk.byteLength;
+            continue;
+          }
+          chunk = chunk.subarray(skipRemaining);
+          skipRemaining = 0;
+        }
+        const remaining = expected > 0
+          ? expected - delivered
+          : chunk.byteLength;
+        if (expected > 0 && chunk.byteLength > remaining) {
+          chunk = chunk.subarray(0, remaining);
+        }
+        try {
+          await validateChunk?.(chunk, delivered);
+          await onChunk?.(chunk, delivered);
+        } catch (error) {
+          await fail(controller, error);
+          return;
+        }
+        if (chunk.byteLength > 0) noteContinuationProgress();
+        delivered += chunk.byteLength;
+        controller.enqueue(chunk);
+        if (expected > 0 && delivered >= expected) {
+          finished = true;
+          try {
+            await reader?.cancel?.("media range complete");
+          } catch {}
+          reader = null;
+          try {
+            await onComplete?.();
+          } catch (error) {
+            controller.error(error);
+            return;
+          }
+          controller.close();
+        }
+        return;
+      }
+    },
+    async cancel(reason) {
+      finished = true;
+      try {
+        await reader?.cancel?.(reason);
+      } catch {}
+      reader = null;
+    },
   });
 }
 
@@ -2644,7 +3197,7 @@ function parallelMediaRangePartFailure(response, part, expectedTotal = 0) {
   if (!response) return "no-response";
   if (response.status !== 206) return `status-${response.status}`;
   if (!response.body) return "no-body";
-  if (response.headers.has("content-encoding")) {
+  if (mediaResponseBodyIsEncoded(response.headers)) {
     return `content-encoding-${response.headers.get("content-encoding")}`;
   }
   if (
@@ -2732,22 +3285,180 @@ function mediaUpstreamConnectionLimit(env) {
     : MEDIA_UPSTREAM_CONNECTION_MAX;
 }
 
-function mediaUpstreamConnectionGate(host, env) {
-  const max = mediaUpstreamConnectionLimit(env);
-  const key = `${host}|${max}`;
-  let gate = MEDIA_UPSTREAM_CONNECTION_GATES.get(key);
-  if (!gate) {
-    gate = createConcurrencyGate({
-      max,
-      queueLimit: MEDIA_UPSTREAM_CONNECTION_QUEUE_LIMIT,
-      waitMs: MEDIA_UPSTREAM_CONNECTION_WAIT_MS,
-      overloadMessage: MEDIA_UPSTREAM_CONNECTION_OVERLOAD,
-      waitTimeoutMessage: MEDIA_UPSTREAM_CONNECTION_WAIT_TIMEOUT,
-    });
-    MEDIA_UPSTREAM_CONNECTION_GATES.set(key, gate);
+function mediaUpstreamGlobalConnectionLimit(env) {
+  const configured = Math.floor(
+    Number(env?.MEDIA_UPSTREAM_CONNECTIONS_GLOBAL),
+  );
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.min(16, Math.max(1, configured));
   }
-  return gate;
+  const parallel = String(env?.MEDIA_PARALLEL_RANGE_ENABLED || "")
+    .trim()
+    .toLowerCase();
+  if (/^(?:1|true|yes|on)$/.test(parallel)) {
+    return MEDIA_UPSTREAM_CONNECTION_PARALLEL_MAX + 1;
+  }
+  return MEDIA_UPSTREAM_CONNECTION_GLOBAL_MAX;
 }
+
+// 媒体请求不能分别套“全局锁”和“主机锁”：外层拿到全局槽后如果卡在主机锁上，
+// 会占着预算却不开连接，随后同主机的其他请求也可能形成死锁。这里用一个调度器
+// 同时维护两维占用。pump 会跳过暂时被主机限制的 waiter，让其他主机继续前进，
+// 因此一个慢 CDN 不会堵住整个队列。
+function createMediaUpstreamScheduler({
+  queueLimit = MEDIA_UPSTREAM_CONNECTION_QUEUE_LIMIT,
+} = {}) {
+  const maxWaiters = Math.max(0, Math.floor(Number(queueLimit) || 0));
+  let active = 0;
+  let generation = 0;
+  const activeByHost = new Map();
+  const waiters = new Set();
+
+  const hostActive = (host) => activeByHost.get(host) || 0;
+  const canGrant = (waiter) =>
+    active < waiter.globalMax &&
+    hostActive(waiter.host) < waiter.hostMax;
+
+  const removeWaiter = (waiter, error = null) => {
+    if (!waiters.delete(waiter) || waiter.settled) return false;
+    waiter.settled = true;
+    clearTimeout(waiter.timer);
+    waiter.signal?.removeEventListener?.("abort", waiter.onAbort);
+    if (error) {
+      waiter.reject(error);
+    }
+    return true;
+  };
+
+  function pump() {
+    for (const waiter of Array.from(waiters)) {
+      if (!canGrant(waiter)) continue;
+      waiters.delete(waiter);
+      waiter.settled = true;
+      clearTimeout(waiter.timer);
+      waiter.signal?.removeEventListener?.("abort", waiter.onAbort);
+      active += 1;
+      activeByHost.set(waiter.host, hostActive(waiter.host) + 1);
+      const leaseGeneration = generation;
+      let released = false;
+      waiter.resolve(() => {
+        if (released) return;
+        released = true;
+        // reset() invalidates old leases. This matters when a test/hot-reload
+        // starts a fresh scheduler while a previous body is still unwinding.
+        if (leaseGeneration !== generation) return;
+        active = Math.max(0, active - 1);
+        const remaining = hostActive(waiter.host) - 1;
+        if (remaining > 0) {
+          activeByHost.set(waiter.host, remaining);
+        } else {
+          activeByHost.delete(waiter.host);
+        }
+        pump();
+      });
+    }
+  }
+
+  const acquire = ({
+    host,
+    globalMax,
+    hostMax,
+    waitMs = MEDIA_UPSTREAM_CONNECTION_WAIT_MS,
+    signal = null,
+  }) => new Promise((resolve, reject) => {
+    const normalizedHost = String(host || "").toLowerCase();
+    const waiter = {
+      host: normalizedHost,
+      globalMax: Math.max(1, Math.floor(Number(globalMax) || 1)),
+      hostMax: Math.max(1, Math.floor(Number(hostMax) || 1)),
+      timer: null,
+      signal,
+      onAbort: null,
+      settled: false,
+      resolve: null,
+      reject,
+    };
+    const abortError = () => {
+      const error = new Error(MEDIA_UPSTREAM_CONNECTION_WAIT_ABORTED);
+      error.name = "AbortError";
+      return error;
+    };
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    if (canGrant(waiter)) {
+      waiter.settled = true;
+      active += 1;
+      activeByHost.set(normalizedHost, hostActive(normalizedHost) + 1);
+      const leaseGeneration = generation;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        if (leaseGeneration !== generation) return;
+        active = Math.max(0, active - 1);
+        const remaining = hostActive(normalizedHost) - 1;
+        if (remaining > 0) {
+          activeByHost.set(normalizedHost, remaining);
+        } else {
+          activeByHost.delete(normalizedHost);
+        }
+        pump();
+      });
+      return;
+    }
+    if (waiters.size >= maxWaiters) {
+      reject(new Error(MEDIA_UPSTREAM_CONNECTION_OVERLOAD));
+      return;
+    }
+
+    waiter.resolve = (release) => resolve(release);
+    waiter.onAbort = () => {
+      removeWaiter(waiter, abortError());
+    };
+    signal?.addEventListener?.("abort", waiter.onAbort, { once: true });
+    waiters.add(waiter);
+    const budget = Math.max(0, Number(waitMs) || 0);
+    waiter.timer = setTimeout(() => {
+      removeWaiter(
+        waiter,
+        new Error(MEDIA_UPSTREAM_CONNECTION_WAIT_TIMEOUT),
+      );
+    }, budget);
+  });
+
+  return {
+    get active() {
+      return active;
+    },
+    get waiting() {
+      return waiters.size;
+    },
+    activeByHost(host) {
+      return hostActive(String(host || "").toLowerCase());
+    },
+    acquire(host, env, options = {}) {
+      return acquire({
+        host,
+        globalMax: mediaUpstreamGlobalConnectionLimit(env),
+        hostMax: mediaUpstreamConnectionLimit(env),
+        waitMs: options.waitMs,
+        signal: options.signal,
+      });
+    },
+    reset() {
+      generation += 1;
+      for (const waiter of Array.from(waiters)) {
+        removeWaiter(waiter, new Error("media upstream scheduler reset"));
+      }
+      active = 0;
+      activeByHost.clear();
+    },
+  };
+}
+
+const MEDIA_UPSTREAM_SCHEDULER = createMediaUpstreamScheduler();
 
 // 连接租约不能随着 fetch() 返回响应头就释放：真正的上游套接字仍然被响应体
 // 占用。这里把租约绑定到 body 的完成/取消/异常，确保同一主机不会因为只拿到
@@ -2783,11 +3494,12 @@ function leaseMediaUpstreamResponseBody(response, releaseLease) {
       }
     },
     async cancel(reason) {
+      // A cancellation may itself wait on a dead upstream socket. Release the
+      // scheduler slot first so a replacement Range request can make progress.
+      release();
       try {
         await reader.cancel(reason);
-      } finally {
-        release();
-      }
+      } catch {}
     },
   });
   return new Response(body, {
@@ -3653,7 +4365,7 @@ async function readMediaBodyFullyWithIdleTimeout(
 // 文件都发回来。播放器拿到的 Content-Range 却远大于实际需要的 1KB/几 MB，
 // 表现为读取失控、卡顿、退出时连接被拖挂。这里在代理出口把响应体截到
 // 客户端请求的精确区间，并同步修正响应头。
-function trimMediaRangeResponseBody(upstream, request, headers) {
+function trimMediaRangeResponseBody(upstream, request, headers, options = {}) {
   const rangeHeader = request.headers.get("range");
   const contentRange = parseMediaContentRange(
     headers.get("content-range") || "",
@@ -3682,88 +4394,30 @@ function trimMediaRangeResponseBody(upstream, request, headers) {
   headers.set("content-length", String(requestedEnd - requestedStart + 1));
   headers.delete("transfer-encoding");
 
-  const reader = upstream.body?.getReader();
-  if (!reader) return { body: null, status: 206 };
-  let skip = requestedStart - contentRange.start;
-  let remaining = requestedEnd - requestedStart + 1;
-  const body = new ReadableStream({
-    async pull(controller) {
-      while (skip > 0) {
-        let result;
-        try {
-          result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
-        } catch (error) {
-          try {
-            await reader.cancel(error);
-          } catch {}
-          controller.error(error);
-          return;
-        }
-        if (result.done) {
-          controller.error(
-            new Error(`media range truncated before requested start`),
-          );
-          return;
-        }
-        if (result.value.byteLength <= skip) {
-          skip -= result.value.byteLength;
-          continue;
-        }
-        const usable = result.value.subarray(skip);
-        skip = 0;
-        const chunk = remaining < usable.byteLength
-          ? usable.subarray(0, remaining)
-          : usable;
-        remaining -= chunk.byteLength;
-        controller.enqueue(chunk);
-        return;
-      }
-      if (remaining <= 0) {
-        controller.close();
-        await reader.cancel().catch(() => {});
-        return;
-      }
-      let result;
-      try {
-        result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
-      } catch (error) {
-        try {
-          await reader.cancel(error);
-        } catch {}
-        controller.error(error);
-        return;
-      }
-      if (result.done) {
-        controller.error(
-          new Error(
-            `media range truncated: ${
-              requestedEnd - requestedStart + 1 - remaining
-            }/${requestedEnd - requestedStart + 1}`,
-          ),
-        );
-        return;
-      }
-      const chunk = remaining < result.value.byteLength
-        ? result.value.subarray(0, remaining)
-        : result.value;
-      remaining -= chunk.byteLength;
-      controller.enqueue(chunk);
-      if (remaining <= 0) {
-        controller.close();
-        await reader.cancel().catch(() => {});
-      }
+  if (!upstream.body) return { body: null, status: 206 };
+  const body = resumableExactMediaStreamBody(
+    upstream.body,
+    requestedEnd - requestedStart + 1,
+    {
+      absoluteStart: contentRange.start,
+      skipBytes: requestedStart - contentRange.start,
+      expectedTotal: contentRange.total ?? 0,
+      fetchRange: options.fetchRange ||
+        mediaContinuationFetcherFor(upstream),
+      signal: options.signal,
+      maxResumes: options.maxResumes,
     },
-    cancel(reason) {
-      return reader.cancel(reason);
-    },
-  });
-  return { body, status: 206 };
+  );
+  return {
+    body,
+    status: 206,
+  };
 }
 
-function embeddedTsMappedResponse(upstream, metadata, range) {
+function embeddedTsMappedResponse(upstream, metadata, range, options = {}) {
   if (
     !upstream.body ||
-    upstream.headers.has("content-encoding") ||
+    mediaResponseBodyIsEncoded(upstream.headers) ||
     upstream.headers.get(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER) === "1"
   ) {
     return null;
@@ -3788,17 +4442,29 @@ function embeddedTsMappedResponse(upstream, metadata, range) {
   );
   headers.set("content-type", metadata.contentType || "video/mp2t");
   headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
-  return new Response(
-    guardExactMediaStreamBody(
-      upstream.body,
-      range.end - range.start + 1,
-    ),
+  const upstreamRange = parseMediaContentRange(
+    upstream.headers.get("content-range") || "",
+  );
+  const mappedStart = range.start + metadata.prefixLength;
+  const absoluteStart = upstreamRange?.start ?? mappedStart;
+  const body = resumableExactMediaStreamBody(
+    upstream.body,
+    range.end - range.start + 1,
     {
-      status: 206,
-      statusText: "Partial Content",
-      headers,
+      absoluteStart,
+      skipBytes: Math.max(0, mappedStart - absoluteStart),
+      expectedTotal: metadata.upstreamTotal,
+      fetchRange: options.fetchRange ||
+        mediaContinuationFetcherFor(upstream),
+      signal: options.signal,
+      maxResumes: options.maxResumes,
     },
   );
+  return new Response(body, {
+    status: 206,
+    statusText: "Partial Content",
+    headers,
+  });
 }
 
 function normalizedMediaSegmentBytes(bytes, contentType = "") {
@@ -4054,8 +4720,6 @@ function streamMediaBodyWithPrefix(
   const cacheStatus = Number(options.cacheStatus) || 200;
   const cacheStatusText = String(options.cacheStatusText || "OK");
   const cacheContentRange = String(options.cacheContentRange || "");
-  // 只有“已经确认是 MPEG-TS”的流才做包对齐校验：上游不给 Content-Length
-  // 时 expectedBytes=0，旧实现没有任何长度可核对，chunked 断流会被静默放过。
   const expectMpegTs = options.expectMpegTs === true;
   const canCache = Boolean(
     cacheKey &&
@@ -4065,16 +4729,11 @@ function streamMediaBodyWithPrefix(
   );
   const cacheBytes = canCache ? new Uint8Array(expectedBytes) : null;
   let cacheOffset = 0;
-  let cacheComplete = Boolean(cacheBytes);
-  let delivered = 0;
-  let prefixSent = false;
-  let remainderSent = !remainder?.byteLength;
-  let streamComplete = complete;
 
   const appendCache = (chunk) => {
-    if (!cacheBytes || !cacheComplete || !chunk?.byteLength) return;
+    if (!cacheBytes || !chunk?.byteLength) return;
     if (cacheOffset + chunk.byteLength > cacheBytes.byteLength) {
-      cacheComplete = false;
+      cacheOffset = -1;
       return;
     }
     cacheBytes.set(chunk, cacheOffset);
@@ -4084,7 +4743,7 @@ function streamMediaBodyWithPrefix(
   const storeCache = () => {
     if (
       !cacheBytes ||
-      !cacheComplete ||
+      cacheOffset < 0 ||
       cacheOffset !== cacheBytes.byteLength
     ) {
       return;
@@ -4099,90 +4758,35 @@ function streamMediaBodyWithPrefix(
     });
   };
 
-  // 流结束时判定分片是否被上游截断：
-  //  - expectedBytes>0（有 Content-Length / Content-Range）：按声明长度核对；
-  //  - expectedBytes=0（chunked 上游）：改用 MPEG-TS 包对齐核对。返回非空即
-  //    表示“这段不完整”，调用方让流失败，播放器会重试这一段。
-  const truncationError = () => {
-    if (expectedBytes > 0 && delivered < expectedBytes) {
-      return new Error(`media segment truncated: ${delivered}/${expectedBytes}`);
-    }
+  const validateComplete = (delivered) => {
     if (
       expectedBytes === 0 &&
       expectMpegTs &&
       mpegTsLengthTruncated(delivered)
     ) {
-      return new Error(
+      throw new Error(
         `media segment truncated: ${delivered}B not MPEG-TS aligned`,
       );
     }
-    return null;
   };
 
-  const body = new ReadableStream({
-    async pull(controller) {
-      if (!prefixSent) {
-        prefixSent = true;
-        if (prefix?.byteLength) {
-          delivered += prefix.byteLength;
-          appendCache(prefix);
-          controller.enqueue(prefix);
-        }
-        return;
-      }
-      if (!remainderSent) {
-        remainderSent = true;
-        delivered += remainder.byteLength;
-        appendCache(remainder);
-        controller.enqueue(remainder);
-        return;
-      }
-      if (streamComplete) {
-        const truncatedError = truncationError();
-        if (truncatedError) {
-          cacheComplete = false;
-          controller.error(truncatedError);
-          return;
-        }
-        storeCache();
-        controller.close();
-        return;
-      }
-
-      let result;
-      try {
-        result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
-      } catch (error) {
-        try {
-          await reader?.cancel?.(error);
-        } catch {}
-        controller.error(error);
-        return;
-      }
-      if (result.done) {
-        streamComplete = true;
-        const truncatedError = truncationError();
-        if (truncatedError) {
-          cacheComplete = false;
-          controller.error(truncatedError);
-          return;
-        }
-        storeCache();
-        controller.close();
-        return;
-      }
-      const chunk = result.value instanceof Uint8Array
-        ? result.value
-        : new Uint8Array(result.value);
-      delivered += chunk.byteLength;
-      appendCache(chunk);
-      controller.enqueue(chunk);
-    },
-    cancel(reason) {
-      return reader?.cancel?.(reason);
-    },
+  const initialBody = mediaBodyFromInitialChunks(
+    prefix,
+    remainder,
+    reader,
+    complete,
+  );
+  return resumableExactMediaStreamBody(initialBody, expectedBytes, {
+    absoluteStart: options.absoluteStart,
+    expectedTotal: options.expectedTotal,
+    fetchRange: options.fetchRange,
+    maxResumes: options.maxResumes,
+    signal: options.signal,
+    validateChunk: options.validateChunk,
+    onChunk: appendCache,
+    validateComplete,
+    onComplete: storeCache,
   });
-  return body;
 }
 
 async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) {
@@ -4211,7 +4815,22 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
   // fetch 会自动解压响应体。压缩响应不能沿用上游 Content-Length /
   // Content-Range 推导剥离后的长度，否则客户端会按错误长度提前截断，
   // 表现为播放卡住或花屏。这里只对未压缩响应做精确长度映射。
-  const contentEncoded = upstream.headers.has("content-encoding");
+  const contentEncoded = mediaResponseBodyIsEncoded(upstream.headers);
+  const upstreamBodyBytes = contentEncoded
+    ? 0
+    : expectedUpstreamBodyBytes(upstream.headers);
+  const parsedUpstreamRange = contentEncoded
+    ? null
+    : parseMediaContentRange(
+      upstream.headers.get("content-range") || "",
+    );
+  const sourceStart = parsedUpstreamRange?.start ?? 0;
+  const sourceTotal = parsedUpstreamRange?.total ??
+    (
+      upstream.status === 200 && upstreamBodyBytes > 0
+        ? upstreamBodyBytes
+        : 0
+    );
   if (embeddedOffset < 0) {
     const headers = mediaProxyResponseHeaders(upstream);
     // 这里已经检查过前 512 字节并确认不是伪 TS 分片。带上内部标记，
@@ -4222,7 +4841,15 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
       prefixResult.remainder,
       prefixResult.reader,
       prefixResult.complete,
-      { cacheKey: options.cacheKey || "" },
+      {
+        cacheKey: "",
+        cacheLimit: 0,
+        expectedBytes: upstreamBodyBytes,
+        expectedTotal: sourceTotal,
+        absoluteStart: sourceStart,
+        fetchRange: options.fetchRange,
+        signal: options.signal,
+      },
     );
     return {
       embedded: false,
@@ -4234,9 +4861,6 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
     };
   }
 
-  const upstreamBodyBytes = contentEncoded
-    ? 0
-    : expectedUpstreamBodyBytes(upstream.headers);
   const normalizedBodyBytes = upstreamBodyBytes > 0
     ? Math.max(0, upstreamBodyBytes - embeddedOffset)
     : 0;
@@ -4296,6 +4920,10 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
   // Content-Length（normalizedBodyBytes=0）时，靠包对齐兜底检测截断。
   const cacheOptions = {
     expectedBytes: normalizedBodyBytes,
+    expectedTotal: sourceTotal,
+    absoluteStart: sourceStart + embeddedOffset,
+    fetchRange: options.fetchRange,
+    signal: options.signal,
     expectMpegTs: true,
     cacheKey,
     cacheLimit: MAX_CACHED_MEDIA_SEGMENT_BYTES,
@@ -4575,27 +5203,21 @@ function mediaSegmentRecordForBytes(upstream, bytes) {
   };
 }
 
-async function streamCompleteMediaSegmentResponse(upstream, cacheKey) {
+async function streamCompleteMediaSegmentResponse(
+  upstream,
+  cacheKey,
+  options = {},
+) {
   if (
     upstream.status !== 200 ||
     !upstream.body ||
-    upstream.headers.has("content-encoding")
+    mediaResponseBodyIsEncoded(upstream.headers)
   ) {
     return null;
   }
   const contentLength = Number(upstream.headers.get("content-length"));
   if (!Number.isSafeInteger(contentLength) || contentLength <= 0) {
     return null;
-  }
-  if (contentLength > MAX_CACHED_MEDIA_SEGMENT_BYTES) {
-    return new Response(
-      guardExactMediaStreamBody(upstream.body, contentLength),
-      {
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers: mediaProxyResponseHeaders(upstream),
-      },
-    );
   }
   const contentType = upstream.headers.get("content-type") || "";
   if (mediaContentTypeLooksLikeErrorDocument(contentType)) {
@@ -4605,80 +5227,43 @@ async function streamCompleteMediaSegmentResponse(upstream, cacheKey) {
     return mediaUpstreamInvalidResponse();
   }
 
-  const cacheBytes = new Uint8Array(contentLength);
+  const shouldCache = Boolean(
+    cacheKey &&
+    contentLength <= MAX_CACHED_MEDIA_SEGMENT_BYTES,
+  );
+  const cacheBytes = shouldCache ? new Uint8Array(contentLength) : null;
   let cacheOffset = 0;
-  let cacheComplete = true;
-  let delivered = 0;
-  let inspectedPrefix = false;
-  const reader = upstream.body.getReader();
-  const body = new ReadableStream({
-    async pull(controller) {
-      let result;
-      try {
-        result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
-      } catch (error) {
-        try {
-          await reader.cancel(error);
-        } catch {}
-        controller.error(error);
-        return;
+  let stored = false;
+  const store = () => {
+    if (stored || !cacheBytes || cacheOffset !== cacheBytes.byteLength) return;
+    stored = true;
+    MEDIA_SEGMENT_BODY_CACHE.write(
+      cacheKey,
+      mediaSegmentRecordForBytes(upstream, cacheBytes),
+    );
+  };
+  const body = resumableExactMediaStreamBody(upstream.body, contentLength, {
+    absoluteStart: 0,
+    expectedTotal: contentLength,
+    fetchRange: options.fetchRange,
+    signal: options.signal,
+    validateChunk: (chunk, offset) => {
+      if (
+        offset === 0 &&
+        mediaPayloadLooksLikeErrorDocument(chunk, contentType)
+      ) {
+        throw new Error("upstream media error document");
       }
-      if (result.done) {
-        if (delivered < contentLength) {
-          // 声明了 content-length 却提前结束（上游断流），别把截断的分片
-          // 当完整数据发出去，否则播放器会卡在半段上。
-          controller.error(
-            new Error(`media segment truncated: ${delivered}/${contentLength}`),
-          );
-          return;
-        }
-        if (cacheComplete && cacheOffset === cacheBytes.byteLength) {
-          MEDIA_SEGMENT_BODY_CACHE.write(
-            cacheKey,
-            mediaSegmentRecordForBytes(upstream, cacheBytes),
-          );
-        }
-        controller.close();
-        return;
-      }
-      const chunk = result.value instanceof Uint8Array
-        ? result.value
-        : new Uint8Array(result.value);
-      if (!inspectedPrefix) {
-        inspectedPrefix = true;
-        if (mediaPayloadLooksLikeErrorDocument(chunk, contentType)) {
-          cacheComplete = false;
-          try {
-            await reader.cancel();
-          } catch {}
-          controller.error(new Error("upstream media error document"));
-          return;
-        }
-      }
-      delivered += chunk.byteLength;
-      if (delivered > contentLength) {
-        cacheComplete = false;
-        try {
-          await reader.cancel("media segment length exceeded");
-        } catch {}
-        controller.error(
-          new Error(`media segment exceeded: ${delivered}/${contentLength}`),
-        );
-        return;
-      }
-      if (cacheComplete) {
-        if (cacheOffset + chunk.byteLength <= cacheBytes.byteLength) {
-          cacheBytes.set(chunk, cacheOffset);
-          cacheOffset += chunk.byteLength;
-        } else {
-          cacheComplete = false;
-        }
-      }
-      controller.enqueue(chunk);
     },
-    cancel(reason) {
-      return reader.cancel(reason);
+    onChunk: (chunk, offset) => {
+      if (!cacheBytes) return;
+      if (offset + chunk.byteLength > cacheBytes.byteLength) {
+        throw new Error("media segment length exceeded");
+      }
+      cacheBytes.set(chunk, offset);
+      cacheOffset = offset + chunk.byteLength;
     },
+    onComplete: store,
   });
   return new Response(body, {
     status: upstream.status,
@@ -4777,7 +5362,7 @@ function mediaRangeRecordForBytes(upstream, bytes) {
 //    “bytes 0-2744239/2744240”，实际只送 866890 字节就结束。
 // 拿不到任何长度信息时返回 0，表示“无从判断”，不做截断检查。
 function expectedUpstreamBodyBytes(headers) {
-  if (!headers || headers.has("content-encoding")) return 0;
+  if (!headers || mediaResponseBodyIsEncoded(headers)) return 0;
   const contentLength = Number(headers.get("content-length"));
   if (Number.isSafeInteger(contentLength) && contentLength > 0) {
     return contentLength;
@@ -4794,25 +5379,30 @@ function expectedUpstreamBodyBytes(headers) {
 //  - 字节一到就转发给客户端（首个字节 = 上游 TTFB），不再等整段下载完；
 //  - 完整读完后写进 Range 缓存，完全相同的 Range 下次直接本地命中；
 //  - 只有体积不超过上限的 Range 才缓存（Range 分块通常 ~1 MB），超限只透传。
-function teeMediaRangeResponseBody(upstream, rangeKey, maxBytes) {
+function teeMediaRangeResponseBody(
+  upstream,
+  rangeKey,
+  maxBytes,
+  options = {},
+) {
   if (!upstream.body) return upstream;
   const contentLength = Number(upstream.headers.get("content-length"));
+  const contentRange = parseMediaContentRange(
+    upstream.headers.get("content-range") || "",
+  );
   const limit = Math.max(0, Math.floor(Number(maxBytes) || 0));
   const hasValidator = Boolean(
     upstream.headers.get("etag") || upstream.headers.get("last-modified"),
   );
-  const shouldCache = hasValidator &&
-    Number.isSafeInteger(contentLength) &&
-    contentLength > 0 &&
-    contentLength <= limit;
-  let buffer = shouldCache ? new Uint8Array(contentLength) : null;
-  let offset = 0;
-  // expectedBytes > 0 时才做短读检查；delivered 独立于 buffer 计数，
-  // 因为超过缓存上限的响应（buffer 置空）同样需要检测截断。
   const expectedBytes = expectedUpstreamBodyBytes(upstream.headers);
-  let delivered = 0;
+  const cacheableBytes = contentLength > 0 ? contentLength : expectedBytes;
+  const shouldCache = hasValidator &&
+    Number.isSafeInteger(cacheableBytes) &&
+    cacheableBytes > 0 &&
+    cacheableBytes <= limit;
+  const buffer = shouldCache ? new Uint8Array(cacheableBytes) : null;
+  let offset = 0;
   let stored = false;
-  let inspectedPrefix = false;
   const contentType = upstream.headers.get("content-type") || "";
   const store = () => {
     if (stored || !buffer || offset !== buffer.byteLength) return;
@@ -4822,63 +5412,28 @@ function teeMediaRangeResponseBody(upstream, rangeKey, maxBytes) {
       mediaRangeRecordForBytes(upstream, buffer),
     );
   };
-  const reader = upstream.body.getReader();
-  const body = new ReadableStream({
-    async pull(controller) {
-      let result;
-      try {
-        result = await readMediaStreamChunk(reader, mediaStreamIdleTimeoutMs);
-      } catch (error) {
-        try {
-          await reader.cancel(error);
-        } catch {}
-        controller.error(error);
-        return;
+  const body = resumableExactMediaStreamBody(upstream.body, expectedBytes, {
+    absoluteStart: contentRange?.start ?? 0,
+    expectedTotal: contentRange?.total ?? 0,
+    fetchRange: options.fetchRange,
+    signal: options.signal,
+    validateChunk: (chunk, delivered) => {
+      if (
+        delivered === 0 &&
+        mediaPayloadLooksLikeErrorDocument(chunk, contentType)
+      ) {
+        throw new Error("upstream media error document");
       }
-      if (result.done) {
-        if (expectedBytes > 0 && delivered < expectedBytes) {
-          // 上游“回了响应头，但响应体中途断流”。旧实现把它当作正常结束，
-          // 播放器拿到一段截断的分片后卡在解码/缓冲，表现为播放一直卡。
-          // 显式让流失败：播放器会重试这一段（多线程/断点续传逻辑生效），
-          // 而不是把半段数据当成完整分片。
-          controller.error(
-            new Error(`media range truncated: ${delivered}/${expectedBytes}`),
-          );
-          return;
-        }
-        store();
-        controller.close();
-        return;
-      }
-      const chunk = result.value instanceof Uint8Array
-        ? result.value
-        : new Uint8Array(result.value);
-      if (!inspectedPrefix) {
-        inspectedPrefix = true;
-        if (mediaPayloadLooksLikeErrorDocument(chunk, contentType)) {
-          buffer = null;
-          try {
-            await reader.cancel();
-          } catch {}
-          controller.error(new Error("upstream media error document"));
-          return;
-        }
-      }
-      delivered += chunk.byteLength;
-      if (buffer) {
-        if (offset + chunk.byteLength <= buffer.byteLength) {
-          buffer.set(chunk, offset);
-          offset += chunk.byteLength;
-        } else {
-          buffer = null;
-        }
-      }
-      controller.enqueue(chunk);
     },
-    cancel(reason) {
-      store();
-      return reader.cancel(reason);
+    onChunk: (chunk, delivered) => {
+      if (!buffer) return;
+      if (delivered + chunk.byteLength > buffer.byteLength) {
+        throw new Error("media range length exceeded");
+      }
+      buffer.set(chunk, delivered);
+      offset = delivered + chunk.byteLength;
     },
+    onComplete: store,
   });
   return new Response(body, {
     status: upstream.status,
@@ -4938,6 +5493,15 @@ async function fetchMediaUpstreamResponse(
       [MEDIA_UPSTREAM_TIMEOUT_HEADER]: "1",
     },
   });
+  const requestAbortedResponse = () => new Response(null, {
+    status: 499,
+    statusText: "Client Closed Request",
+    headers: {
+      "cache-control": "no-store",
+      [MEDIA_UPSTREAM_TIMEOUT_HEADER]: "client-aborted",
+    },
+  });
+  const requestWasAborted = () => request.signal?.aborted === true;
   const mediaUpstreamHost = mediaUpstreamHostOf(sourceUrl);
   // 单次尝试：只负责“拿到响应头”，超时/连接中断都折算成合成的 504。
   const fetchUpstreamOnce = async (
@@ -4950,11 +5514,18 @@ async function fetchMediaUpstreamResponse(
       : MEDIA_UPSTREAM_CONNECTION_WAIT_MS;
     let releaseLease;
     try {
-      releaseLease = await mediaUpstreamConnectionGate(
+      releaseLease = await MEDIA_UPSTREAM_SCHEDULER.acquire(
         mediaUpstreamHost,
         env,
-      ).acquire(gateWaitMs);
-    } catch {
+        {
+          waitMs: gateWaitMs,
+          signal: request.signal,
+        },
+      );
+    } catch (error) {
+      if (requestWasAborted() || error?.name === "AbortError") {
+        return requestAbortedResponse();
+      }
       return upstreamTimeoutResponse();
     }
     const remainingMs = requestDeadline > 0
@@ -4972,13 +5543,17 @@ async function fetchMediaUpstreamResponse(
           method: request.method,
           headers: requestHeaders,
           redirect: "follow",
+          signal: request.signal,
         },
         remainingMs,
       );
       return leaseMediaUpstreamResponseBody(response, releaseLease);
-    } catch {
+    } catch (error) {
       // 连接被中断、DNS 失败、上游不回响应头 —— 统一按“这条线路不可用”处理。
       releaseLease();
+      if (requestWasAborted()) {
+        return requestAbortedResponse();
+      }
       return upstreamTimeoutResponse();
     }
   };
@@ -5035,8 +5610,45 @@ async function fetchMediaUpstreamResponse(
   };
   // 上游 5xx / 连接抖动都在 fetchUpstream 内部按“短尝试 + 重试”处理，
   // 这里保留别名，调用方语义不变。
-  const fetchUpstreamWithRetry = (requestHeaders = headers) =>
+  const fetchUpstreamRaw = (requestHeaders = headers) =>
     fetchUpstream(requestHeaders);
+  let fetchMediaContinuationRange = null;
+  const fetchUpstreamWithRetry = async (requestHeaders = headers) => {
+    const response = await fetchUpstreamRaw(requestHeaders);
+    return rememberMediaContinuationFetcher(
+      response,
+      fetchMediaContinuationRange,
+    );
+  };
+  fetchMediaContinuationRange = (start, end) => {
+    const continuationStart = Math.floor(Number(start));
+    const continuationEnd = Math.floor(Number(end));
+    if (
+      !Number.isSafeInteger(continuationStart) ||
+      !Number.isSafeInteger(continuationEnd) ||
+      continuationStart < 0 ||
+      continuationEnd < continuationStart
+    ) {
+      return Promise.reject(new Error("invalid media continuation range"));
+    }
+    const continuationHeaders = new Headers(headers);
+    for (const name of [
+      "if-match",
+      "if-range",
+      "if-none-match",
+      "if-modified-since",
+    ]) {
+      continuationHeaders.delete(name);
+    }
+    continuationHeaders.set(
+      "range",
+      `bytes=${continuationStart}-${continuationEnd}`,
+    );
+    continuationHeaders.set("accept-encoding", "identity");
+    // Use the same per-host/global scheduler and transient retry loop as the
+    // original request. Calling fetch() directly here would bypass both.
+    return fetchUpstreamRaw(continuationHeaders);
+  };
 
   // 虚拟 HLS 子分片：清单里已经把一条伪 TS 分片拆成 vsplit 条等长子区间。
   // 这里把虚拟偏移映射回「PNG / 字体外壳之后」的真实上游字节。任一环节
@@ -5143,14 +5755,13 @@ async function fetchMediaUpstreamResponse(
             const partRangeMatches = partRange &&
               partRange.start === mappedStart &&
               partRange.end === mappedEnd &&
-              (partRange.total === null ||
-                partRange.total === virtualMetadata.upstreamTotal);
+              partRange.total === virtualMetadata.upstreamTotal;
             const partLengthMatches = !Number.isSafeInteger(partLength) ||
               partLength === expectedLength;
             if (
               partUpstream.status === 206 &&
               partUpstream.body &&
-              !partUpstream.headers.has("content-encoding") &&
+              !mediaResponseBodyIsEncoded(partUpstream.headers) &&
               partRangeMatches &&
               partLengthMatches &&
               !mediaContentTypeLooksLikeErrorDocument(
@@ -5181,9 +5792,15 @@ async function fetchMediaUpstreamResponse(
                 responseHeaders.delete("content-range");
               }
               return new Response(
-                guardExactMediaStreamBody(
+                resumableExactMediaStreamBody(
                   partUpstream.body,
                   expectedLength,
+                  {
+                    absoluteStart: mappedStart,
+                    expectedTotal: virtualMetadata.upstreamTotal,
+                    fetchRange: fetchMediaContinuationRange,
+                    signal: request.signal,
+                  },
                 ),
                 {
                   status: requestedRangeHeader ? 206 : 200,
@@ -5246,7 +5863,7 @@ async function fetchMediaUpstreamResponse(
       const upstream = await fetchUpstreamWithRetry();
       if (
         upstream.status !== 206 ||
-        upstream.headers.has("content-encoding")
+        mediaResponseBodyIsEncoded(upstream.headers)
       ) {
         upstream.headers.set(MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER, "1");
         return upstream;
@@ -5299,6 +5916,10 @@ async function fetchMediaUpstreamResponse(
         upstream,
         rangeKey,
         MAX_CACHED_MEDIA_SEGMENT_RANGE_BYTES,
+        {
+          fetchRange: fetchMediaContinuationRange,
+          signal: request.signal,
+        },
       );
     }
     // 非 Range 的整段请求：有 Content-Length 时走流式（能精确检测截断），
@@ -5311,6 +5932,10 @@ async function fetchMediaUpstreamResponse(
       const response = await streamCompleteMediaSegmentResponse(
         upstream,
         cacheKey,
+        {
+          fetchRange: fetchMediaContinuationRange,
+          signal: request.signal,
+        },
       );
       if (response) return response;
       const result = await bufferMediaSegmentResponse(upstream, sourceUrl);
@@ -5385,6 +6010,8 @@ async function fetchMediaUpstreamResponse(
           // 已经决定走单连接时，不能再让剥壳函数额外开四路 Range，否则
           // 一次客户端请求仍会同时占用五条上游连接。
           parallelTransportDisabled: true,
+          fetchRange: fetchMediaContinuationRange,
+          signal: request.signal,
         },
       );
       if (result?.response) return result.response;
@@ -5428,6 +6055,8 @@ async function fetchMediaUpstreamResponse(
             {
               cacheKey,
               parallelTransportDisabled: true,
+              fetchRange: fetchMediaContinuationRange,
+              signal: request.signal,
             },
           );
           if (replay?.response) {
@@ -5437,7 +6066,7 @@ async function fetchMediaUpstreamResponse(
         }
         if (
           probe.status === 206 &&
-          !probe.headers.has("content-encoding") &&
+          !mediaResponseBodyIsEncoded(probe.headers) &&
           !mediaContentTypeLooksLikeErrorDocument(
             probe.headers.get("content-type") || "",
           )
@@ -5511,6 +6140,8 @@ async function fetchMediaUpstreamResponse(
                   {
                     cacheKey,
                     parallelTransportDisabled: true,
+                    fetchRange: fetchMediaContinuationRange,
+                    signal: request.signal,
                   },
                 );
                 if (replay?.response) {
@@ -5698,6 +6329,10 @@ async function fetchMediaUpstreamResponse(
       mappedUpstream,
       metadata,
       range,
+      {
+        fetchRange: fetchMediaContinuationRange,
+        signal: request.signal,
+      },
     );
     if (response) return response;
   }
@@ -5762,7 +6397,7 @@ function mediaProxyResponseHeaders(upstream, options = {}) {
   }
   // fetch 通常已经解压响应体；继续转发压缩前的 Content-Length 会让
   // 客户端读到错误长度并卡在播放器缓冲阶段。
-  if (!upstream.headers.has("content-encoding")) {
+  if (!mediaResponseBodyIsEncoded(upstream.headers)) {
     const contentLength = upstream.headers.get("content-length");
     if (contentLength) {
       headers.set("content-length", contentLength);
@@ -6506,6 +7141,8 @@ async function proxyMediaResponse(
         cacheKey,
         parallelTransportDisabled:
           requestUrl.searchParams.get("_parallel") === "0",
+        fetchRange: mediaContinuationFetcherFor(upstream),
+        signal: request.signal,
       },
     );
     if (result?.response) return result.response;
@@ -6519,8 +7156,19 @@ async function proxyMediaResponse(
     (upstream.status === 206 && !hlsManifestRequest) ||
     (upstream.status === 206 && !upstreamType.includes("mpegurl"))
   ) {
-    const trimmed = trimMediaRangeResponseBody(upstream, request, headers);
-    return new Response(guardMediaStreamBody(trimmed.body), {
+    const trimmed = trimMediaRangeResponseBody(
+      upstream,
+      request,
+      headers,
+      {
+        fetchRange: mediaContinuationFetcherFor(upstream),
+        signal: request.signal,
+      },
+    );
+    const body = trimmed.body === upstream.body
+      ? guardMediaStreamBody(trimmed.body)
+      : trimmed.body;
+    return new Response(body, {
       status: trimmed.status,
       statusText: upstream.statusText,
       headers,
@@ -6932,11 +7580,21 @@ function selfHostedMergeBudget(env) {
 
 async function fetchWithTimeout(fetchImpl, url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
+  const sourceSignal = options.signal;
+  const abortFromSource = () => {
+    controller.abort(sourceSignal?.reason);
+  };
+  if (sourceSignal?.aborted) {
+    abortFromSource();
+  } else if (sourceSignal?.addEventListener) {
+    sourceSignal.addEventListener("abort", abortFromSource, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetchImpl(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timer);
+    sourceSignal?.removeEventListener?.("abort", abortFromSource);
   }
 }
 
@@ -16758,6 +17416,14 @@ export function createEmbyConcurrencyGateForTests(options) {
   return createConcurrencyGate(options);
 }
 
+export function createMediaUpstreamSchedulerForTests(options) {
+  return createMediaUpstreamScheduler(options);
+}
+
+export function mediaSegmentCacheKeyForTests(sourceUrl) {
+  return mediaSegmentCacheKey(sourceUrl);
+}
+
 // 只给单测用：直接驱动“清单改写缓存”，验证同一份清单只改写一次、
 // 而清单内容变化时不会被旧结果顶掉。
 export function rewriteHlsManifestCachedForTests(
@@ -16809,7 +17475,7 @@ export function resetEmbyCachesForTests() {
   MEDIA_SEGMENT_PREFIX_CACHE.clear();
   MEDIA_SEGMENT_RANGE_CACHE.clear();
   MEDIA_PARALLEL_RANGE_FAILURES.clear();
-  MEDIA_UPSTREAM_CONNECTION_GATES.clear();
+  MEDIA_UPSTREAM_SCHEDULER.reset();
   REWRITTEN_HLS_CACHE.clear();
   rewrittenHlsCacheHits = 0;
   rewrittenHlsCacheMisses = 0;
