@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-18-exact-media-resume-82";
+const SERVER_BUILD_ID = "2026-10-20-parallel-passthrough-90";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -266,18 +266,28 @@ const MEDIA_SEGMENT_STREAM_IDLE_TIMEOUT_MS = 15000;
 // 显式小 Range（seek / 断点续传）不会在服务端再次拆分，避免请求成倍放大。
 const MEDIA_PARALLEL_RANGE_CHUNK_BYTES = 512 * 1024;
 const MEDIA_PARALLEL_RANGE_WINDOW = 4;
+const MEDIA_PARALLEL_RANGE_MIN_WINDOW = 2;
 const MEDIA_PARALLEL_RANGE_MAX_CHUNKS = 16;
 const MEDIA_PARALLEL_RANGE_MIN_BYTES = 1024 * 1024;
 // 并行分片按顺序拼接，任何时刻最多 4 块在途。总区间上限固定为 8MB，避免
 // 一个响应占用过多 isolate 内存。
 const MEDIA_PARALLEL_RANGE_MAX_TOTAL_BYTES = 8 * 1024 * 1024;
 // 单块中途断流时只从尚未收到的偏移续传；总尝试次数包含第一次读取。
-const MEDIA_PARALLEL_RANGE_MAX_ATTEMPTS = 3;
+const MEDIA_PARALLEL_RANGE_MAX_ATTEMPTS = 2;
 // 同一个上游主机连续失败两次就临时关掉并行。
 const MEDIA_PARALLEL_RANGE_FAILURE_LIMIT = 2;
 const MEDIA_PARALLEL_RANGE_DISABLE_MS = 5 * 60 * 1000;
+// Strict Range incompatibility (ignored Range, malformed Content-Range, HTML
+// error document) is not transient. Do not retry that host for a longer period.
+const MEDIA_PARALLEL_RANGE_INCOMPATIBLE_DISABLE_MS = 30 * 60 * 1000;
 const MEDIA_PARALLEL_RANGE_FAILURES = new Map();
-const MEDIA_PARALLEL_RANGE_DEFAULT_ENABLED = false;
+// Verified pseudo-TS segments use bounded parallel ranges by default. The
+// fan-out coordinator below keeps this from multiplying with HLS.js requests.
+const MEDIA_PARALLEL_RANGE_DEFAULT_ENABLED = true;
+const MEDIA_PARALLEL_FANOUT_GLOBAL_MAX = 2;
+const MEDIA_PARALLEL_FANOUT_HOST_MAX = 1;
+const MEDIA_PARALLEL_RANGE_OPEN_STAGGER_MS = 60;
+const MEDIA_PARALLEL_RANGE_EXPAND_WINDOW_MS = 6000;
 // 显式 Range 达到整段长度的 90% 才按“整段”并行；其余 Range 直接透传，
 // 否则播放器的一次 1MB seek 会在服务端又变成 2~4 路上游请求。
 const MEDIA_PARALLEL_RANGE_FULL_REQUEST_RATIO = 0.9;
@@ -290,9 +300,10 @@ const MEDIA_PARALLEL_RANGE_HEADER = "x-catemby-parallel-range";
 // p16 / p19 等不同 CDN 主机可以各自开一条长连接，合起来仍会超过实例预算。
 const MEDIA_UPSTREAM_CONNECTION_MAX = 1;
 const MEDIA_UPSTREAM_CONNECTION_GLOBAL_MAX = 2;
-// 显式开启实验性服务端并行 Range 时，初始窗口本身就要 4 条连接；给内部拆分的
-// 原始响应留 1 条余量，避免探针连接和初始窗口互相等待。生产默认不启用并行。
-const MEDIA_UPSTREAM_CONNECTION_PARALLEL_MAX = 5;
+// 服务端并行 Range 的初始窗口本身就要 4 条连接；给内部拆分的原始响应留
+// 1 条余量，避免探针连接和初始窗口互相等待。
+const MEDIA_UPSTREAM_CONNECTION_PARALLEL_MAX = MEDIA_PARALLEL_RANGE_WINDOW;
+const MEDIA_UPSTREAM_CONNECTION_PARALLEL_GLOBAL_MAX = 8;
 const MEDIA_UPSTREAM_CONNECTION_QUEUE_LIMIT = 32;
 const MEDIA_UPSTREAM_CONNECTION_WAIT_MS = 12000;
 const MEDIA_UPSTREAM_CONNECTION_OVERLOAD =
@@ -321,15 +332,15 @@ const MEDIA_UPSTREAM_TIMEOUT_HEADER = "x-catemby-upstream-timeout";
 // 一次播放请求在“拿到上游响应头”之前允许消耗的总时间。多线路时逐条换线，
 // 但总时间必须有界，否则线路全部挂起时客户端早就自己超时了。
 const STREAM_HEADERS_BUDGET_MS = 20000;
-const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([
-  401,
-  403,
-  404,
-  410,
-  429,
-]);
+// 只有 404/410 能证明线路已经不存在。401/403 可能是临时风控或签名校验
+// 节点异常，429 是限流，5xx 是上游暂时故障；这些都必须按“未知”保留，
+// 让播放器自己重试，不能在校验阶段把真实线路永久删掉。
+const REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES = new Set([404, 410]);
+const REMOTE_MEDIA_VERDICT_PLAYABLE = "playable";
+const REMOTE_MEDIA_VERDICT_DEAD = "definitely-dead";
+const REMOTE_MEDIA_VERDICT_UNKNOWN = "unknown";
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v49";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v52";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -1348,12 +1359,24 @@ async function fetchRemoteHlsAesKey(url, fetchImpl, budget) {
       accept: "application/octet-stream,*/*;q=0.8",
       budget,
     });
-    if (!response?.ok) return null;
+    if (!response?.ok) {
+      return {
+        keyBytes: null,
+        definitiveFailure: REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES.has(
+          response?.status,
+        ),
+      };
+    }
     const keyBytes = new Uint8Array(await response.arrayBuffer());
-    return keyBytes.length === HLS_AES_KEY_LENGTH ? keyBytes : null;
+    return {
+      keyBytes: keyBytes.length === HLS_AES_KEY_LENGTH ? keyBytes : null,
+      // An upstream 200 response whose AES key is not exactly 16 bytes is a
+      // deterministic format failure, not a temporary network failure.
+      definitiveFailure: keyBytes.length !== HLS_AES_KEY_LENGTH,
+    };
   } catch (error) {
     if (isRemoteHlsValidationExpired(error)) throw error;
-    return null;
+    return { keyBytes: null, definitiveFailure: false };
   }
 }
 
@@ -1384,14 +1407,17 @@ async function hlsKeyContextFromTag(
       return { invalid: true };
     }
   }
-  const keyBytes = await fetchRemoteHlsAesKey(keyUrl, fetchImpl, budget);
-  if (!keyBytes) {
-    return { invalid: true };
+  const keyResult = await fetchRemoteHlsAesKey(keyUrl, fetchImpl, budget);
+  if (!keyResult.keyBytes) {
+    return {
+      invalid: true,
+      definitiveFailure: keyResult.definitiveFailure,
+    };
   }
   return {
     key: {
       method: "AES-128",
-      keyBytes,
+      keyBytes: keyResult.keyBytes,
       explicitIv,
     },
   };
@@ -1432,7 +1458,11 @@ async function hlsPlaylistMediaEntries(
         budget,
       );
       if (resolved.invalid) {
-        return { entries: null, truncated };
+        return {
+          entries: null,
+          truncated,
+          definitiveFailure: resolved.definitiveFailure === true,
+        };
       }
       activeKey = resolved.key;
       continue;
@@ -1466,39 +1496,49 @@ async function probeRemoteHlsSegment(
   keyContext = null,
   sequence = 0,
 ) {
-  if (budget.remaining <= 0) return true;
+  if (budget.remaining <= 0) return REMOTE_MEDIA_VERDICT_UNKNOWN;
   budget.remaining -= 1;
   try {
     const response = await fetchRemoteHlsResponse(url, fetchImpl, {
       range: true,
       budget,
     });
-    if (!response?.ok) return false;
+    if (!response?.ok) {
+      return REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES.has(response?.status)
+        ? REMOTE_MEDIA_VERDICT_DEAD
+        : REMOTE_MEDIA_VERDICT_UNKNOWN;
+    }
     const bytes = new Uint8Array(await response.arrayBuffer())
       .subarray(0, REMOTE_MEDIA_PROBE_BYTES);
-    if (!bytes.length) return false;
+    if (!bytes.length) return REMOTE_MEDIA_VERDICT_UNKNOWN;
     if (keyContext?.method === "AES-128") {
       const encryptedBlock = bytes.subarray(0, HLS_AES_BLOCK_LENGTH);
-      if (encryptedBlock.length !== HLS_AES_BLOCK_LENGTH) return false;
+      if (encryptedBlock.length !== HLS_AES_BLOCK_LENGTH) {
+        return REMOTE_MEDIA_VERDICT_UNKNOWN;
+      }
       try {
         const plaintext = await decryptHlsAes128FirstBlock(
           encryptedBlock,
           keyContext,
           sequence,
         );
-        return plaintext.length > 0 && plaintext[0] === 0x47;
+        return plaintext?.length > 0 && plaintext[0] === 0x47
+          ? REMOTE_MEDIA_VERDICT_PLAYABLE
+          : REMOTE_MEDIA_VERDICT_DEAD;
       } catch {
-        return false;
+        return REMOTE_MEDIA_VERDICT_UNKNOWN;
       }
     }
-    if (bytesLookLikeMpegTs(bytes)) return true;
-    if (bytesLookLikeFont(bytes) || sniffImageContentType(bytes)) return false;
-    if (responseLooksLikeTextDocument(bytes)) return false;
-    return true;
+    if (bytesLookLikeMpegTs(bytes)) return REMOTE_MEDIA_VERDICT_PLAYABLE;
+    if (bytesLookLikeFont(bytes) || sniffImageContentType(bytes)) {
+      return REMOTE_MEDIA_VERDICT_DEAD;
+    }
+    if (responseLooksLikeTextDocument(bytes)) return REMOTE_MEDIA_VERDICT_DEAD;
+    return REMOTE_MEDIA_VERDICT_UNKNOWN;
   } catch {
     // A transient network failure is not evidence that an otherwise valid
     // source is fake. Keep it and let the player decide.
-    return true;
+    return REMOTE_MEDIA_VERDICT_UNKNOWN;
   }
 }
 
@@ -1511,21 +1551,26 @@ async function validateHlsPlaylistSource(
   inheritedKey = null,
 ) {
   if (!String(playlist || "").trimStart().startsWith("#EXTM3U")) {
-    return false;
+    return REMOTE_MEDIA_VERDICT_DEAD;
   }
-  const { entries, truncated } = await hlsPlaylistMediaEntries(
+  const { entries, truncated, definitiveFailure } = await hlsPlaylistMediaEntries(
     playlist,
     baseUrl,
     fetchImpl,
     budget,
     inheritedKey,
   );
-  if (!entries) return false;
+  if (!entries) {
+    return definitiveFailure
+      ? REMOTE_MEDIA_VERDICT_DEAD
+      : REMOTE_MEDIA_VERDICT_UNKNOWN;
+  }
   // 清单被扫描上限截断且前段没有任何可探测条目时，无法证明它是坏源，
   // 按未验证保留（fail-open）。
-  if (!entries.length) return truncated;
+  if (!entries.length) return REMOTE_MEDIA_VERDICT_UNKNOWN;
 
   let attemptedSegment = false;
+  let sawUnknownSegment = false;
   const childEntries = [];
   for (const entry of entries) {
     if (hlsUriLooksLikeNonVideo(entry.uri, baseUrl)) {
@@ -1536,41 +1581,52 @@ async function validateHlsPlaylistSource(
       // 签名已过期 = 死源：分片必然 403/410，即使清单本身能被截断式扫描
       // 看到也不能按 fail-open 保留，否则播放器点到这条源就花屏/跳段。
       if (hlsSignedUrlExpired(entry.uri)) {
-        return false;
+        return REMOTE_MEDIA_VERDICT_DEAD;
       }
-      if (await probeRemoteHlsSegment(
+      const verdict = await probeRemoteHlsSegment(
         entry.uri,
         fetchImpl,
         budget,
         entry.key,
         entry.sequence,
-      )) {
-        return true;
+      );
+      if (verdict === REMOTE_MEDIA_VERDICT_PLAYABLE) {
+        return REMOTE_MEDIA_VERDICT_PLAYABLE;
       }
+      if (verdict === REMOTE_MEDIA_VERDICT_UNKNOWN) sawUnknownSegment = true;
       continue;
     }
     childEntries.push(entry);
   }
 
   // 截断的清单里，前缀分片探测失败不足以否定整条线路，按未验证保留。
-  if (attemptedSegment) return truncated;
-  if (budget.remaining <= 0 || depth >= REMOTE_HLS_PROBE_DEPTH) {
-    return true;
+  if (attemptedSegment) {
+    return truncated || sawUnknownSegment
+      ? REMOTE_MEDIA_VERDICT_UNKNOWN
+      : REMOTE_MEDIA_VERDICT_DEAD;
   }
+  if (budget.remaining <= 0 || depth >= REMOTE_HLS_PROBE_DEPTH) {
+    return REMOTE_MEDIA_VERDICT_UNKNOWN;
+  }
+  let sawUnknownChild = false;
   for (const entry of childEntries.slice(0, 2)) {
-    if (await validateRemoteHlsPlaylist(
+    const verdict = await validateRemoteHlsPlaylist(
       entry.uri,
       fetchImpl,
       budget,
       depth + 1,
       entry.key,
-    )) {
-      return true;
+    );
+    if (verdict === REMOTE_MEDIA_VERDICT_PLAYABLE) {
+      return REMOTE_MEDIA_VERDICT_PLAYABLE;
     }
+    if (verdict === REMOTE_MEDIA_VERDICT_UNKNOWN) sawUnknownChild = true;
   }
   // 子清单都探测失败时，若清单本身已被截断，剩余子清单可能仍可播放，
   // 同样降级为未验证保留，而不是直接剔除线路。
-  return truncated;
+  return truncated || sawUnknownChild
+    ? REMOTE_MEDIA_VERDICT_UNKNOWN
+    : REMOTE_MEDIA_VERDICT_DEAD;
 }
 
 async function validateRemoteHlsPlaylist(
@@ -1580,22 +1636,26 @@ async function validateRemoteHlsPlaylist(
   depth = 0,
   inheritedKey = null,
 ) {
-  if (budget.remaining <= 0) return true;
+  if (budget.remaining <= 0) return REMOTE_MEDIA_VERDICT_UNKNOWN;
   budget.remaining -= 1;
 
   let response;
   try {
     response = await fetchRemoteHlsResponse(url, fetchImpl, { budget });
   } catch {
-    return true;
+    return REMOTE_MEDIA_VERDICT_UNKNOWN;
   }
-  if (!response?.ok) return false;
+  if (!response?.ok) {
+    return REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES.has(response?.status)
+      ? REMOTE_MEDIA_VERDICT_DEAD
+      : REMOTE_MEDIA_VERDICT_UNKNOWN;
+  }
 
   let playlist;
   try {
     playlist = await response.text();
   } catch {
-    return true;
+    return REMOTE_MEDIA_VERDICT_UNKNOWN;
   }
   return validateHlsPlaylistSource(
     playlist,
@@ -1615,7 +1675,7 @@ function remoteHlsVariant(variant) {
 }
 
 async function httpMediaVariantLooksPlayable(variant, fetchImpl, budget) {
-  if (!variant?.sourceUrl) return true;
+  if (!variant?.sourceUrl) return REMOTE_MEDIA_VERDICT_UNKNOWN;
   let response;
   try {
     response = await fetchRemoteHlsResponse(
@@ -1632,13 +1692,14 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl, budget) {
   } catch {
     // A transient DNS / TLS / timeout failure is not enough evidence to drop
     // a source that the resolver advertised.
-    return true;
+    return REMOTE_MEDIA_VERDICT_UNKNOWN;
   }
-  if (!response) return true;
-  if (REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES.has(response.status)) {
-    return false;
+  if (!response) return REMOTE_MEDIA_VERDICT_UNKNOWN;
+  if (!response.ok) {
+    return REMOTE_MEDIA_DEFINITIVE_FAILURE_STATUSES.has(response.status)
+      ? REMOTE_MEDIA_VERDICT_DEAD
+      : REMOTE_MEDIA_VERDICT_UNKNOWN;
   }
-  if (!response.ok) return true;
   const mediaFailure = String(
     response.headers.get("x-media-failure") || "",
   ).toLowerCase();
@@ -1646,7 +1707,7 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl, budget) {
     mediaFailure.includes("metadata_invalid_reference") ||
     mediaFailure.includes("invalid_reference")
   ) {
-    return false;
+    return REMOTE_MEDIA_VERDICT_DEAD;
   }
 
   const contentType = String(response.headers.get("content-type") || "")
@@ -1659,7 +1720,7 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl, budget) {
     contentType === "application/json" ||
     contentType.endsWith("+json")
   ) {
-    return false;
+    return REMOTE_MEDIA_VERDICT_DEAD;
   }
 
   let bytes;
@@ -1667,16 +1728,18 @@ async function httpMediaVariantLooksPlayable(variant, fetchImpl, budget) {
     bytes = new Uint8Array(await response.arrayBuffer())
       .subarray(0, REMOTE_MEDIA_PROBE_BYTES);
   } catch {
-    return true;
+    return REMOTE_MEDIA_VERDICT_UNKNOWN;
   }
-  if (!bytes.length) return false;
+  if (!bytes.length) return REMOTE_MEDIA_VERDICT_UNKNOWN;
   // GG 的媒体 CDN 会把 MPEG-TS 藏在 PNG 文件头后面，并且返回 image/png。
   // 必须先检查 TS 包，再按普通图片/字体内容做拒绝。
-  if (bytesLookLikeMpegTs(bytes)) return true;
-  if (contentType.startsWith("image/")) return false;
-  if (sniffImageContentType(bytes) || bytesLookLikeFont(bytes)) return false;
-  if (responseLooksLikeTextDocument(bytes)) return false;
-  return true;
+  if (bytesLookLikeMpegTs(bytes)) return REMOTE_MEDIA_VERDICT_PLAYABLE;
+  if (contentType.startsWith("image/")) return REMOTE_MEDIA_VERDICT_DEAD;
+  if (sniffImageContentType(bytes) || bytesLookLikeFont(bytes)) {
+    return REMOTE_MEDIA_VERDICT_DEAD;
+  }
+  if (responseLooksLikeTextDocument(bytes)) return REMOTE_MEDIA_VERDICT_DEAD;
+  return REMOTE_MEDIA_VERDICT_UNKNOWN;
 }
 
 // 上游有时会把同一条视频流包装成多条“URL 不同”的线路（例如 GG / fcjav
@@ -1752,12 +1815,31 @@ function dedupeSameStreamVariants(variants) {
     return 3;
   };
   const preferred = (value) => `${providerRank(value)}|${label(value)}`;
+  const semanticIdentity = (value) => {
+    const variant = String(value?.variant || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+    // 去重发生在 assignUniqueSourceNames 之前，通常只有上游原始 label；
+    // 缓存回放或测试对象可能已经带 sourceName。优先使用原始语义标签，
+    // 避免“原版”和“fcjav 原版”被误判成两种线路。
+    const sourceLabel = String(value?.label || value?.sourceName || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+    return [variant, sourceLabel].filter(Boolean).join("|") || "unknown";
+  };
   const byIdentity = new Map();
   for (const variant of variants) {
     const identity = String(variant?.streamIdentity || "").trim();
     if (!identity) continue;
-    if (!byIdentity.has(identity)) byIdentity.set(identity, []);
-    byIdentity.get(identity).push(variant);
+    // 首分片指纹只说明字节前缀相同，不能证明播放线路语义相同。
+    // fcjav 原版 / 去码版、javgg 原版 / 去码版等经常共享同一段
+    // PAT/PMT 头，却是用户明确可区分的两条源，必须分开去重。
+    const key = `${identity}|${semanticIdentity(variant)}`;
+    if (!byIdentity.has(key)) byIdentity.set(key, []);
+    byIdentity.get(key).push(variant);
   }
   if (!byIdentity.size) return variants;
   const kept = new Set();
@@ -1860,7 +1942,9 @@ async function validatedVideoVariants(
     },
   );
   await Promise.all(workers);
-  const playable = variants.filter((_, index) => results[index]);
+  const playable = variants.filter(
+    (_, index) => results[index] !== REMOTE_MEDIA_VERDICT_DEAD,
+  );
   const identityDeadline = Date.now() + HLS_STREAM_IDENTITY_BUDGET_MS;
   for (let index = 0; index < playable.length; index += 1) {
     playable[index] = await attachHlsStreamIdentity(
@@ -2333,10 +2417,94 @@ function mediaRangeResponseMatchesRequest(rangeHeader, responseHeaders) {
     expected.end === contentRange.end;
 }
 
+function mediaRangeValidator(kind, value) {
+  const normalizedKind = String(kind || "").trim().toLowerCase();
+  const normalizedValue = String(value || "").trim();
+  if (!normalizedValue) return null;
+  if (normalizedKind === "etag") {
+    // If-Range requires a strong comparison. A weak ETag cannot prove that two
+    // responses refer to the same representation, even when the text matches.
+    if (/^W\//i.test(normalizedValue)) return null;
+    return { kind: "etag", value: normalizedValue };
+  }
+  if (
+    normalizedKind === "last-modified" &&
+    Number.isFinite(Date.parse(normalizedValue))
+  ) {
+    return { kind: "last-modified", value: normalizedValue };
+  }
+  return null;
+}
+
+function mediaRangeValidatorFromHeaders(headers) {
+  if (!headers?.get) return null;
+  const etag = mediaRangeValidator("etag", headers.get("etag"));
+  if (etag) return etag;
+  return mediaRangeValidator(
+    "last-modified",
+    headers.get("last-modified"),
+  );
+}
+
+function mediaRangeValidatorFromMetadata(metadata) {
+  return mediaRangeValidator(
+    metadata?.rangeValidatorKind,
+    metadata?.rangeValidatorValue,
+  );
+}
+
+function setMediaRangeIfRangeHeader(headers, validator) {
+  const normalized = mediaRangeValidator(
+    validator?.kind,
+    validator?.value,
+  );
+  if (!normalized || !headers?.set) return null;
+  headers.set("if-range", normalized.value);
+  return normalized;
+}
+
+function clearMediaRangeRequestConditions(headers) {
+  if (!headers?.delete) return headers;
+  for (const name of [
+    "if-match",
+    "if-range",
+    "if-none-match",
+    "if-modified-since",
+  ]) {
+    headers.delete(name);
+  }
+  return headers;
+}
+
+function mediaRangeResponseValidatorFailure(responseHeaders, expected) {
+  const normalizedExpected = mediaRangeValidator(
+    expected?.kind,
+    expected?.value,
+  );
+  if (!normalizedExpected) return "validator-unavailable";
+  if (!responseHeaders?.get) return `validator-missing-${normalizedExpected.kind}`;
+  if (normalizedExpected.kind === "etag") {
+    const actual = mediaRangeValidator("etag", responseHeaders.get("etag"));
+    if (!actual) return "validator-missing-etag";
+    return actual.value === normalizedExpected.value
+      ? ""
+      : "validator-mismatch-etag";
+  }
+  const actual = mediaRangeValidator(
+    "last-modified",
+    responseHeaders.get("last-modified"),
+  );
+  if (!actual) return "validator-missing-last-modified";
+  return Date.parse(actual.value) === Date.parse(normalizedExpected.value)
+    ? ""
+    : "validator-mismatch-last-modified";
+}
+
 function mediaSegmentPrefixMetadata(
   prefixLength,
   upstreamTotal,
   contentType = "video/mp2t",
+  rangeValidator = null,
 ) {
   const prefix = Math.floor(Number(prefixLength));
   const total = Math.floor(Number(upstreamTotal));
@@ -2352,6 +2520,8 @@ function mediaSegmentPrefixMetadata(
     prefixLength: prefix,
     upstreamTotal: total,
     contentType: contentType || "video/mp2t",
+    rangeValidatorKind: rangeValidator?.kind || "",
+    rangeValidatorValue: rangeValidator?.value || "",
   };
 }
 
@@ -2469,6 +2639,12 @@ function embeddedTsRangeResponse(body, metadata, range) {
 // 管道：长度/区间/类型都由 metadata 推导，不依赖上游原始头。
 function embeddedTsParallelRangeResponse(parallel, metadata, range) {
   const total = parallel.total;
+  if (
+    !parallel?.bytes ||
+    parallel.bytes.byteLength !== total
+  ) {
+    return null;
+  }
   const headers = new Headers({
     "accept-ranges": "bytes",
     "cache-control": "no-store",
@@ -2482,7 +2658,7 @@ function embeddedTsParallelRangeResponse(parallel, metadata, range) {
   if (parallel.timing) {
     headers.set(MEDIA_PARALLEL_RANGE_HEADER, `range;${parallel.timing}`);
   }
-  return new Response(parallel.body, {
+  return new Response(parallel.bytes, {
     status: 206,
     statusText: "Partial Content",
     headers,
@@ -2494,7 +2670,8 @@ function embeddedTsParallelRangeResponse(parallel, metadata, range) {
 function embeddedTsParallelWholeResponse(parallel, metadata) {
   const total = metadata.upstreamTotal - metadata.prefixLength;
   if (
-    !parallel?.body ||
+    !parallel?.bytes ||
+    parallel.bytes.byteLength !== total ||
     !Number.isSafeInteger(total) ||
     total <= 0 ||
     parallel.total !== total
@@ -2512,7 +2689,7 @@ function embeddedTsParallelWholeResponse(parallel, metadata) {
     headers.set(MEDIA_PARALLEL_RANGE_HEADER, `hit;${parallel.timing}`);
   }
   return new Response(
-    guardExactMediaStreamBody(parallel.body, total),
+    parallel.bytes,
     {
       status: 200,
       statusText: "OK",
@@ -2526,6 +2703,8 @@ function embeddedTsParallelWholeResponse(parallel, metadata) {
 // 一样由 handleEmbyInternal 在每次请求开始时刷新）。
 let mediaStreamIdleTimeoutMs = MEDIA_SEGMENT_STREAM_IDLE_TIMEOUT_MS;
 let mediaParallelRangeEnabled = MEDIA_PARALLEL_RANGE_DEFAULT_ENABLED;
+let mediaParallelRangeOpenStaggerMs = MEDIA_PARALLEL_RANGE_OPEN_STAGGER_MS;
+let mediaParallelRangeExpandWindowMs = MEDIA_PARALLEL_RANGE_EXPAND_WINDOW_MS;
 
 function applyMediaStreamEnv(env) {
   mediaStreamIdleTimeoutMs = positiveEnvMilliseconds(
@@ -2539,6 +2718,16 @@ function applyMediaStreamEnv(env) {
   mediaParallelRangeEnabled = parallel
     ? /^(?:1|true|yes|on)$/.test(parallel)
     : MEDIA_PARALLEL_RANGE_DEFAULT_ENABLED;
+  mediaParallelRangeOpenStaggerMs = positiveEnvMilliseconds(
+    env,
+    "MEDIA_PARALLEL_RANGE_OPEN_STAGGER_MS",
+    MEDIA_PARALLEL_RANGE_OPEN_STAGGER_MS,
+  );
+  mediaParallelRangeExpandWindowMs = positiveEnvMilliseconds(
+    env,
+    "MEDIA_PARALLEL_RANGE_EXPAND_WINDOW_MS",
+    MEDIA_PARALLEL_RANGE_EXPAND_WINDOW_MS,
+  );
 }
 
 // 虚拟 HLS 分段的段数：默认关闭，可用 HLS_VIRTUAL_SPLIT_PARTS 覆盖。
@@ -2585,6 +2774,8 @@ function readMediaStreamChunk(reader, idleTimeoutMs) {
 const MEDIA_STREAM_RESUME_MAX_CONSECUTIVE_FAILURES = 3;
 const MEDIA_STREAM_RESUME_MAX_SUCCESSES = 32;
 const MEDIA_UPSTREAM_CONTINUATION_FETCHERS = new WeakMap();
+const MEDIA_UPSTREAM_PARALLEL_RANGE_FETCHERS = new WeakMap();
+const MEDIA_UPSTREAM_PARALLEL_RANGE_HOSTS = new WeakMap();
 
 function rememberMediaContinuationFetcher(response, fetchRange) {
   if (response && typeof fetchRange === "function") {
@@ -2599,11 +2790,31 @@ function mediaContinuationFetcherFor(response) {
     : null;
 }
 
+function rememberMediaParallelRangeTransport(response, fetchRange, host) {
+  if (!response || typeof fetchRange !== "function") return response;
+  MEDIA_UPSTREAM_PARALLEL_RANGE_FETCHERS.set(response, fetchRange);
+  MEDIA_UPSTREAM_PARALLEL_RANGE_HOSTS.set(response, String(host || ""));
+  return response;
+}
+
+function mediaParallelRangeFetcherFor(response) {
+  return response
+    ? MEDIA_UPSTREAM_PARALLEL_RANGE_FETCHERS.get(response) || null
+    : null;
+}
+
+function mediaParallelRangeHostFor(response) {
+  return response
+    ? MEDIA_UPSTREAM_PARALLEL_RANGE_HOSTS.get(response) || ""
+    : "";
+}
+
 function mediaContinuationResponseFailure(
   response,
   start,
   end,
   expectedTotal = 0,
+  expectedValidator = null,
 ) {
   if (!response) return "no-response";
   if (response.status !== 206) return `status-${response.status}`;
@@ -2633,6 +2844,11 @@ function mediaContinuationResponseFailure(
       return `total-mismatch-${contentRange.total}-${expectedTotal}`;
     }
   }
+  const validatorFailure = mediaRangeResponseValidatorFailure(
+    response.headers,
+    expectedValidator,
+  );
+  if (validatorFailure) return validatorFailure;
   const expectedLength = end - start + 1;
   if (response.headers.has("content-length")) {
     const rawContentLength = String(
@@ -2736,6 +2952,10 @@ function resumableExactMediaStreamBody(body, expectedBytes, options = {}) {
   const fetchRange = typeof options.fetchRange === "function"
     ? options.fetchRange
     : null;
+  const rangeValidator = mediaRangeValidator(
+    options.rangeValidator?.kind,
+    options.rangeValidator?.value,
+  );
   const onChunk = typeof options.onChunk === "function"
     ? options.onChunk
     : null;
@@ -2838,7 +3058,11 @@ function resumableExactMediaStreamBody(body, expectedBytes, options = {}) {
       reader = null;
       let response = null;
       try {
-        response = await fetchRange(targetStart, absoluteEnd);
+        response = await fetchRange(
+          targetStart,
+          absoluteEnd,
+          rangeValidator,
+        );
       } catch (error) {
         consecutiveResumeFailures += 1;
         lastError = error;
@@ -2849,6 +3073,7 @@ function resumableExactMediaStreamBody(body, expectedBytes, options = {}) {
         targetStart,
         absoluteEnd,
         expectedTotal,
+        rangeValidator,
       );
       if (failure) {
         consecutiveResumeFailures += 1;
@@ -3193,7 +3418,12 @@ function mediaParallelRangePlan(start, end, options = {}) {
 // 并行分块的响应头必须精确证明“这就是我请求的那一段”：状态 206、带
 // Content-Range、区间与请求一致、长度一致、不是错误文档。任何一条不满足都
 // 说明这条上游在糊弄 Range，直接放弃并行（回退单连接），绝不把错位字节拼进去。
-function parallelMediaRangePartFailure(response, part, expectedTotal = 0) {
+function parallelMediaRangePartFailure(
+  response,
+  part,
+  expectedTotal = 0,
+  expectedValidator = null,
+) {
   if (!response) return "no-response";
   if (response.status !== 206) return `status-${response.status}`;
   if (!response.body) return "no-body";
@@ -3219,6 +3449,11 @@ function parallelMediaRangePartFailure(response, part, expectedTotal = 0) {
   if (expectedTotal > 0 && contentRange.total !== expectedTotal) {
     return `total-mismatch-${contentRange.total}-${expectedTotal}`;
   }
+  const validatorFailure = mediaRangeResponseValidatorFailure(
+    response.headers,
+    expectedValidator,
+  );
+  if (validatorFailure) return validatorFailure;
   const contentLength = Number(response.headers.get("content-length"));
   if (
     Number.isSafeInteger(contentLength) &&
@@ -3230,8 +3465,18 @@ function parallelMediaRangePartFailure(response, part, expectedTotal = 0) {
   return "";
 }
 
-function parallelMediaRangePartMatches(response, part, expectedTotal = 0) {
-  return !parallelMediaRangePartFailure(response, part, expectedTotal);
+function parallelMediaRangePartMatches(
+  response,
+  part,
+  expectedTotal = 0,
+  expectedValidator = null,
+) {
+  return !parallelMediaRangePartFailure(
+    response,
+    part,
+    expectedTotal,
+    expectedValidator,
+  );
 }
 
 function mediaParallelRangeHostAllowed(host) {
@@ -3245,12 +3490,52 @@ function mediaParallelRangeHostAllowed(host) {
   return true;
 }
 
-function noteMediaParallelRangeFailure(host) {
+function mediaParallelRangeFailureIsDeterministic(failure) {
+  const value = String(failure || "").toLowerCase();
+  if (!value) return false;
+  if (
+    value.startsWith("fetch-error-") ||
+    value.startsWith("read-error-") ||
+    value.startsWith("short-read-")
+  ) {
+    return false;
+  }
+  if (/^status-(?:408|425|429|500|502|503|504|524)$/.test(value)) {
+    return false;
+  }
+  return value === "status-200" ||
+    /^status-(?:400|401|403|404|410|416)$/.test(value) ||
+    value.startsWith("bad-content-range") ||
+    value.startsWith("range-mismatch") ||
+    value.startsWith("validator-mismatch") ||
+    value.includes("error-document") ||
+    value.includes("encoded");
+}
+
+function mediaParallelRangeFailureIsIgnorable(failure) {
+  const value = String(failure || "").toLowerCase();
+  return !value ||
+    value === "aborted" ||
+    value === "client-aborted" ||
+    value === "host-disabled" ||
+    value === "validator-unavailable" ||
+    value === "not-planned" ||
+    value === "fanout-busy";
+}
+
+function noteMediaParallelRangeFailure(host, failure = "") {
   if (!host) return;
+  if (mediaParallelRangeFailureIsIgnorable(failure)) return;
   const entry = MEDIA_PARALLEL_RANGE_FAILURES.get(host) || {
     failures: 0,
     until: 0,
   };
+  if (mediaParallelRangeFailureIsDeterministic(failure)) {
+    entry.failures = MEDIA_PARALLEL_RANGE_FAILURE_LIMIT;
+    entry.until = Date.now() + MEDIA_PARALLEL_RANGE_INCOMPATIBLE_DISABLE_MS;
+    MEDIA_PARALLEL_RANGE_FAILURES.set(host, entry);
+    return;
+  }
   entry.failures += 1;
   if (entry.failures >= MEDIA_PARALLEL_RANGE_FAILURE_LIMIT) {
     entry.until = Date.now() + MEDIA_PARALLEL_RANGE_DISABLE_MS;
@@ -3277,10 +3562,7 @@ function mediaUpstreamConnectionLimit(env) {
   if (Number.isFinite(configured) && configured > 0) {
     return Math.min(8, Math.max(1, configured));
   }
-  const parallel = String(env?.MEDIA_PARALLEL_RANGE_ENABLED || "")
-    .trim()
-    .toLowerCase();
-  return /^(?:1|true|yes|on)$/.test(parallel)
+  return mediaParallelRangeEnabled
     ? MEDIA_UPSTREAM_CONNECTION_PARALLEL_MAX
     : MEDIA_UPSTREAM_CONNECTION_MAX;
 }
@@ -3292,13 +3574,9 @@ function mediaUpstreamGlobalConnectionLimit(env) {
   if (Number.isFinite(configured) && configured > 0) {
     return Math.min(16, Math.max(1, configured));
   }
-  const parallel = String(env?.MEDIA_PARALLEL_RANGE_ENABLED || "")
-    .trim()
-    .toLowerCase();
-  if (/^(?:1|true|yes|on)$/.test(parallel)) {
-    return MEDIA_UPSTREAM_CONNECTION_PARALLEL_MAX + 1;
-  }
-  return MEDIA_UPSTREAM_CONNECTION_GLOBAL_MAX;
+  return mediaParallelRangeEnabled
+    ? MEDIA_UPSTREAM_CONNECTION_PARALLEL_GLOBAL_MAX
+    : MEDIA_UPSTREAM_CONNECTION_GLOBAL_MAX;
 }
 
 // 媒体请求不能分别套“全局锁”和“主机锁”：外层拿到全局槽后如果卡在主机锁上，
@@ -3460,6 +3738,61 @@ function createMediaUpstreamScheduler({
 
 const MEDIA_UPSTREAM_SCHEDULER = createMediaUpstreamScheduler();
 
+// Parallel Range sessions are intentionally non-blocking. Queueing one behind a
+// busy CDN would hold the caller's fallback stream open and multiply timeouts.
+function createMediaParallelRangeCoordinator({
+  globalMax = MEDIA_PARALLEL_FANOUT_GLOBAL_MAX,
+  hostMax = MEDIA_PARALLEL_FANOUT_HOST_MAX,
+} = {}) {
+  const normalizedGlobalMax = Math.max(1, Math.floor(Number(globalMax) || 1));
+  const normalizedHostMax = Math.max(1, Math.floor(Number(hostMax) || 1));
+  let active = 0;
+  let generation = 0;
+  const activeByHost = new Map();
+  const hostActive = (host) => activeByHost.get(host) || 0;
+
+  return {
+    get active() {
+      return active;
+    },
+    activeByHost(host) {
+      return hostActive(String(host || "").toLowerCase());
+    },
+    tryAcquire(host) {
+      const normalizedHost = String(host || "").toLowerCase();
+      if (
+        active >= normalizedGlobalMax ||
+        hostActive(normalizedHost) >= normalizedHostMax
+      ) {
+        return null;
+      }
+      active += 1;
+      activeByHost.set(normalizedHost, hostActive(normalizedHost) + 1);
+      const leaseGeneration = generation;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        if (leaseGeneration !== generation) return;
+        active = Math.max(0, active - 1);
+        const remaining = hostActive(normalizedHost) - 1;
+        if (remaining > 0) {
+          activeByHost.set(normalizedHost, remaining);
+        } else {
+          activeByHost.delete(normalizedHost);
+        }
+      };
+    },
+    reset() {
+      generation += 1;
+      active = 0;
+      activeByHost.clear();
+    },
+  };
+}
+
+const MEDIA_PARALLEL_RANGE_COORDINATOR = createMediaParallelRangeCoordinator();
+
 // 连接租约不能随着 fetch() 返回响应头就释放：真正的上游套接字仍然被响应体
 // 占用。这里把租约绑定到 body 的完成/取消/异常，确保同一主机不会因为只拿到
 // 响应头就提前放行下一条连接。
@@ -3528,6 +3861,11 @@ async function openLegacyParallelMediaRangeStream(
   if (!mediaParallelRangeHostAllowed(host)) {
     return { error: "host-disabled" };
   }
+  const expectedValidator = mediaRangeValidator(
+    options.rangeValidator?.kind,
+    options.rangeValidator?.value,
+  );
+  if (!expectedValidator) return { error: "validator-unavailable" };
   const expectedTotal = Math.floor(Number(options.expectedTotal) || 0);
   const startedAt = Date.now();
   const states = new Array(plan.length);
@@ -3562,7 +3900,7 @@ async function openLegacyParallelMediaRangeStream(
   };
   const fail = async (error, response = null) => {
     await cancelAll();
-    noteMediaParallelRangeFailure(host);
+    noteMediaParallelRangeFailure(host, error);
     return {
       error,
       status: response?.status || 0,
@@ -3576,7 +3914,10 @@ async function openLegacyParallelMediaRangeStream(
       let response = null;
       const partStartedAt = Date.now();
       try {
-        response = await fetchRange(`bytes=${part.start}-${part.end}`);
+        response = await fetchRange(
+          `bytes=${part.start}-${part.end}`,
+          expectedValidator,
+        );
       } catch (error) {
         return {
           part,
@@ -3589,6 +3930,7 @@ async function openLegacyParallelMediaRangeStream(
         response,
         part,
         expectedTotal,
+        expectedValidator,
       );
       return {
         part,
@@ -3668,7 +4010,10 @@ async function openLegacyParallelMediaRangeStream(
     if (retryPart.length <= 0) return true;
     let response = null;
     try {
-      response = await fetchRange(`bytes=${retryPart.start}-${retryPart.end}`);
+      response = await fetchRange(
+        `bytes=${retryPart.start}-${retryPart.end}`,
+        expectedValidator,
+      );
     } catch {
       return false;
     }
@@ -3682,6 +4027,7 @@ async function openLegacyParallelMediaRangeStream(
       response,
       retryPart,
       expectedTotal,
+      expectedValidator,
     );
     if (failure) {
       try {
@@ -3745,7 +4091,7 @@ async function openLegacyParallelMediaRangeStream(
             return;
           }
           if (!await activatePart(activeIndex)) {
-            noteMediaParallelRangeFailure(host);
+            noteMediaParallelRangeFailure(host, "read-error-stream");
             controller.error(new Error("parallel media range unavailable"));
             return;
           }
@@ -3782,7 +4128,7 @@ async function openLegacyParallelMediaRangeStream(
         } catch {
           if (finished) return;
           if (await retryActivePart()) continue;
-          noteMediaParallelRangeFailure(host);
+          noteMediaParallelRangeFailure(host, "read-error-stream");
           controller.error(
             new Error(`parallel media range interrupted: ${activeIndex}`),
           );
@@ -3792,7 +4138,7 @@ async function openLegacyParallelMediaRangeStream(
           if (finished) return;
           if (activeDelivered < activePart.length) {
             if (await retryActivePart()) continue;
-            noteMediaParallelRangeFailure(host);
+            noteMediaParallelRangeFailure(host, "short-read");
             controller.error(
               new Error(
                 `parallel media range truncated: ${activeDelivered}/${activePart.length}`,
@@ -3832,10 +4178,12 @@ async function openLegacyParallelMediaRangeStream(
   };
 }
 
-// 有界、按序的 Range 管道：按 512KB 分块，窗口内最多四块在途。当前块边读边
-// 向下游发送，后续块各预取到自己的 512KB 缓冲区；消费完一块后才补入下一块。
+// 有界、按序的 Range 管道：按 512KB 分块，初始两路，只有首块完成且第二块
+// 在启动预算内完整到达时才扩到最多四块。所有块先在服务端按序完整收齐并校验，
+// 之后才把整段字节交给调用方。响应头一旦发给客户端就不能再安全回退，因此这里
+// 不允许把中途短读的并行结果直接流出去。
 // 某块中途短读/断流时，从尚未收到的偏移改走单 Range 续传；若续传也失败，
-// 让响应体报错，播放器会重试整段，绝不会把截断或错位数据当成完整分片。
+// 返回错误给调用方，由调用方改用已打开或重新建立的单连接完整响应。
 async function openRollingParallelMediaRangeStream(
   start,
   end,
@@ -3850,15 +4198,25 @@ async function openRollingParallelMediaRangeStream(
   if (!mediaParallelRangeHostAllowed(host)) {
     return { error: "host-disabled" };
   }
+  const expectedValidator = mediaRangeValidator(
+    options.rangeValidator?.kind,
+    options.rangeValidator?.value,
+  );
+  if (!expectedValidator) return { error: "validator-unavailable" };
+  const releaseFanout = MEDIA_PARALLEL_RANGE_COORDINATOR.tryAcquire(host);
+  if (!releaseFanout) {
+    return { error: "fanout-busy" };
+  }
   const expectedTotal = Math.floor(Number(options.expectedTotal) || 0);
   const startedAt = Date.now();
-  const windowSize = Math.min(
+  const maxWindowSize = Math.min(
     plan.length,
     Math.max(
-      2,
+      MEDIA_PARALLEL_RANGE_MIN_WINDOW,
       Math.floor(Number(options.window) || MEDIA_PARALLEL_RANGE_WINDOW),
     ),
   );
+  let windowSize = Math.min(plan.length, MEDIA_PARALLEL_RANGE_MIN_WINDOW);
   const states = new Array(plan.length);
   const openPromises = new Map();
   let currentIndex = 0;
@@ -3871,6 +4229,18 @@ async function openRollingParallelMediaRangeStream(
   let nextOpenIndex = 0;
   let aborted = false;
   let finished = false;
+  let fanoutReleased = false;
+  let lastFailure = "";
+  let bufferedReader = null;
+  let abortListener = null;
+
+  const releaseFanoutLease = () => {
+    if (fanoutReleased) return;
+    fanoutReleased = true;
+    releaseFanout();
+  };
+  const waitForOpenStagger = () =>
+    new Promise((resolve) => setTimeout(resolve, mediaParallelRangeOpenStaggerMs));
 
   const cancelReader = async (reader) => {
     if (!reader) return;
@@ -3885,6 +4255,8 @@ async function openRollingParallelMediaRangeStream(
     try {
       await state.response?.body?.cancel?.();
     } catch {}
+    state.response = null;
+    state.prefetchBytes = null;
   };
   const cancelAll = async () => {
     aborted = true;
@@ -3894,10 +4266,35 @@ async function openRollingParallelMediaRangeStream(
     await Promise.allSettled(
       states.filter(Boolean).map((state) => state.prefetchPromise),
     );
+    for (const state of states) {
+      if (!state) continue;
+      state.response = null;
+      state.prefetchBytes = null;
+      state.prefetchPromise = null;
+    }
+    releaseFanoutLease();
   };
+  const detachAbortListener = () => {
+    if (!abortListener || !options.signal?.removeEventListener) return;
+    options.signal.removeEventListener("abort", abortListener);
+    abortListener = null;
+  };
+  if (options.signal?.aborted) {
+    await cancelAll();
+    return { error: "client-aborted" };
+  }
+  if (options.signal?.addEventListener) {
+    abortListener = () => {
+      if (finished || aborted) return;
+      aborted = true;
+      void cancelAll();
+      void bufferedReader?.cancel(options.signal.reason);
+    };
+    options.signal.addEventListener("abort", abortListener, { once: true });
+  }
   const fail = async (error, response = null) => {
     await cancelAll();
-    noteMediaParallelRangeFailure(host);
+    noteMediaParallelRangeFailure(host, error);
     return {
       error,
       status: response?.status || 0,
@@ -3911,7 +4308,10 @@ async function openRollingParallelMediaRangeStream(
       let response = null;
       const partStartedAt = Date.now();
       try {
-        response = await fetchRange(`bytes=${part.start}-${part.end}`);
+        response = await fetchRange(
+          `bytes=${part.start}-${part.end}`,
+          expectedValidator,
+        );
       } catch (error) {
         return {
           part,
@@ -3935,6 +4335,7 @@ async function openRollingParallelMediaRangeStream(
         response,
         part,
         expectedTotal,
+        expectedValidator,
       );
       return {
         part,
@@ -3982,6 +4383,7 @@ async function openRollingParallelMediaRangeStream(
           try {
             response = await fetchRange(
               `bytes=${retryPart.start}-${retryPart.end}`,
+              expectedValidator,
             );
           } catch (error) {
             state.prefetchError = `fetch-error-${
@@ -4001,6 +4403,7 @@ async function openRollingParallelMediaRangeStream(
             response,
             retryPart,
             expectedTotal,
+            expectedValidator,
           );
           if (failure) {
             state.prefetchError = failure;
@@ -4072,13 +4475,16 @@ async function openRollingParallelMediaRangeStream(
       return state;
     });
   };
-  // 初始窗口的响应头必须全部有效，此时还没有向下游发送任何字节，可以安全
-  // 回退到调用方已经建好的单连接。
+  // 初始只开两路，并在请求起点之间留出短间隔。响应头必须全部有效后才开始
+  // 向下游发送，任何一路不兼容都可以安全回退到调用方原有的单连接。
   const initialCount = Math.min(windowSize, plan.length);
   nextOpenIndex = initialCount;
-  const initial = await Promise.all(
-    Array.from({ length: initialCount }, (_, index) => loadPart(index)),
-  );
+  const initialPromises = [loadPart(0)];
+  for (let index = 1; index < initialCount; index += 1) {
+    await waitForOpenStagger();
+    initialPromises.push(loadPart(index));
+  }
+  const initial = await Promise.all(initialPromises);
   if (aborted) {
     await cancelAll();
     return { error: "aborted" };
@@ -4103,28 +4509,67 @@ async function openRollingParallelMediaRangeStream(
     currentDelivered = 0;
     currentAttempts = 0;
   };
-  const openFutureWindow = () => {
+  const openFutureWindow = async () => {
     const target = Math.min(plan.length - 1, currentIndex + windowSize - 1);
+    const opening = [];
     while (nextOpenIndex <= target) {
       const index = nextOpenIndex;
       nextOpenIndex += 1;
-      loadPart(index).then((state) => {
-        if (aborted || state.failure) return;
+      opening.push(loadPart(index).then((state) => {
+        if (aborted) return cancelState(state);
+        if (state.failure) return;
         prefetchPart(index);
-      }).catch(() => {});
+      }).catch(() => {}));
+      if (nextOpenIndex <= target) await waitForOpenStagger();
     }
+    await Promise.all(opening);
+  };
+  const maybeExpandWindow = async () => {
+    if (windowSize >= maxWindowSize || plan.length <= windowSize) return;
+    // Expand only after the first chunk has been fully delivered and the second
+    // 512KB chunk arrived within the startup budget. One slow hop keeps the
+    // session at two connections instead of multiplying pressure.
+    if (currentIndex !== 1) return;
+    if (
+      Date.now() - startedAt >
+        mediaParallelRangeExpandWindowMs
+    ) {
+      return;
+    }
+    const second = states[1];
+    if (!second || second.failure || !second.prefetchPromise) return;
+    await second.prefetchPromise;
+    if (
+      aborted ||
+      !second.prefetchComplete ||
+      second.prefetchBytes?.byteLength !== second.part.length ||
+      Date.now() - startedAt > mediaParallelRangeExpandWindowMs
+    ) {
+      return;
+    }
+    windowSize = maxWindowSize;
   };
   const finishCurrent = async () => {
+    const completedState = currentState;
     await cancelReader(currentReader);
     resetCurrent();
+    if (completedState) {
+      completedState.response = null;
+      completedState.prefetchBytes = null;
+      completedState.prefetchPromise = null;
+    }
     currentIndex += 1;
-    // 当前块已经结束，立刻补入下一块，让窗口始终从当前块起保持四块。
-    openFutureWindow();
+    await maybeExpandWindow();
+    // Only after the stability decision may the window grow from two to four.
+    await openFutureWindow();
   };
   const activateCurrent = async () => {
     const state = states[currentIndex] || await loadPart(currentIndex);
     if (aborted) return false;
-    if (state.failure) return false;
+    if (state.failure) {
+      lastFailure = state.failure;
+      return false;
+    }
     resetCurrent();
     currentState = state;
     if (currentIndex === 0) {
@@ -4139,6 +4584,8 @@ async function openRollingParallelMediaRangeStream(
       !state.prefetchComplete ||
       state.prefetchBytes?.byteLength !== state.part.length
     ) {
+      lastFailure = state.prefetchError ||
+        `short-read-${state.prefetchBytes?.byteLength || 0}/${state.part.length}`;
       return false;
     }
     currentBuffered = state.prefetchBytes;
@@ -4166,8 +4613,12 @@ async function openRollingParallelMediaRangeStream(
     };
     let response = null;
     try {
-      response = await fetchRange(`bytes=${retryPart.start}-${retryPart.end}`);
-    } catch {
+      response = await fetchRange(
+        `bytes=${retryPart.start}-${retryPart.end}`,
+        expectedValidator,
+      );
+    } catch (error) {
+      lastFailure = `fetch-error-${error?.name || "unknown"}`;
       return false;
     }
     if (finished) {
@@ -4180,8 +4631,10 @@ async function openRollingParallelMediaRangeStream(
       response,
       retryPart,
       expectedTotal,
+      expectedValidator,
     );
     if (failure) {
+      lastFailure = failure;
       try {
         await response?.body?.cancel?.();
       } catch {}
@@ -4202,12 +4655,13 @@ async function openRollingParallelMediaRangeStream(
           if (currentIndex >= plan.length) {
             finished = true;
             noteMediaParallelRangeSuccess(host);
+            releaseFanoutLease();
             controller.close();
             return;
           }
           if (!await activateCurrent()) {
             await cancelAll();
-            noteMediaParallelRangeFailure(host);
+            noteMediaParallelRangeFailure(host, lastFailure);
             controller.error(new Error("parallel media range unavailable"));
             return;
           }
@@ -4239,7 +4693,7 @@ async function openRollingParallelMediaRangeStream(
           if (!currentReader) {
             if (currentAttempts >= MEDIA_PARALLEL_RANGE_MAX_ATTEMPTS) {
               await cancelAll();
-              noteMediaParallelRangeFailure(host);
+              noteMediaParallelRangeFailure(host, lastFailure);
               controller.error(
                 new Error(
                   `parallel media range interrupted: ${currentIndex}`,
@@ -4256,12 +4710,17 @@ async function openRollingParallelMediaRangeStream(
               mediaStreamIdleTimeoutMs,
             );
           } catch {
+            lastFailure = "read-error-stream";
             currentReader = null;
             continue;
           }
           if (result.done) {
             currentReader = null;
-            if (currentDelivered < currentState.part.length) continue;
+            if (currentDelivered < currentState.part.length) {
+              lastFailure =
+                `short-read-${currentDelivered}/${currentState.part.length}`;
+              continue;
+            }
             await finishCurrent();
             return;
           }
@@ -4288,10 +4747,47 @@ async function openRollingParallelMediaRangeStream(
     },
   });
 
+  const total = plan.reduce((sum, part) => sum + part.length, 0);
+  let buffered = null;
+  try {
+    buffered = await readMediaBodyFullyWithIdleTimeout(
+      new Response(body),
+      total,
+      {
+        onReader(reader) {
+          bufferedReader = reader;
+        },
+      },
+    );
+  } finally {
+    detachAbortListener();
+  }
+  if (aborted || options.signal?.aborted) {
+    await cancelAll();
+    return { error: "client-aborted" };
+  }
+  if (
+    !buffered?.complete ||
+    !buffered.bytes ||
+    buffered.bytes.byteLength !== total
+  ) {
+    return fail(
+      lastFailure ||
+        `incomplete-buffer-${buffered?.bytes?.byteLength || 0}/${total}`,
+    );
+  }
+  if (
+    total >= MPEG_TS_MIN_JUDGE_BYTES &&
+    (buffered.bytes[0] !== 0x47 || mpegTsLengthTruncated(total))
+  ) {
+    return fail(`packet-misaligned-${total}`);
+  }
+  finished = true;
+  await cancelAll();
   return {
-    body,
-    total: plan.reduce((sum, part) => sum + part.length, 0),
-    timing: `ordered;${Date.now() - startedAt}ms;window=${windowSize};chunks=${
+    bytes: buffered.bytes,
+    total,
+    timing: `buffered;${Date.now() - startedAt}ms;window=${windowSize};chunks=${
       plan.length
     }`,
   };
@@ -4367,6 +4863,12 @@ async function readMediaBodyFullyWithIdleTimeout(
 // 客户端请求的精确区间，并同步修正响应头。
 function trimMediaRangeResponseBody(upstream, request, headers, options = {}) {
   const rangeHeader = request.headers.get("range");
+  const rangeValidator =
+    mediaRangeValidator(
+      options.rangeValidator?.kind,
+      options.rangeValidator?.value,
+    ) ||
+    mediaRangeValidatorFromHeaders(upstream.headers);
   const contentRange = parseMediaContentRange(
     headers.get("content-range") || "",
   );
@@ -4404,6 +4906,7 @@ function trimMediaRangeResponseBody(upstream, request, headers, options = {}) {
       expectedTotal: contentRange.total ?? 0,
       fetchRange: options.fetchRange ||
         mediaContinuationFetcherFor(upstream),
+      rangeValidator,
       signal: options.signal,
       maxResumes: options.maxResumes,
     },
@@ -4447,6 +4950,13 @@ function embeddedTsMappedResponse(upstream, metadata, range, options = {}) {
   );
   const mappedStart = range.start + metadata.prefixLength;
   const absoluteStart = upstreamRange?.start ?? mappedStart;
+  const rangeValidator =
+    mediaRangeValidator(
+      options.rangeValidator?.kind,
+      options.rangeValidator?.value,
+    ) ||
+    mediaRangeValidatorFromMetadata(metadata) ||
+    mediaRangeValidatorFromHeaders(upstream.headers);
   const body = resumableExactMediaStreamBody(
     upstream.body,
     range.end - range.start + 1,
@@ -4456,6 +4966,7 @@ function embeddedTsMappedResponse(upstream, metadata, range, options = {}) {
       expectedTotal: metadata.upstreamTotal,
       fetchRange: options.fetchRange ||
         mediaContinuationFetcherFor(upstream),
+      rangeValidator,
       signal: options.signal,
       maxResumes: options.maxResumes,
     },
@@ -4780,6 +5291,7 @@ function streamMediaBodyWithPrefix(
     absoluteStart: options.absoluteStart,
     expectedTotal: options.expectedTotal,
     fetchRange: options.fetchRange,
+    rangeValidator: options.rangeValidator,
     maxResumes: options.maxResumes,
     signal: options.signal,
     validateChunk: options.validateChunk,
@@ -4791,6 +5303,12 @@ function streamMediaBodyWithPrefix(
 
 async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) {
   if (!upstream?.body) return null;
+  const rangeValidator =
+    mediaRangeValidator(
+      options.rangeValidator?.kind,
+      options.rangeValidator?.value,
+    ) ||
+    mediaRangeValidatorFromHeaders(upstream.headers);
   const originalContentType = String(
     upstream.headers.get("content-type") || "",
   ).split(";")[0].trim().toLowerCase();
@@ -4848,6 +5366,7 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
         expectedTotal: sourceTotal,
         absoluteStart: sourceStart,
         fetchRange: options.fetchRange,
+        rangeValidator,
         signal: options.signal,
       },
     );
@@ -4873,6 +5392,7 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
       embeddedOffset,
       upstreamTotal,
       "video/mp2t",
+      rangeValidator,
     );
     if (metadata) {
       MEDIA_SEGMENT_PREFIX_CACHE.write(cacheKey, metadata);
@@ -4923,6 +5443,7 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
     expectedTotal: sourceTotal,
     absoluteStart: sourceStart + embeddedOffset,
     fetchRange: options.fetchRange,
+    rangeValidator,
     signal: options.signal,
     expectMpegTs: true,
     cacheKey,
@@ -4952,7 +5473,9 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
       options.fetchParallelRange,
       {
         expectedTotal: upstreamTotal,
+        rangeValidator,
         host: options.parallelHost || "",
+        signal: options.signal,
       },
     );
     if (parallel?.total === normalizedBodyBytes) {
@@ -4964,10 +5487,10 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
         await prefixResult.reader?.cancel?.();
       } catch {}
       body = streamMediaBodyWithPrefix(
-        new Uint8Array(0),
+        parallel.bytes,
         null,
-        parallel.body.getReader(),
-        false,
+        null,
+        true,
         // 并行管道本身已经按段占用最多 8MB。再复制一份完整分片到本地缓存会在
         // 多个 HLS 请求重叠时把内存峰值翻倍，正是 1102 的高风险来源。
         { ...cacheOptions, cacheKey: "", cacheLimit: 0 },
@@ -5018,6 +5541,7 @@ async function probeEmbeddedTsSegmentMetadata(
     : fetch;
   try {
     const probeHeaders = mediaProxyRequestHeaders(request, env, sourceUrl, {});
+    clearMediaRangeRequestConditions(probeHeaders);
     probeHeaders.set(
       "range",
       `bytes=0-${Math.max(0, REMOTE_MEDIA_PROBE_BYTES - 1)}`,
@@ -5049,7 +5573,12 @@ async function probeEmbeddedTsSegmentMetadata(
           : null);
     const rangeStartsAtZero = !range || range.start === 0;
     if (offset >= 0 && total && rangeStartsAtZero) {
-      const metadata = mediaSegmentPrefixMetadata(offset, total, "video/mp2t");
+      const metadata = mediaSegmentPrefixMetadata(
+        offset,
+        total,
+        "video/mp2t",
+        mediaRangeValidatorFromHeaders(probe.headers),
+      );
       if (metadata) {
         if (cacheKey) MEDIA_SEGMENT_PREFIX_CACHE.write(cacheKey, metadata);
         return metadata;
@@ -5246,6 +5775,12 @@ async function streamCompleteMediaSegmentResponse(
     absoluteStart: 0,
     expectedTotal: contentLength,
     fetchRange: options.fetchRange,
+    rangeValidator:
+      mediaRangeValidator(
+        options.rangeValidator?.kind,
+        options.rangeValidator?.value,
+      ) ||
+      mediaRangeValidatorFromHeaders(upstream.headers),
     signal: options.signal,
     validateChunk: (chunk, offset) => {
       if (
@@ -5394,6 +5929,12 @@ function teeMediaRangeResponseBody(
   const hasValidator = Boolean(
     upstream.headers.get("etag") || upstream.headers.get("last-modified"),
   );
+  const rangeValidator =
+    mediaRangeValidator(
+      options.rangeValidator?.kind,
+      options.rangeValidator?.value,
+    ) ||
+    mediaRangeValidatorFromHeaders(upstream.headers);
   const expectedBytes = expectedUpstreamBodyBytes(upstream.headers);
   const cacheableBytes = contentLength > 0 ? contentLength : expectedBytes;
   const shouldCache = hasValidator &&
@@ -5416,6 +5957,7 @@ function teeMediaRangeResponseBody(
     absoluteStart: contentRange?.start ?? 0,
     expectedTotal: contentRange?.total ?? 0,
     fetchRange: options.fetchRange,
+    rangeValidator,
     signal: options.signal,
     validateChunk: (chunk, delivered) => {
       if (
@@ -5557,12 +6099,14 @@ async function fetchMediaUpstreamResponse(
       return upstreamTimeoutResponse();
     }
   };
-  // “这次响应值不值得换条连接重试”：只重试明确的边缘限流/网关超时。
-  // 500/501/502 等普通上游错误直接返回，避免把上游故障放大成重试风暴。
+  // “这次响应值不值得换条连接重试”：只重试明确的边缘限流/网关错误。
+  // 502 常由 CDN 边缘瞬时换节点产生，恢复后第二次通常可成功；500/501
+  // 等其他普通上游错误仍直接返回，避免把上游故障放大成重试风暴。
   const isRetryableUpstreamResponse = (response) => {
     if (!response) return true;
     if (response.headers.get(MEDIA_UPSTREAM_TIMEOUT_HEADER)) return true;
-    return response.status === 503 ||
+    return response.status === 502 ||
+      response.status === 503 ||
       response.status === 504 ||
       response.status === 524;
   };
@@ -5613,14 +6157,20 @@ async function fetchMediaUpstreamResponse(
   const fetchUpstreamRaw = (requestHeaders = headers) =>
     fetchUpstream(requestHeaders);
   let fetchMediaContinuationRange = null;
+  let fetchMediaParallelRange = null;
   const fetchUpstreamWithRetry = async (requestHeaders = headers) => {
     const response = await fetchUpstreamRaw(requestHeaders);
-    return rememberMediaContinuationFetcher(
+    rememberMediaContinuationFetcher(
       response,
       fetchMediaContinuationRange,
     );
+    return rememberMediaParallelRangeTransport(
+      response,
+      fetchMediaParallelRange,
+      mediaUpstreamHost,
+    );
   };
-  fetchMediaContinuationRange = (start, end) => {
+  fetchMediaContinuationRange = (start, end, expectedValidator = null) => {
     const continuationStart = Math.floor(Number(start));
     const continuationEnd = Math.floor(Number(end));
     if (
@@ -5632,23 +6182,39 @@ async function fetchMediaUpstreamResponse(
       return Promise.reject(new Error("invalid media continuation range"));
     }
     const continuationHeaders = new Headers(headers);
-    for (const name of [
-      "if-match",
-      "if-range",
-      "if-none-match",
-      "if-modified-since",
-    ]) {
-      continuationHeaders.delete(name);
-    }
+    clearMediaRangeRequestConditions(continuationHeaders);
     continuationHeaders.set(
       "range",
       `bytes=${continuationStart}-${continuationEnd}`,
     );
     continuationHeaders.set("accept-encoding", "identity");
+    setMediaRangeIfRangeHeader(continuationHeaders, expectedValidator);
     // Use the same per-host/global scheduler and transient retry loop as the
     // original request. Calling fetch() directly here would bypass both.
     return fetchUpstreamRaw(continuationHeaders);
   };
+  // 服务端并行 Range 用的取数函数：沿用同一条线路的请求头（origin / referer /
+  // user-agent），只替换 Range。条件请求头必须去掉，否则内部换区间的请求会被
+  // 上游按“条件不满足”回 304 / 空体。
+  //
+  // 这个函数必须在“不启用分段缓存”的提前返回之前创建。直接播放路径和
+  // 无扩展名媒体不会走下面的缓存分支，但它们仍可能在 proxyMediaResponse()
+  // 中识别出 PNG/font 外壳里的 TS；如果这里还是 null，响应就登记不到并行
+  // Range 传输能力，只能退回单连接。
+  fetchMediaParallelRange = (rangeHeader, expectedValidator = null) => {
+    const parallelHeaders = new Headers(headers);
+    clearMediaRangeRequestConditions(parallelHeaders);
+    parallelHeaders.set("range", rangeHeader);
+    parallelHeaders.set("accept-encoding", "identity");
+    // A CDN may redirect the same signed URL to different object replicas. If
+    // the probe exposed a validator, require every Range to refer to that same
+    // representation. A mismatch is handled as an incompatible Range response
+    // and falls back to one ordered stream.
+    setMediaRangeIfRangeHeader(parallelHeaders, expectedValidator);
+    return fetchUpstreamWithRetry(parallelHeaders);
+  };
+  const fetchParallelRange = fetchMediaParallelRange;
+  const parallelHost = mediaUpstreamHostOf(sourceUrl);
 
   // 虚拟 HLS 子分片：清单里已经把一条伪 TS 分片拆成 vsplit 条等长子区间。
   // 这里把虚拟偏移映射回「PNG / 字体外壳之后」的真实上游字节。任一环节
@@ -5667,6 +6233,7 @@ async function fetchMediaUpstreamResponse(
       let virtualMetadata = MEDIA_SEGMENT_PREFIX_CACHE.read(virtualCacheKey);
       if (!virtualMetadata) {
         const probeHeaders = new Headers(headers);
+        clearMediaRangeRequestConditions(probeHeaders);
         probeHeaders.set(
           "range",
           `bytes=0-${Math.max(0, REMOTE_MEDIA_PROBE_BYTES - 1)}`,
@@ -5695,6 +6262,7 @@ async function fetchMediaUpstreamResponse(
             probeOffset,
             probeTotal,
             "video/mp2t",
+            mediaRangeValidatorFromHeaders(probe.headers),
           );
           if (virtualMetadata) {
             MEDIA_SEGMENT_PREFIX_CACHE.write(
@@ -5705,7 +6273,8 @@ async function fetchMediaUpstreamResponse(
         }
       }
 
-      if (virtualMetadata) {
+      const virtualValidator = mediaRangeValidatorFromMetadata(virtualMetadata);
+      if (virtualMetadata && virtualValidator) {
         const virtualTotal = virtualMetadata.upstreamTotal -
           virtualMetadata.prefixLength;
         const partBounds = hlsVirtualPartBounds(virtualPart, virtualTotal);
@@ -5738,6 +6307,7 @@ async function fetchMediaUpstreamResponse(
             const expectedLength = virtualRange.end - virtualRange.start + 1;
             const mappedHeaders = new Headers(headers);
             for (const name of [
+              "if-match",
               "if-range",
               "if-none-match",
               "if-modified-since",
@@ -5745,6 +6315,8 @@ async function fetchMediaUpstreamResponse(
               mappedHeaders.delete(name);
             }
             mappedHeaders.set("range", `bytes=${mappedStart}-${mappedEnd}`);
+            mappedHeaders.set("accept-encoding", "identity");
+            setMediaRangeIfRangeHeader(mappedHeaders, virtualValidator);
             const partUpstream = await fetchUpstreamWithRetry(mappedHeaders);
             const partRange = parseMediaContentRange(
               partUpstream.headers.get("content-range") || "",
@@ -5758,12 +6330,18 @@ async function fetchMediaUpstreamResponse(
               partRange.total === virtualMetadata.upstreamTotal;
             const partLengthMatches = !Number.isSafeInteger(partLength) ||
               partLength === expectedLength;
+            const partValidatorFailure =
+              mediaRangeResponseValidatorFailure(
+                partUpstream.headers,
+                virtualValidator,
+              );
             if (
               partUpstream.status === 206 &&
               partUpstream.body &&
               !mediaResponseBodyIsEncoded(partUpstream.headers) &&
               partRangeMatches &&
               partLengthMatches &&
+              !partValidatorFailure &&
               !mediaContentTypeLooksLikeErrorDocument(
                 partUpstream.headers.get("content-type") || "",
               )
@@ -5799,6 +6377,7 @@ async function fetchMediaUpstreamResponse(
                     absoluteStart: mappedStart,
                     expectedTotal: virtualMetadata.upstreamTotal,
                     fetchRange: fetchMediaContinuationRange,
+                    rangeValidator: virtualValidator,
                     signal: request.signal,
                   },
                 ),
@@ -5814,6 +6393,9 @@ async function fetchMediaUpstreamResponse(
             try {
               await partUpstream.body?.cancel();
             } catch {}
+            if (partValidatorFailure) {
+              MEDIA_SEGMENT_PREFIX_CACHE.forget(virtualCacheKey);
+            }
           }
         }
       }
@@ -5951,7 +6533,11 @@ async function fetchMediaUpstreamResponse(
     return cachedMediaSegmentResponse(bufferedResult.record, request);
   }
 
-  const cacheEmbeddedTsResult = (result, upstreamContentRange = "") => {
+  const cacheEmbeddedTsResult = (
+    result,
+    upstreamContentRange = "",
+    rangeValidator = null,
+  ) => {
     if (!result?.record) return result;
     if (result.cacheable && !result.errorDocument) {
       MEDIA_SEGMENT_BODY_CACHE.write(cacheKey, result.record);
@@ -5964,6 +6550,7 @@ async function fetchMediaUpstreamResponse(
         result.embeddedOffset,
         upstreamTotal,
         "video/mp2t",
+        rangeValidator,
       );
       if (metadata) {
         MEDIA_SEGMENT_PREFIX_CACHE.write(cacheKey, metadata);
@@ -5981,21 +6568,9 @@ async function fetchMediaUpstreamResponse(
       return cacheEmbeddedTsResult(
         result,
         upstream.headers.get("content-range") || "",
+        mediaRangeValidatorFromHeaders(upstream.headers),
       );
     });
-
-  // 服务端并行 Range 用的取数函数：沿用同一条线路的请求头（origin / referer /
-  // user-agent），只替换 Range。条件请求头必须去掉，否则内部换区间的请求会被
-  // 上游按“条件不满足”回 304 / 空体。
-  const fetchParallelRange = (rangeHeader) => {
-    const parallelHeaders = new Headers(headers);
-    for (const name of ["if-range", "if-none-match", "if-modified-since"]) {
-      parallelHeaders.delete(name);
-    }
-    parallelHeaders.set("range", rangeHeader);
-    return fetchUpstreamWithRetry(parallelHeaders);
-  };
-  const parallelHost = mediaUpstreamHostOf(sourceUrl);
 
   const requestedRangeHeader = request.headers.get("range");
   if (!requestedRangeHeader) {
@@ -6031,13 +6606,7 @@ async function fetchMediaUpstreamResponse(
     let metadata = MEDIA_SEGMENT_PREFIX_CACHE.read(cacheKey);
     if (!metadata) {
       const probeHeaders = new Headers(headers);
-      for (const name of [
-        "if-range",
-        "if-none-match",
-        "if-modified-since",
-      ]) {
-        probeHeaders.delete(name);
-      }
+      clearMediaRangeRequestConditions(probeHeaders);
       probeHeaders.set(
         "range",
         `bytes=0-${Math.max(0, REMOTE_MEDIA_PROBE_BYTES - 1)}`,
@@ -6114,6 +6683,7 @@ async function fetchMediaUpstreamResponse(
                 probeOffset,
                 probeRange.total,
                 "video/mp2t",
+                mediaRangeValidatorFromHeaders(probe.headers),
               );
               if (metadata) {
                 MEDIA_SEGMENT_PREFIX_CACHE.write(cacheKey, metadata);
@@ -6170,7 +6740,9 @@ async function fetchMediaUpstreamResponse(
         fetchParallelRange,
         {
           expectedTotal: metadata.upstreamTotal,
+          rangeValidator: mediaRangeValidatorFromMetadata(metadata),
           host: parallelHost,
+          signal: request.signal,
         },
       );
       const response = embeddedTsParallelWholeResponse(parallel, metadata);
@@ -6185,6 +6757,7 @@ async function fetchMediaUpstreamResponse(
   let probeStatus = 0;
   if (!metadata) {
     const probeHeaders = new Headers(headers);
+    clearMediaRangeRequestConditions(probeHeaders);
     probeHeaders.set(
       "range",
       `bytes=0-${Math.max(0, REMOTE_MEDIA_PROBE_BYTES - 1)}`,
@@ -6218,6 +6791,7 @@ async function fetchMediaUpstreamResponse(
         probeOffset,
         upstreamTotal,
         "video/mp2t",
+        mediaRangeValidatorFromHeaders(probe.headers),
       );
       if (metadata) {
         MEDIA_SEGMENT_PREFIX_CACHE.write(cacheKey, metadata);
@@ -6239,6 +6813,7 @@ async function fetchMediaUpstreamResponse(
           sourceUrl,
         ),
         probe.headers.get("content-range") || "",
+        mediaRangeValidatorFromHeaders(probe.headers),
       );
       const response = bufferedMediaResultResponse(result, request);
       if (response) return response;
@@ -6298,10 +6873,15 @@ async function fetchMediaUpstreamResponse(
       mappedStart,
       mappedEnd,
       fetchParallelRange,
-      { expectedTotal: metadata.upstreamTotal, host: parallelHost },
+      {
+        expectedTotal: metadata.upstreamTotal,
+        rangeValidator: mediaRangeValidatorFromMetadata(metadata),
+        host: parallelHost,
+        signal: request.signal,
+      },
     )
     : null;
-  if (parallel?.body && parallel.total === range.end - range.start + 1) {
+  if (parallel?.bytes && parallel.total === range.end - range.start + 1) {
     return embeddedTsParallelRangeResponse(
       parallel,
       metadata,
@@ -6309,21 +6889,43 @@ async function fetchMediaUpstreamResponse(
     );
   }
 
+  const metadataValidator = mediaRangeValidatorFromMetadata(metadata);
   const mappedHeaders = new Headers(headers);
+  for (const name of [
+    "if-match",
+    "if-range",
+    "if-none-match",
+    "if-modified-since",
+  ]) {
+    mappedHeaders.delete(name);
+  }
   mappedHeaders.set("range", embeddedTsMappedRange(range, metadata));
+  mappedHeaders.set("accept-encoding", "identity");
+  setMediaRangeIfRangeHeader(mappedHeaders, metadataValidator);
   const mappedUpstream = await fetchUpstreamWithRetry(mappedHeaders);
   const mappedRange = parseMediaContentRange(
     mappedUpstream.headers.get("content-range") || "",
   );
   const mappedLength = Number(mappedUpstream.headers.get("content-length"));
-  const mappedRangeMatches = !mappedRange ||
-    (mappedRange.start === mappedStart && mappedRange.end === mappedEnd);
+  const mappedRangeMatches = Boolean(
+    mappedRange &&
+    mappedRange.start === mappedStart &&
+    mappedRange.end === mappedEnd &&
+    mappedRange.total === metadata.upstreamTotal,
+  );
   const mappedLengthMatches = !Number.isSafeInteger(mappedLength) ||
     mappedLength === range.end - range.start + 1;
+  const mappedValidatorFailure = metadataValidator
+    ? mediaRangeResponseValidatorFailure(
+      mappedUpstream.headers,
+      metadataValidator,
+    )
+    : "";
   if (
     mappedUpstream.status === 206 &&
     mappedRangeMatches &&
-    mappedLengthMatches
+    mappedLengthMatches &&
+    !mappedValidatorFailure
   ) {
     const response = embeddedTsMappedResponse(
       mappedUpstream,
@@ -6331,6 +6933,7 @@ async function fetchMediaUpstreamResponse(
       range,
       {
         fetchRange: fetchMediaContinuationRange,
+        rangeValidator: metadataValidator,
         signal: request.signal,
       },
     );
@@ -6338,9 +6941,29 @@ async function fetchMediaUpstreamResponse(
   }
 
   if (mappedUpstream.status === 200) {
+    const fullValidatorFailure = metadataValidator
+      ? mediaRangeResponseValidatorFailure(
+        mappedUpstream.headers,
+        metadataValidator,
+      )
+      : "";
+    if (fullValidatorFailure) {
+      MEDIA_SEGMENT_PREFIX_CACHE.forget(cacheKey);
+      try {
+        await mappedUpstream.body?.cancel();
+      } catch {}
+      const fallbackResult = await bufferFullEmbeddedTsResponse();
+      const fallbackResponse = bufferedMediaResultResponse(
+        fallbackResult,
+        request,
+      );
+      if (fallbackResponse) return fallbackResponse;
+      return fetchUpstreamWithRetry();
+    }
     const result = cacheEmbeddedTsResult(
       await bufferMediaSegmentResponse(mappedUpstream, sourceUrl),
       mappedUpstream.headers.get("content-range") || "",
+      mediaRangeValidatorFromHeaders(mappedUpstream.headers),
     );
     const response = bufferedMediaResultResponse(result, request);
     if (response) return response;
@@ -7142,6 +7765,8 @@ async function proxyMediaResponse(
         parallelTransportDisabled:
           requestUrl.searchParams.get("_parallel") === "0",
         fetchRange: mediaContinuationFetcherFor(upstream),
+        fetchParallelRange: mediaParallelRangeFetcherFor(upstream),
+        parallelHost: mediaParallelRangeHostFor(upstream),
         signal: request.signal,
       },
     );
@@ -7512,16 +8137,16 @@ const FETCH_MAX_ATTEMPTS = 2;
 // 绝对截止时间，元数据、播放源和字幕不能再各自累计等待。
 // 实测回退解析端冷启动要 6~21 秒（主解析器若被停用更是完全不可用），旧值
 // 8200 会把“刚好差一点点就返回真实线路”的那批请求提前截断成占位源。放宽到
-// 9000，仍明显小于客户端约 10 秒的超时；真正超时的请求会由 resolveVideo 的
+// 9200，仍低于客户端约 10 秒的超时；真正超时的请求会由 resolveVideo 的
 // onPartial 早发布拿到已经解析出的线路，不会退回空源。
 //
-// 但 9000 这个总截止线同时被“先取影片元数据”吃掉一部分：线上实测冷启动
+// 但总截止线同时被“先取影片元数据”吃掉一部分：线上实测冷启动
 // 取元数据要 1.0~1.5 秒，留给播放源解析的只剩 7.5~8.0 秒，而公共解析器冷启动
 // 实测要 6.6~8.7 秒——两者几乎重合，“第一次点开只有一条/占位源，退出再点才变多”
-// 就是在这个边界上随机复现的。这里把总截止线提到 9.6 秒（仍低于客户端 ~10 秒），
+// 就是在这个边界上随机复现的。这里把总截止线提到 9.2 秒（仍低于客户端 ~10 秒），
 // 并把元数据预算从 4.2 秒收到 3.6 秒（元数据正常 <1.5 秒，只有上游真的挂住才会
 // 用满），把差额让给播放源解析。
-const ITEM_REQUEST_DEADLINE_MS = 9600;
+const ITEM_REQUEST_DEADLINE_MS = 9200;
 const ITEM_METADATA_BUDGET_MS = 3600;
 // 播放源解析接口是第三方现场抓取：响应头有时很快，但 700KB 左右的 JSON
 // 会慢慢挤牙膏。整个请求（包括响应体读取）必须控制在客户端等待预算内，
@@ -9624,7 +10249,10 @@ async function getMoviePage(query, env, fetchImpl, token = "", options = {}) {
     TotalRecordCount: page.totalRecordCount,
     StartIndex: startIndex,
   };
-  return attachPrewarmMovies(result, upstreamScanRan ? [] : page.movies);
+  return attachListPagePrewarm(result, page.movies, {
+    upstreamScanRan,
+    searchTerm,
+  });
 }
 
 // 抓取分类/搜索结果（不依赖具体客户端地址，所以可以整块缓存复用）。
@@ -10009,7 +10637,10 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
     TotalRecordCount: page.totalRecordCount,
     StartIndex: startIndex,
   };
-  return attachPrewarmMovies(result, upstreamScanRan ? [] : page.movies);
+  return attachListPagePrewarm(result, page.movies, {
+    upstreamScanRan,
+    searchTerm,
+  });
 }
 
 // 点击“类别 / 标签 / 片商 / 系列”后的作品列表：把 Id 还原出的名字当关键词搜。
@@ -11373,14 +12004,13 @@ function markResolvedVideoCacheComplete(video) {
 }
 
 // 缓存（内存 / 边缘 / D1）里的播放源能不能直接复用：
-//   - 多条线路：可以（正是首屏想要的结果）；
-//   - 单条线路：只有解析链收尾时打过标记的才可信。
+// 只有解析链真正收尾时打过标记的结果才可信。线路数量不能作为完整性依据：
+// 公共解析器与自建补源并行时，两条线路的首屏快照也很常见，但它仍可能在
+// 后续补出更多线路；若把这种快照当完整缓存，客户端会长期少源。
 function resolvedVideoCacheIsTrustworthy(video) {
   if (!isUsableResolvedVideo(video)) return false;
-  if (resolvedVideoSourceCount(video) >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT) {
-    return true;
-  }
-  return video[RESOLVED_VIDEO_COMPLETE_FLAG] === true;
+  return video[RESOLVED_VIDEO_COMPLETE_FLAG] === true ||
+    RESOLVED_VIDEO_COMPLETENESS.get(video) === true;
 }
 
 function markResolvedVideoResolutionComplete(video, complete) {
@@ -11433,45 +12063,33 @@ const RESOLVE_VIDEO_STALE_PEEK_MS = 1200;
 //   5. 无论哪条，整条解析链一旦收尾就立刻返回它（优先完整、已校验的结果）；
 //   6. 最坏也在 FIRST_SCREEN_MAX_WAIT_MS 内答复，剩余线路由后台继续跑并写
 //      缓存，客户端跨 20 秒时间桶重拉详情时补齐。
-// 主批次（公共解析器）线路数达到这个条数就改用较短的静默窗口，不再等满宽限期。
+// 目标线路数：低于这个数量时，首屏宁可多等并行链路，也不要用单线路半成品答复。
 const RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT = 2;
-// 只有一条链路彻底收尾（另一条还在跑）时，线路数要达到这个条数才值得提前返回
-// 首屏。1~2 条正是用户反馈“只显示一两个播放源”的情形：此时宁可再等另一条链路
-// （上限 FIRST_SCREEN_MAX_WAIT_MS），也不要让用户以为这部片只有一两条线路。
-// 达到 3 条（例如 GetAV 的 1080/720/480）时，即便公共解析器还在慢慢跑，也先让
-// 客户端拿到可直接播放的多线路，后到的线路由后台补进缓存、客户端下次刷新
-// （20 秒时间桶）再取。
+// 仅作历史阈值保留：即使已有 3 条，也不能在自建补源仍可能合并更多线路时提前
+// 答复。首屏是否结束只看两条解析链是否真正收尾。
 const RESOLVE_VIDEO_FIRST_SCREEN_EARLY_EXIT_COUNT = 3;
-// 详情页首屏等待上限：宁可先给客户端少量线路，也不能让详情页一直转圈。
-// 线上实测公共解析器（/api/v/resolve）冷启动常在 6.5~8.0 秒才把整批线路挤完
-// （1.1~1.8MB 的流式 JSON），而首屏窗口原来是 7.4 秒——两者几乎重合，于是
-// “第一次点开只有一条 / 自动线路，退出再进才变多”随机复现。这里把窗口放到
-// 8.2 秒，覆盖公共批次的正常到达时间；同时仍由详情请求的 9 秒总截止线
-// （ITEM_REQUEST_DEADLINE_MS）保护，低于客户端约 10 秒的 HTTP 超时。
-// 后续实测：公共批次冷启动最坏 8.7 秒，元数据又先吃掉 1 秒多，8.2 秒的上限
-// 会在边界上把“马上就有 4~5 条线路”的请求截成 1 条。这里跟总截止线一起放到
-// 9.0 秒，仍然低于客户端 ~10 秒的 HTTP 超时。
-const RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS = 9000;
+// 详情页首屏等待上限。线上冷缓存实测元数据先占约 2.3 秒，公共解析器随后
+// 7.0~7.5 秒才补完；若首屏仍等到 9 秒，整个 HTTP 请求会贴近客户端 10 秒
+// 超时线。这里不再追求“一次请求内等完所有后台补源”，而是先尽快返回已有
+// 真实线路，未完成批次继续在后台写缓存。
+const RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS = 7600;
 // “主批次且已有多个线路”的快照到达后的静默窗口：只要这个窗口内不再出现
 // 线路更多的快照，就返回当前快照；期间整条解析链若收尾则优先返回完整结果。
 const RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS = 400;
-// 公共解析器这条链路“距离上一份快照”持续这么久之后，判定为卡住/挂了：
-// 此后允许带着自建补源已有的多条线路提前返回，不再为它空等到首屏上限。
-// 只在“已经拿到 ≥ TARGET_COUNT 条线路”时才生效，不会把只有 0~1 条的场景
-// 提前截断（那种情况一律等满首屏上限）。
-//
-// 校准值：/api/v/resolve 冷启动实测最坏 ~7.0~7.5 秒才把整批线路一次吐完
-// （不是流式挤牙膏，onVariants 到最后一刻才回调，期间一份快照都不发布）。
-// 旧值 4500 会在 5.0~5.5 秒就带着自建 GetAV 的 4 条提前返回，公共批次
-// 7.5 秒才到——用户看到的就是“第一次点开只有 4 条，退出再进才变 8 条”。
-// 放到 7000 后，正常到达的公共批次能在首屏上限内赶回来；链路真的挂死时
-// 也只比旧行为晚 ~2.5 秒，仍由 FIRST_SCREEN_MAX_WAIT_MS 兜底。
-const RESOLVE_VIDEO_FIRST_SCREEN_PUBLIC_STALL_MS = 7000;
-// 已经有 ≥ TARGET_COUNT 条可用线路、但公共批次还没收尾时，最多再给公共批次这么
-// 久的补时（从请求开始算，不是从自建快照算）。旧实现这里直接空等到 9 秒上限，
-// 公共链路一卡就让详情页转 9 秒，客户端容易撞上自己的 HTTP 超时；而公共批次正常
-// 到达是 1.5~4 秒，5 秒足够覆盖，剩下的极少数留给后台补缓存、客户端重拉补齐。
-const RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS = 5000;
+// 已经拿到多条真实线路后，最多再为慢批次等这么久。这个窗口从“上一份
+// 线路更多的快照”开始计算：正常 1.5~2.0 秒内到达的补充仍能合并；超过窗口
+// 就返回当前快照，避免公共链路卡住时把整个请求拖到客户端超时。
+const RESOLVE_VIDEO_FIRST_SCREEN_PUBLIC_STALL_MS = 2400;
+// 任一批次尚未收尾、但手上已经有多条线路时，同样只保留这个有界补时。
+// 两个常量分开是为了以后能按线上遥测单独调节，不改变控制流。
+const RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS = 2400;
+// 公共解析器尚未收尾时的首屏主批次窗口。自建补源经常先回 1~3 条，公共
+// 主批次却在 3.5~6.8 秒才补齐；不能按“上一份快照后 2.4 秒”提前结束。
+// 这个窗口从请求开始计时，并仍受 7.6 秒首屏硬上限约束。
+const RESOLVE_VIDEO_FIRST_SCREEN_MAJOR_WAIT_MS = 7000;
+// 只有 0~1 条线路时不能立刻返回单源半成品，但也不能无限等。超过这个窗口
+// 就先返回已有真实线路；后台解析完成后写入缓存，后续请求会得到完整列表。
+const RESOLVE_VIDEO_FIRST_SCREEN_THIN_WAIT_MS = 5200;
 
 function normalizedPersistedResolvedVideo(value) {
   if (!value || typeof value !== "object") return null;
@@ -12227,8 +12845,8 @@ async function resolveVideoForResponse(
   //      FIRST_SCREEN_GRACE_MS(3000ms)，于是 3.0 秒就把 1 条线路答复出去，
   //      公共批次 3.4 秒才到、永远赶不上——这是“只显示一个播放源”的根因。
   //      主批次到达后（majorSeen）且线路数 ≥ 目标条数时改用
-  //      FIRST_SCREEN_SETTLE_MS；主批次只有 1 条时用 FIRST_SCREEN_GRACE_MS
-  //      再给自建补源一点补齐时间。
+  //      FIRST_SCREEN_PUBLIC_STALL_MS；主批次只有 1 条时用
+  //      FIRST_SCREEN_THIN_WAIT_MS 再给自建补源一点补齐时间。
   //      为什么不能只看条数：自建补源常常 0.3 秒就回 2 条，公共解析器 1.4~1.8
   //      秒才回 5 条。若“≥2 条就 400 毫秒返回”，首屏只会是那 2 条（用户
   //      “只显示两个播放源”）。
@@ -12236,7 +12854,7 @@ async function resolveVideoForResponse(
   //      补一批互补线路（合并测试覆盖了这个场景），给 400 毫秒静默期把它们
   //      一起收进来，既不会漏线路，也不会把首屏拖到 4 秒。
   //   3. 整条解析链收尾（resolveTask）优先返回完整、已校验结果；
-  //   4. 最坏由 FIRST_SCREEN_MAX_WAIT_MS 兜底。
+  //   4. 最坏由 FIRST_SCREEN_MAX_WAIT_MS 兜底；慢批次在后台继续补齐。
   let partialTimer = null;
   let partialResolve = null;
   // 最近一次“线路更多”的快照到达时间。公共批次常常是流式挤牙膏（实测
@@ -12248,6 +12866,9 @@ async function resolveVideoForResponse(
   let currentCount = 0;
   // 公共解析器两条链路是否已经彻底落定（resolveVideo 的 onPublicPhaseSettled）。
   let publicPhaseSettled = false;
+  // 至少见过一份公共解析器快照。保留这个状态，后续自建链路或收尾信号
+  // 重新武装窗口时不能把它覆盖回 false。
+  let majorSeen = false;
   // 自建补源这一批是否已经落定（resolveVideo 的 onSelfHostedPhaseSettled）。
   let selfHostedPhaseSettled = false;
   const partialSettled = new Promise((resolve) => {
@@ -12264,54 +12885,61 @@ async function resolveVideoForResponse(
   //   { exit: true }  → 已经可以答复，只等一个短静默期；
   //   { delay: <ms> } → 还不能答复，最多再等这么久后重新评估。
   const partialWindowDecision = (count) => {
-    // 什么时候可以答复首屏？
-    //   1. 两条链路都收尾：不可能再有新线路；
-    //   2. 公共解析器这条链路收尾、且已经拿到 ≥ 目标条数：它基本代表上游
-    //      到底有几条线路（服务器GG / javgg / fcjav / GetAV 原生）。
+    // 首屏不再等“所有批次绝对收尾”。客户端点击详情页时需要先看到真实线路
+    // 和播放按钮；慢批次可以继续在后台解析，但不能占住 HTTP 响应。
     //
-    // 关键：**公共解析器“途中发布的流式快照”不算收尾**。上游把整批线路挤在
-    // 一条 1~2MB 的流式 JSON 里，publishPartial 会在数组还在挤牙膏时（只到
-    // 前几条）就发出快照。旧实现“拿到多条自建线路 + 公共批次没落地就给
-    // GRACE(5s) 补时”，5.0 秒就把“只有自建 4 条”的结果答复出去，而公共批次
-    // 5.2 秒才到——用户看到的就是“第一次点开只有 4 条，退出再进才变 8 条”。
-    // 现在：只要公共批次还没收尾，就不提前答复，最多等到首屏上限。
-    //
-    // 但也不能为它空等到上限：公共链路整条挂死时（本地实测有资源 8.8 秒都
-    // 没吐出第一条线路），手上已有的多条线路应该先发给客户端。逃生口用
-    // “距离上一份快照的静默时长”（PUBLIC_STALL_MS），既能放过正常挤牙膏的
-    // 公共批次，又能在它真挂死时提前答复。
+    // - 两条链路都收尾：进入短静默期后返回完整快照。
+    // - 已有多条线路：只给慢链路 PUBLIC_STALL/GRACE 的有界补时。
+    // - 只有 0~1 条线路：最多等 THIN_WAIT，避免首屏永久只有单源。
+    // - 首屏上限仍作为最后保险，所有未完成任务由 keepAliveBounded() 继续跑。
     const enough = count >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT;
     const bothSettled = publicPhaseSettled && selfHostedPhaseSettled;
     const elapsed = Date.now() - startedAt;
-    if (bothSettled || (publicPhaseSettled && enough)) {
-      return { exit: true };
-    }
-    // 公共批次收尾但仍不足目标条数：给自建补源一段有界补时（从请求开始算）。
-    if (publicPhaseSettled) {
-      return elapsed >= RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS
-        ? { exit: true }
-        : {
-          delay: Math.max(
-            RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS,
-            RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS - elapsed,
-          ),
-        };
-    }
-    // 公共批次还没收尾。
-    //   手上 0~1 条：等下去比提前答复（客户端只会看到一条/占位源）更值，
-    //   由首屏上限兜底。
-    //   手上 ≥ 目标条数：继续等公共批次收尾，或用静默逃生口提前答复。
+    if (bothSettled) return { exit: true };
+
     const capLeftMs = RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS - elapsed;
     if (capLeftMs <= 0) return { exit: true };
-    let wakeMs = capLeftMs;
-    if (enough) {
-      const idleMs = Date.now() - lastSnapshotAt;
-      const untilStallMs = RESOLVE_VIDEO_FIRST_SCREEN_PUBLIC_STALL_MS - idleMs;
-      if (untilStallMs <= 0) return { exit: true };
-      wakeMs = Math.min(wakeMs, untilStallMs);
+    if (!enough) {
+      // 已经见过公共快照但只有 1 条时，说明另一条公共解析端仍可能补齐
+      // 一批线路（现场常见 0.2 秒 1 条、6.8 秒再补 5 条）。此时不能套用
+      // 自建补源的 5.2 秒薄线路窗口，否则会稳定截断后到的主批次。
+      const waitTargetMs = majorSeen
+        ? RESOLVE_VIDEO_FIRST_SCREEN_MAJOR_WAIT_MS
+        : RESOLVE_VIDEO_FIRST_SCREEN_THIN_WAIT_MS;
+      const waitLeftMs = waitTargetMs - elapsed;
+      if (waitLeftMs <= 0) return { exit: true };
+      return {
+        delay: Math.max(
+          RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS,
+          Math.min(capLeftMs, waitLeftMs),
+        ),
+      };
     }
+
+    const idleMs = Date.now() - lastSnapshotAt;
+    if (publicPhaseSettled) {
+      const graceLeftMs = RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS - idleMs;
+      if (graceLeftMs <= 0) return { exit: true };
+      return {
+        delay: Math.max(
+          RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS,
+          Math.min(capLeftMs, graceLeftMs),
+        ),
+      };
+    }
+
+    // 还没见过主批次时，自建源的快照再多也不能证明公共线路已经到齐。
+    // 给公共主批次一个从请求开始计算的固定窗口，覆盖正常 3.5~6.8 秒的
+    // 冷启动；真正挂死时到点仍会释放已有自建线路。
+    const waitLeftMs = majorSeen
+      ? RESOLVE_VIDEO_FIRST_SCREEN_PUBLIC_STALL_MS - idleMs
+      : RESOLVE_VIDEO_FIRST_SCREEN_MAJOR_WAIT_MS - elapsed;
+    if (waitLeftMs <= 0) return { exit: true };
     return {
-      delay: Math.max(RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS, wakeMs),
+      delay: Math.max(
+        RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS,
+        Math.min(capLeftMs, waitLeftMs),
+      ),
     };
   };
   const finishPartialWindow = () => {
@@ -12352,6 +12980,7 @@ async function resolveVideoForResponse(
   };
   const armPartialWindow = (count, major) => {
     if (!partialResolve) return;
+    if (major === true) majorSeen = true;
     currentCount = count;
     lastSnapshotAt = Date.now();
     dbgResolve("partial-window", debugCode, {
@@ -12436,11 +13065,10 @@ async function resolveVideoForResponse(
     // 但只等“第一条线路”又会踩另一个坑：自建链路的第一批常常只有 1 条，比
     // 完整的自建合并（通常 4~5 条，0.5~1.3 秒）早几百毫秒到达；实测正是
     // 这 400 毫秒的宽限让详情页停在“只有一个播放源”。所以：
-    //   1. 出现 ≥ RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT 条后，只要
-    //      FIRST_SCREEN_SETTLE_MS 内没有更多线路就返回（多个真实播放源）；
-    //   2. 只有 1 条时用 FIRST_SCREEN_GRACE_MS 等并行链路补齐；
-    //   3. 每来一份“线路更多”的快照都重新计时（见 armPartialWindow）；
-    //   4. 最坏也在 FIRST_SCREEN_MAX_WAIT_MS 内给客户端答复。
+    //   1. 两条链路都收尾后才在一个短静默期返回完整结果；
+    //   2. 任意一条链路尚未收尾时，每来一份“线路更多”的快照都重新计时
+    //      （见 armPartialWindow），并继续等另一条链路；
+    //   3. 最坏也在 FIRST_SCREEN_MAX_WAIT_MS 内给客户端答复。
     // 其余线路由客户端 20 秒后重拉详情时补齐（发布按线路条数单调递增，不倒退）。
     let early;
     try {
@@ -13227,9 +13855,12 @@ function selectedPlaybackVideo(video, itemId, requestUrl) {
   };
 }
 
-// MemoJav 源解析的墙钟预算。命中缓存时几乎是 0 开销；冷缓存时最多等这么久，
-// 超时就退回裸短链（302 到上游第一条），绝不因为一个附加源拖垮详情页。
-const MEMOJAV_EMBY_RESOLVE_BUDGET_MS = 2500;
+// MemoJav 只是附加线路，不能阻塞已经解析成功的 GetAV / fcjav 多源首屏。
+// 缓存命中时通常几毫秒返回；冷缓存只给一个很短的同步窗口，超时后交给
+// ctx.waitUntil 在后台补缓存，下一次详情页 / PlaybackInfo（以及客户端 20 秒
+// 刷新）就能拿到完整线路。旧值 2500ms 会把 PlaybackInfo 推过客户端 10 秒超时。
+const MEMOJAV_EMBY_RESOLVE_BUDGET_MS = 200;
+const MEMOJAV_EMBY_BACKGROUND_GRACE_MS = 4000;
 
 async function resolveMemoSourcesForMovie(movie, env, fetchImpl, budgetMs, ctx) {
   const code = movieResolveCode(movie);
@@ -13241,10 +13872,11 @@ async function resolveMemoSourcesForMovie(movie, env, fetchImpl, budgetMs, ctx) 
     resolveMemoSourceCached(normalizedCode, env, ctx, fetchImpl),
   ).catch(() => null);
   const budget = Math.max(0, Number(budgetMs) || 0);
-  const info = budget > 0 ? await settledWithin(task, budget) : await task;
-  if (info && info.ok) return info;
-  // 预算耗尽就把它交给响应生命周期继续跑完并写缓存，下一次重拉直接命中。
-  keepAliveBounded(task, ctx, Math.max(1000, budget));
+  const info = budget > 0 ? await settledWithin(task, budget) : null;
+  if (info !== null && info !== undefined) return info;
+  // 预算耗尽不能继续 await 同一个任务，否则“短预算”仍会被冷解析拖成长等待。
+  // 把它登记到响应生命周期后立即返回已有真实线路，后台完成后写共享缓存。
+  keepAliveBounded(task, ctx, MEMOJAV_EMBY_BACKGROUND_GRACE_MS);
   return null;
 }
 
@@ -13550,33 +14182,33 @@ function virtualFolder(library) {
 // 3000/4500 常常“刚超一点点”，结果只能回一条占位源。7.4 秒对 9 秒的请求
 // 截止时间（扣除元数据预算）仍有安全余量；超时也会优先返回 onPartial 已经
 // 发布的公共线路快照，最坏才是占位源。
-// 8.2 秒：与 RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS 对齐。旧值 7.4 秒会先于
-// “首屏上限”触发，公共解析器实测 6.5~7.7 秒才吐完整批线路（自建链路 0.3~1.4
-// 秒只给 1~2 条），于是第一次点开详情页经常只剩一条。“预算 < 首屏上限”会让
-// 首屏上限形同虚设，两者必须一起调。
-// 9.0 秒：继续与 RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS 对齐（公共批次最坏
-// 8.7 秒），同时小于 9.6 秒的 ITEM_REQUEST_DEADLINE_MS。
-const ITEM_DETAIL_RESOLVE_BUDGET_MS = 9000;
+// 首屏预算与 9.2 秒的总请求截止线配合：元数据之后尽快返回已有真实线路，
+// 剩余补源由后台完成。继续追求在首个请求内等完最慢公共批次，会直接撞上
+// Emby 客户端自己的 HTTP 超时。
+const ITEM_DETAIL_RESOLVE_BUDGET_MS = 8000;
 // /Videos/{id}/stream 现场解析播放源的硬预算。客户端点播放后如果长时间收不到
 // 任何字节，就会弹 “Connection timeout, try again later”。旧实现无预算地
 // await 整条解析链（最坏 10 秒以上），还会在第一次失败后再清缓存重解析一次
 // （耗时直接翻倍）。这里给它一个有界预算，超时就立刻回错误，同时后台把结果
 // 写进缓存——客户端重试的那一次就能直接命中。
-const STREAM_RESOLVE_BUDGET_MS = 9000;
+const STREAM_RESOLVE_BUDGET_MS = 8000;
 // 重试一轮（清掉可能失效的直链后重新解析）时额外允许的时间上限。
 const STREAM_RESOLVE_RETRY_BUDGET_MS = 6000;
 // PlaybackInfo 是用户“点了播放”之后的请求，客户端对它的容忍度比详情页更高。
 // 旧值 12 秒是在“等自建补源收尾”（实测 12~16 秒），结果客户端先超时弹
 // “Connection timeout”，详情页又退回占位源。现在公共线路一发布（onPartial）
 // 就提前返回，这里只是兜底上限，给回退端冷启动留出更多时间。
-const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 9000;
-// PlaybackInfo 单独放宽整个请求的截止时间，否则会被详情页共用的 8.2 秒
-// 截止时间提前截断，导致冷启动时反复 503。补源已交给后台任务，不需要 15 秒。
-// 但仍须小于客户端约 10 秒的 HTTP 超时，否则客户端会先判失败并清掉播放记录。
-const PLAYBACK_INFO_REQUEST_DEADLINE_MS = 9600;
+const PLAYBACK_INFO_RESOLVE_BUDGET_MS = 8000;
+// PlaybackInfo 与详情页使用同一档总截止时间。9.2 秒低于客户端约 10 秒
+// 的超时线，同时给冷启动元数据之后的真实线路多留 0.8 秒，避免首条线路
+// 刚过旧 8.4 秒截止线就触发“后端返回占位源、客户端随后超时”的假失败。
+const PLAYBACK_INFO_REQUEST_DEADLINE_MS = 9200;
 // 详情页也只等一个很小的字幕窗口：播放源就绪后立刻返回会让首次打开详情
 // 缺省字幕轨；冷启动字幕仍由后台任务继续完成。
 const ITEM_DETAIL_SUBTITLE_WAIT_MS = 1500;
+// 播放记录与播放源并行读取。正常 D1 读取远快于解析，只有存储异常时才会等到
+// 这里；设置短上限可以保留进度条，同时避免拖过客户端 10 秒超时。
+const ITEM_PLAYBACK_STATE_WAIT_MS = 800;
 // PlaybackInfo 首次请求如果播放源已经先返回、字幕仍在解析，短暂等待，
 // 避免客户端第一次点击播放拿到没有字幕轨的 MediaSource。
 const PLAYBACK_INFO_SUBTITLE_WAIT_MS = 1500;
@@ -13588,19 +14220,27 @@ const PLAYBACK_INFO_SUBTITLE_WAIT_MS = 1500;
 // 9.6s / 11.7s / 15.5s，甚至顶到 Cloudflare 的 30 秒 waitUntil 上限
 // （30258 / 30366 毫秒）。这些被挂住的实例会占满整个 colo，邻近请求就直接
 // 503 / 1102（Worker exceeded resource limits）。
-// 因此：每次只预热 1 部（原来 3 部），并给整批预热一个 6 秒墙钟预算，
-// 超时就让 waitUntil 提前结束。预热本身只是“让下次点播放快一点”的优化，
-// 放弃它不影响播放源的正确性（真正点播放时还会正常解析并写缓存）。
+// 因此：每次只预热 1 部（原来 3 部），并给普通预热一个 6 秒墙钟预算，
+// 超时就让 waitUntil 提前结束。精确番号搜索是唯一例外：它只有一个明确目标，
+// 且线上公共解析器实测可能 14 秒后才补齐线路；给单条精确目标 18 秒仍低于
+// Cloudflare 的 30 秒 waitUntil 上限，并由解析闸门保证不同时叠加。
 const SEARCH_PREWARM_LIMIT = 1;
 const SEARCH_PREWARM_BUDGET_MS = 6000;
+const EXACT_SEARCH_PREWARM_BUDGET_MS = 18000;
 
 // 把原始影片对象挂在结果上但保持不可枚举，JSON 响应不会泄漏内部字段。
 // 搜索后续可以用真实番号预热，而不是拿 Emby Item ID 去解析。
-function attachPrewarmMovies(result, movies) {
+function attachPrewarmMovies(result, movies, options = {}) {
   if (!result || !Array.isArray(movies)) return result;
+  const exactOnly = options.exactOnly === true;
+  const exactCode = exactOnly
+    ? exactSearchCode(options.exactSearchTerm)
+    : "";
+  if (exactOnly && !exactCode) movies = [];
   const seen = new Set();
   const candidates = [];
   for (const movie of movies) {
+    if (exactOnly && !movieMatchesExactSearch(movie, exactCode)) continue;
     const code = movieResolveCode(movie);
     if (!code || seen.has(code)) continue;
     seen.add(code);
@@ -13612,6 +14252,13 @@ function attachPrewarmMovies(result, movies) {
     enumerable: false,
     configurable: true,
   });
+  Object.defineProperty(result, "prewarmBudgetMs", {
+    value: exactOnly
+      ? EXACT_SEARCH_PREWARM_BUDGET_MS
+      : SEARCH_PREWARM_BUDGET_MS,
+    enumerable: false,
+    configurable: true,
+  });
   return result;
 }
 
@@ -13619,14 +14266,15 @@ function prewarmSearchResults(result, env, fetchImpl, ctx) {
   if (!ctx || typeof ctx.waitUntil !== "function") return;
   const movies = result?.prewarmMovies;
   if (!Array.isArray(movies) || !movies.length) return;
+  const budgetMs = Number(result?.prewarmBudgetMs) || SEARCH_PREWARM_BUDGET_MS;
   for (const movie of movies.slice(0, SEARCH_PREWARM_LIMIT)) {
-    prewarmResolve(movie, env, fetchImpl, ctx);
+    prewarmResolve(movie, env, fetchImpl, ctx, { budgetMs });
   }
 }
 
 // 后台预热:不阻塞当前响应,把播放源与字幕列表解析完写进缓存,
 // 下次(真正点播放时)直接命中,起播和字幕出现都更快。
-function prewarmResolve(movie, env, fetchImpl, ctx = null) {
+function prewarmResolve(movie, env, fetchImpl, ctx = null, options = {}) {
   if (!movie?.id && !movie?.number) return;
   // 预热只是“下次点播放快一点”的优化，绝不能和真实请求抢解析槽位：
   // 一旦实例里已经有请求在解析（在跑或在排队），就跳过这次预热。
@@ -13642,9 +14290,32 @@ function prewarmResolve(movie, env, fetchImpl, ctx = null) {
   ]);
   // Worker 响应返回后后台任务可能被直接杀掉:有 ctx.waitUntil 就登记上,
   // 让预解析真正跑完,下次点播放时字幕能直接命中缓存。
-  // 这里登记的是“带预算的包装”：超过 SEARCH_PREWARM_BUDGET_MS 就结束
+  // 这里登记的是“带预算的包装”：超过对应预算就结束
   // waitUntil，避免上游抖动时把实例挂到 Cloudflare 的 30 秒上限。
-  keepAlive(withTimeout(task, SEARCH_PREWARM_BUDGET_MS).catch(() => {}), ctx);
+  const budgetMs = Math.max(
+    1,
+    Number(options.budgetMs) || SEARCH_PREWARM_BUDGET_MS,
+  );
+  keepAlive(withTimeout(task, budgetMs).catch(() => {}), ctx);
+}
+
+// 冷扫描本身不预热，避免“全量抓取 + 解析”叠加触发 Worker 1102。
+// 唯一例外是精确番号：只预热本地确认完全同号的那一部，模糊搜索仍保持零预热。
+function attachListPagePrewarm(result, movies, options = {}) {
+  const exactCode = exactSearchCode(options.searchTerm);
+  if (options.upstreamScanRan && !exactCode) {
+    return attachPrewarmMovies(result, []);
+  }
+  return attachPrewarmMovies(
+    result,
+    movies,
+    exactCode
+      ? {
+          exactOnly: true,
+          exactSearchTerm: options.searchTerm,
+        }
+      : {},
+  );
 }
 
 // 把后台任务登记到响应生命周期上:Worker 返回响应后可能被立刻回收,
@@ -13761,6 +14432,12 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     ));
   }
   const requestDeadline = Date.now() + ITEM_REQUEST_DEADLINE_MS;
+  // 播放记录、元数据、字幕和播放源互不依赖：从请求一开始全部并行。旧顺序在
+  // 取到元数据后先 await D1，再启动播放源解析，慢几十到几百毫秒就会把公共
+  // 解析器冷启动窗口挤到截止线外，首次详情只剩一条占位源。
+  const playbackStateResolution = trackResolution(
+    readPlaybackState(env, token),
+  );
   const metadataBudgetMs = remainingRequestMs(
     requestDeadline,
     ITEM_METADATA_BUDGET_MS,
@@ -13777,7 +14454,6 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   }
 
   const item = mapMovie(movie, request.url, env);
-  attachPlaybackUserData(item, await readPlaybackState(env, token));
 
   // 详情页不应被“解析播放源/字幕”这类慢请求拖住：解析服务首次冷启动时
   // 会明显变慢（第二次通常命中缓存才快），旧逻辑在返回详情前一直等它，
@@ -13824,6 +14500,17 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     // 有界登记：字幕链路最坏要等上游聚合，不能让它把实例挂到 waitUntil 上限。
     keepAliveBounded(subtitleResolution.tracked, ctx, BACKGROUND_SUBTITLE_GRACE_MS);
   }
+  const playbackStateWaitMs = Math.min(
+    ITEM_PLAYBACK_STATE_WAIT_MS,
+    remainingRequestMs(requestDeadline, ITEM_PLAYBACK_STATE_WAIT_MS),
+  );
+  const playbackState = playbackStateResolution.record.done
+    ? playbackStateResolution.record.value
+    : await settledWithin(playbackStateResolution.tracked, playbackStateWaitMs);
+  attachPlaybackUserData(
+    item,
+    playbackState && typeof playbackState === "object" ? playbackState : {},
+  );
 
   const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
   const requestUserAgent = clientUserAgent(request);
@@ -17420,6 +18107,16 @@ export function createMediaUpstreamSchedulerForTests(options) {
   return createMediaUpstreamScheduler(options);
 }
 
+export function createMediaParallelRangeCoordinatorForTests(options) {
+  return createMediaParallelRangeCoordinator(options);
+}
+
+export function mediaParallelRangeCoordinatorStatsForTests() {
+  return {
+    active: MEDIA_PARALLEL_RANGE_COORDINATOR.active,
+  };
+}
+
 export function mediaSegmentCacheKeyForTests(sourceUrl) {
   return mediaSegmentCacheKey(sourceUrl);
 }
@@ -17445,6 +18142,18 @@ export function rewrittenHlsEntryBytesForTests(entry) {
 
 export function resolvedVideoCacheKeyForTests(movie, env) {
   return resolvedVideoCacheKey(movie, env);
+}
+
+export function dedupeSameStreamVariantsForTests(variants) {
+  return dedupeSameStreamVariants(variants);
+}
+
+export function resolvedVideoCacheIsTrustworthyForTests(video) {
+  return resolvedVideoCacheIsTrustworthy(video);
+}
+
+export function validatedVideoVariantsForTests(video, fetchImpl, budgetMs) {
+  return validatedVideoVariants(video, fetchImpl, budgetMs);
 }
 
 export function mediaSourceIdForIndexForTests(itemId, index) {
@@ -17476,6 +18185,7 @@ export function resetEmbyCachesForTests() {
   MEDIA_SEGMENT_RANGE_CACHE.clear();
   MEDIA_PARALLEL_RANGE_FAILURES.clear();
   MEDIA_UPSTREAM_SCHEDULER.reset();
+  MEDIA_PARALLEL_RANGE_COORDINATOR.reset();
   REWRITTEN_HLS_CACHE.clear();
   rewrittenHlsCacheHits = 0;
   rewrittenHlsCacheMisses = 0;

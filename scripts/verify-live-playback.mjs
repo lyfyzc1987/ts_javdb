@@ -27,13 +27,13 @@ const expectedTsBytes = Math.max(
   0,
   Number(process.env.EXPECTED_TS_BYTES || 0),
 );
-const transportMode = String(process.env.PARALLEL_MODE || "serial")
+const transportMode = String(process.env.PARALLEL_MODE || "parallel")
   .trim()
   .toLowerCase();
 const parallelDisabled = ["0", "false", "no", "off", "serial", "single"]
   .includes(transportMode);
 const expectedBuildId = String(
-  process.env.EXPECTED_BUILD_ID || "2026-10-18-exact-media-resume-82",
+  process.env.EXPECTED_BUILD_ID || "2026-10-20-parallel-passthrough-90",
 ).trim();
 const runDirectBench = /^(?:1|true|yes|on)$/i.test(
   String(process.env.RUN_DIRECT_BENCH || ""),
@@ -178,9 +178,9 @@ function publicResult(result) {
   return visible;
 }
 
-function proxyUrlWithTransportMode(value) {
+function proxyUrlWithTransportMode(value, disableParallel = parallelDisabled) {
   const url = new URL(value);
-  if (parallelDisabled) {
+  if (disableParallel) {
     url.searchParams.set("_parallel", "0");
   }
   return url.href;
@@ -343,43 +343,55 @@ let directSingle = null;
 let directOffset = null;
 let directTsBytes = null;
 const directRanges = [];
+let upstreamProbeError = null;
+let directSingleError = null;
 
 if (!expectedTsSha256) {
-  stage("upstream size probe");
-  const probeStartedAt = performance.now();
-  const probeResponse = await fetch(upstreamUrl, {
-    headers: { ...sourceHeaders, range: "bytes=0-0" },
-    signal: AbortSignal.timeout(requestTimeoutMs),
-  });
-  probeHeaderMs = elapsed(probeStartedAt);
-  probeContentRange = probeResponse.headers.get("content-range") || "";
-  await probeResponse.body?.cancel();
-  const totalMatch = /\/\s*(\d+)\s*$/.exec(probeContentRange);
-  upstreamTotal = Number(totalMatch?.[1]);
-  if (!Number.isSafeInteger(upstreamTotal) || upstreamTotal <= 0) {
-    throw new Error(
-      `Cannot determine upstream size from Content-Range: ${probeContentRange}`,
-    );
+  try {
+    stage("upstream size probe");
+    const probeStartedAt = performance.now();
+    const probeResponse = await fetch(upstreamUrl, {
+      headers: { ...sourceHeaders, range: "bytes=0-0" },
+      signal: AbortSignal.timeout(requestTimeoutMs),
+    });
+    probeHeaderMs = elapsed(probeStartedAt);
+    probeContentRange = probeResponse.headers.get("content-range") || "";
+    await probeResponse.body?.cancel();
+    const totalMatch = /\/\s*(\d+)\s*$/.exec(probeContentRange);
+    upstreamTotal = Number(totalMatch?.[1]);
+    if (!Number.isSafeInteger(upstreamTotal) || upstreamTotal <= 0) {
+      throw new Error(
+        `Cannot determine upstream size from Content-Range: ${probeContentRange}`,
+      );
+    }
+  } catch (error) {
+    upstreamProbeError = errorDetails(error);
   }
 
-  stage("direct upstream single connection");
-  directSingle = await measuredFetch(upstreamUrl, {
-    range: `bytes=0-${upstreamTotal - 1}`,
-  });
-  directOffset = embeddedTsOffset(directSingle.rawBytes);
-  if (directOffset < 0) {
-    throw new Error(
-      "The direct upstream response has no embedded MPEG-TS prefix",
-    );
+  if (upstreamTotal > 0) {
+    try {
+      stage("direct upstream single connection");
+      directSingle = await measuredFetch(upstreamUrl, {
+        range: `bytes=0-${upstreamTotal - 1}`,
+      });
+      directOffset = embeddedTsOffset(directSingle.rawBytes);
+      if (directOffset < 0) {
+        throw new Error(
+          "The direct upstream response has no embedded MPEG-TS prefix",
+        );
+      }
+      directTsBytes = directSingle.rawBytes.slice(directOffset);
+    } catch (error) {
+      directSingleError = errorDetails(error);
+    }
   }
-  directTsBytes = directSingle.rawBytes.slice(directOffset);
 }
 
 if (runDirectBench) {
   if (!upstreamTotal) {
     throw new Error("RUN_DIRECT_BENCH requires an upstream size probe");
   }
-  for (const parts of [2, 3, 4]) {
+  for (const parts of [2, 3, 4, 8]) {
     stage(`direct upstream ${parts}-range`);
     directRanges.push(await measureRanges(upstreamUrl, upstreamTotal, parts));
   }
@@ -387,11 +399,24 @@ if (runDirectBench) {
 
 stage("Worker/Pages proxy segment");
 const proxyResult = await measuredFetch(proxyUrlWithTransportMode(target.url));
+stage("Worker/Pages serial control segment");
+const serialControl = await measuredFetch(
+  proxyUrlWithTransportMode(target.url, true),
+);
+const proxyTransportStream = /^video\/mp2t\b/i.test(
+  proxyResult.contentType,
+);
+const proxyTransportStreamValid = !proxyTransportStream ||
+  (proxyResult.packetAligned && proxyResult.firstByte === 0x47);
 const expectedMatch = Boolean(
   expectedTsSha256 &&
   proxyResult.sha256 === expectedTsSha256 &&
   (!expectedTsBytes || proxyResult.bytes === expectedTsBytes)
 );
+const serialMatch = serialControl.status === 200 &&
+  proxyResult.status === 200 &&
+  proxyResult.bytes === serialControl.bytes &&
+  proxyResult.sha256 === serialControl.sha256;
 const directMatch = directTsBytes
   ? proxyResult.bytes === directTsBytes.byteLength &&
     proxyResult.sha256 === sha256(directTsBytes)
@@ -445,6 +470,12 @@ const stressWallMs = elapsed(stressStartedAt);
 const successfulStress = stressResults.filter(
   (result) => result.status === 200,
 );
+const transportStreamStress = successfulStress.filter((result) =>
+  /^video\/mp2t\b/i.test(result.contentType || "")
+);
+const transportStreamStressValid = transportStreamStress.every(
+  (result) => result.packetAligned && result.firstByte === 0x47,
+);
 const totalStressBytes = successfulStress.reduce(
   (totalBytes, result) => totalBytes + (result.bytes || 0),
   0,
@@ -476,9 +507,11 @@ const summary = {
     probeHeaderMs,
     contentRange: probeContentRange,
     total: upstreamTotal,
+    probeError: upstreamProbeError,
     directEmbeddedOffset: directOffset,
     directTsBytes: directTsBytes?.byteLength ?? null,
     directTsSha256: directTsBytes ? sha256(directTsBytes) : null,
+    directSingleError,
     expectedTsBytes: expectedTsBytes || null,
     expectedTsSha256: expectedTsSha256 || null,
   },
@@ -490,6 +523,15 @@ const summary = {
     : null,
   directRanges,
   proxySegment: publicResult(proxyResult),
+  serialControl: publicResult(serialControl),
+  transportStreamValidation: {
+    target: proxyTransportStream,
+    targetValid: proxyTransportStreamValid,
+    stressTransportStreamSegments: transportStreamStress.length,
+    stressOtherSegments: successfulStress.length - transportStreamStress.length,
+    stressValid: transportStreamStressValid,
+  },
+  serialMatch,
   byteExactMatch: directMatch,
   expectedHashMatch: expectedMatch,
   stress: {
@@ -502,9 +544,7 @@ const summary = {
       (totalStressBytes / 1024 / 1024 / Math.max(stressWallMs, 1) * 1000)
         .toFixed(3),
     ),
-    packetAligned: successfulStress.every(
-      (result) => result.packetAligned && result.firstByte === 0x47,
-    ),
+    packetAligned: transportStreamStressValid,
     results: stressResults,
   },
 };
@@ -517,11 +557,11 @@ if (
   (playback.build && playback.build !== serverInfo.buildId) ||
   manifestResponse.status !== 200 ||
   proxyResult.status !== 200 ||
-  !(directMatch || expectedMatch) ||
-  !proxyResult.packetAligned ||
-  proxyResult.firstByte !== 0x47 ||
+  serialControl.status !== 200 ||
+  !(serialMatch || directMatch || expectedMatch) ||
+  !proxyTransportStreamValid ||
   successfulStress.length !== stressResults.length ||
-  !summary.stress.packetAligned
+  !transportStreamStressValid
 ) {
   process.exitCode = 1;
 }
