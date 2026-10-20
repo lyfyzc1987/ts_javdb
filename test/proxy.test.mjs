@@ -151,8 +151,8 @@ test("scopes resolved-video caches to the Worker or Pages deployment", () => {
     PLAYBACK_DEPLOY_TAG: "pages",
   });
 
-  assert.match(workerKey, /sources-v52\|worker\|TEST-001$/);
-  assert.match(pagesKey, /sources-v52\|pages\|TEST-001$/);
+  assert.match(workerKey, /sources-v57\|worker\|TEST-001$/);
+  assert.match(pagesKey, /sources-v57\|pages\|TEST-001$/);
   assert.notEqual(workerKey, pagesKey);
 });
 
@@ -302,6 +302,88 @@ test("removes only sources with definitive dead-media evidence", async () => {
   assert.deepEqual(result, []);
 });
 
+test("keeps four AES GetAV qualities disguised as signed woff2 segments", async () => {
+  const qualities = [2160, 1080, 720, 480];
+  const signedQuery =
+    `?token=${"a".repeat(280)}&expires=1999999999&signature=${"b".repeat(40)}`;
+  const keyBytes = Uint8Array.from([
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+  ]);
+  const iv = Uint8Array.from([
+    0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
+    0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f,
+  ]);
+  const resources = new Map();
+  const variants = [];
+
+  for (let index = 0; index < qualities.length; index += 1) {
+    const quality = qualities[index];
+    const playlistUrl =
+      `https://static.worldstatic.com/rctd-740/${quality}/index.txt${signedQuery}`;
+    const keyUrl =
+      `https://static.worldstatic.com/rctd-740/${quality}/key.woff${signedQuery}`;
+    const segmentUrl =
+      `https://static.worldstatic.com/rctd-740/${quality}/seg-0.woff2${signedQuery}`;
+    const plaintext = new Uint8Array(376 + index * 188);
+    for (let offset = 0; offset < plaintext.length; offset += 188) {
+      plaintext[offset] = 0x47;
+    }
+    const encrypted = await encryptAes128Cbc(plaintext, keyBytes, iv);
+    resources.set(playlistUrl, {
+      body: [
+        "#EXTM3U",
+        "#EXT-X-VERSION:7",
+        "#EXT-X-TARGETDURATION:8",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        `#EXT-X-KEY:METHOD=AES-128,URI="${keyUrl}",IV=0x102132435465768798a9bacbdcedfe0f`,
+        "#EXTINF:8,",
+        segmentUrl,
+        "#EXT-X-ENDLIST",
+      ].join("\n"),
+      contentType: "application/vnd.apple.mpegurl",
+      status: 200,
+    });
+    resources.set(keyUrl, {
+      body: keyBytes,
+      contentType: "application/octet-stream",
+      status: 200,
+    });
+    resources.set(segmentUrl, {
+      body: encrypted,
+      contentType: "font/woff2",
+      status: 206,
+    });
+    variants.push({
+      variant: `getav_raw_${quality === 2160 ? "4k" : `${quality}p`}`,
+      label: `原版 (GetAV) ${quality}`,
+      sourceUrl: playlistUrl,
+      sourceType: "application/vnd.apple.mpegurl",
+      quality,
+    });
+  }
+
+  const video = { ...variants[0], alternates: variants.slice(1) };
+  const result = await validatedVideoVariantsForTests(
+    video,
+    async (url) => {
+      const target = String(url);
+      const resource = resources.get(target);
+      assert.ok(resource, `unexpected validation request: ${target}`);
+      return new Response(resource.body, {
+        status: resource.status,
+        headers: { "content-type": resource.contentType },
+      });
+    },
+    5000,
+  );
+
+  assert.deepEqual(
+    result.map((variant) => variant.quality),
+    qualities,
+  );
+});
+
 test("keeps same-fingerprint streams when their provider semantics differ", () => {
   const original = {
     variant: "fcjav_original",
@@ -328,7 +410,33 @@ test("keeps same-fingerprint streams when their provider semantics differ", () =
   assert.equal(renamedDuplicate[0].variant, "fcjav_original");
 });
 
-test("only trusts resolved-video cache entries marked complete", () => {
+test("collapses rotated signed URLs for the same GetAV family and quality", () => {
+  const signed = (quality, token) => ({
+    variant: `getav_raw_${quality === 2160 ? "4k" : `${quality}p`}`,
+    label: `原版 (GetAV) ${quality}`,
+    quality,
+    sourceUrl:
+      `https://static.worldstatic.com/rctd-740/${quality}/index.txt` +
+      `?token=${token}&expires=1999999999`,
+  });
+  const result = dedupeSameStreamVariantsForTests([
+    signed(2160, "first"),
+    signed(1080, "first"),
+    signed(2160, "second"),
+    signed(1080, "second"),
+    signed(720, "first"),
+    signed(480, "first"),
+  ]);
+
+  assert.deepEqual(result.map((variant) => variant.quality), [
+    2160,
+    1080,
+    720,
+    480,
+  ]);
+});
+
+test("only trusts complete resolved-video cache entries from the current capability", () => {
   const partial = {
     variant: "fcjav_original",
     sourceUrl: "https://cdn.example/first.m3u8",
@@ -343,6 +451,49 @@ test("only trusts resolved-video cache entries marked complete", () => {
     resolvedVideoCacheIsTrustworthyForTests({
       ...partial,
       resolveComplete: true,
+    }),
+    false,
+  );
+  assert.equal(
+    resolvedVideoCacheIsTrustworthyForTests({
+      ...partial,
+      resolveComplete: true,
+      resolveCapability: "getav-all-qualities-v7",
+    }),
+    true,
+  );
+  const incompleteGetav = {
+    variant: "getav_raw_4k",
+    quality: 2160,
+    sourceUrl: "https://cdn.example/getav-4k.m3u8",
+    alternates: [{
+      variant: "getav_raw_1080p",
+      quality: 1080,
+      sourceUrl: "https://cdn.example/getav-1080p.m3u8",
+    }],
+    resolveComplete: true,
+    resolveCapability: "getav-all-qualities-v7",
+  };
+  assert.equal(
+    resolvedVideoCacheIsTrustworthyForTests(incompleteGetav),
+    false,
+  );
+  assert.equal(
+    resolvedVideoCacheIsTrustworthyForTests({
+      ...incompleteGetav,
+      alternates: [
+        ...incompleteGetav.alternates,
+        {
+          variant: "getav_raw_720p",
+          quality: 720,
+          sourceUrl: "https://cdn.example/getav-720p.m3u8",
+        },
+        {
+          variant: "getav_raw_480p",
+          quality: 480,
+          sourceUrl: "https://cdn.example/getav-480p.m3u8",
+        },
+      ],
     }),
     true,
   );
@@ -6218,6 +6369,116 @@ test("answers with the self-hosted lines once the first-screen grace expires", a
   assert.ok(elapsed >= 7000, `first screen returned too early at ${elapsed}ms`);
   assert.ok(elapsed < 9000, `first screen took ${elapsed}ms`);
 });
+
+test("waits past the thin-source window when a settled self-hosted batch has one line", async () => {
+  // JUX-844 线上冷启动时序：自建链路 3.4 秒收尾时只有 1 条，公共 fcjav
+  // 批次约 6.3 秒才到。旧实现会在 5.2 秒用单条自建线路答复，第一次进入
+  // 详情页因此只显示一个播放源；退出重进命中后台缓存后才变成多源。
+  const code = "RCTD-743";
+  const detailUrl = `https://javtiful.com/zh/video/99999/${code}`;
+  const selfHostedUrl =
+    "https://fast-stream.jav.si/rctd-743/self-original.mp4";
+  const publicUrls = [
+    "https://fast-stream.jav.si/rctd-743/fcjav-original.mp4",
+    "https://fast-stream.jav.si/rctd-743/fcjav-decode.mp4",
+  ];
+  const allUrls = [selfHostedUrl, ...publicUrls];
+  const env = {
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 9000,
+  };
+  const startedAt = Date.now();
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/45"),
+    env,
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/45")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: { id: 45, number: code, title: `${code} JUX-844` },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`/api/v/resolve?code=${code}`)) {
+        await new Promise((resolve) => setTimeout(resolve, 6300));
+        return new Response(
+          JSON.stringify({
+            variants: [
+              {
+                variant: "fcjav_original",
+                sourceUrl: publicUrls[0],
+                sourceType: "video/mp4",
+              },
+              {
+                variant: "fcjav_decode",
+                sourceUrl: publicUrls[1],
+                sourceType: "video/mp4",
+              },
+            ],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === `https://javtiful.com/zh/search?q=${code}`) {
+        return new Response(`<a href="${detailUrl}">${code} Test</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        await new Promise((resolve) => setTimeout(resolve, 3400));
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: `${code} Test`,
+            playerSources: [{
+              src: selfHostedUrl,
+              type: "video/mp4",
+              size: 1080,
+            }],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (allUrls.includes(target)) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, new RegExp(`/api/subtitle\\?name=${code}`));
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  const elapsed = Date.now() - startedAt;
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(payload.MediaSourceCount, allUrls.length);
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ).sort(),
+    [...allUrls].sort(),
+  );
+  assert.ok(elapsed < 8000, `first screen took ${elapsed}ms`);
+});
+
 test("waits through the extended cold-start window when the public batch completes with six lines", async () => {
   // 同一资源的两种解析端点：
   // - 主解析端 0.2 秒只回 1 条；
@@ -6834,6 +7095,7 @@ test("loads Javtiful MP4 qualities in order and probes each stream", async () =>
 
 test("loads all GetAV qualities through parallel page requests", async () => {
   const calls = [];
+  let readerAttempts = 0;
   const sourceQualities = [
     ["raw_4k", 2160],
     ["raw_1080p", 1080],
@@ -6848,6 +7110,14 @@ test("loads all GetAV qualities through parallel page requests", async () => {
   }));
   const pageUrl = "https://getav.net/zh/videos/rctd-740";
   const readerUrl = `https://r.jina.ai/${pageUrl}`;
+  const escapedJinaPage =
+    `<html><title>RCTD-740 Test | GetAV</title>` +
+    JSON.stringify({ videoSources }).replace(/"/g, '\\"') +
+    `</html>`;
+  const partialJinaPage =
+    `<html><title>RCTD-740 Test | GetAV</title>` +
+    JSON.stringify({ videoSources: videoSources.slice(0, 2) }).replace(/"/g, '\\"') +
+    `</html>`;
 
   const response = await handleProxy(
     new Request("https://clone.example/Items/42/PlaybackInfo", {
@@ -6880,18 +7150,33 @@ test("loads all GetAV qualities through parallel page requests", async () => {
       }
       if (target === readerUrl) {
         assert.equal(init.headers.get("x-respond-with"), "html");
+        readerAttempts += 1;
+        if (readerAttempts === 1) {
+          return new Response(
+            JSON.stringify({
+              code: 429,
+              name: "RateLimitTriggeredError",
+              message: "Per IP rate limit exceeded",
+            }),
+            {
+              status: 429,
+              headers: {
+                "content-type": "application/json",
+                "retry-after": "0",
+              },
+            },
+          );
+        }
         return new Response(
-          `<html><title>RCTD-740 Test | GetAV</title>` +
-          `${JSON.stringify({ videoSources })}</html>`,
-          { headers: { "content-type": "text/html" } },
+          readerAttempts === 2 ? partialJinaPage : escapedJinaPage,
+          { headers: { "content-type": "text/plain; charset=utf-8" } },
         );
       }
       if (target === pageUrl) {
-        return new Response(
-          `<html><title>RCTD-740 Test | GetAV</title>` +
-          `${JSON.stringify({ videoSources })}</html>`,
-          { headers: { "content-type": "text/html" } },
-        );
+        return new Response("<html><title>Access denied</title></html>", {
+          status: 403,
+          headers: { "content-type": "text/html" },
+        });
       }
       if (/\/rctd-740\/\d+\/index\.txt$/.test(target)) {
         return new Response([
@@ -6920,7 +7205,7 @@ test("loads all GetAV qualities through parallel page requests", async () => {
 
   const payload = await response.json();
   assert.equal(response.status, 200);
-  assert.equal(calls.includes(readerUrl), true);
+  assert.equal(calls.filter((target) => target === readerUrl).length, 3);
   assert.equal(calls.includes(pageUrl), true);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
@@ -6937,6 +7222,301 @@ test("loads all GetAV qualities through parallel page requests", async () => {
     ),
     [2160, 1080, 720, 480],
   );
+});
+
+test("includes late GetAV retry qualities in the first detail response", async () => {
+  const number = "RCTD-744";
+  const publicUrls = [
+    "https://fast-stream.jav.si/rctd-744/fcjav-original.mp4",
+    "https://fast-stream.jav.si/rctd-744/fcjav-decode.mp4",
+    "https://fast-stream.jav.si/rctd-744/javgg-original.mp4",
+    "https://fast-stream.jav.si/rctd-744/javgg-decode.mp4",
+  ];
+  const sourceQualities = [
+    ["raw_4k", 2160],
+    ["raw_1080p", 1080],
+    ["raw_720p", 720],
+    ["raw_480p", 480],
+  ];
+  const getavSources = sourceQualities.map(([type, quality]) => ({
+    movieId: number,
+    type,
+    url: `https://static.worldstatic.com/rctd-744/${quality}/index.txt`,
+    quality,
+  }));
+  const getavUrls = getavSources.map((source) => source.url);
+  const pageUrl = "https://getav.net/zh/videos/rctd-744";
+  const readerUrl = `https://r.jina.ai/${pageUrl}`;
+  const getavPage = (sources) =>
+    `<html><title>${number} Test | GetAV</title>` +
+    `${JSON.stringify({ videoSources: sources })}</html>`;
+  let readerAttempts = 0;
+  const env = {
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 9000,
+  };
+  const startedAt = Date.now();
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/47"),
+    env,
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/47")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 47, number, title: `${number} Test` } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (
+        target.includes(`/api/v/resolve?code=${number}`) ||
+        target.includes(`/api/resolve?code=${number}`)
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return new Response(
+          JSON.stringify({
+            variants: publicUrls.map((sourceUrl, index) => ({
+              variant: index % 2 === 0 ? "original" : "decode",
+              sourceUrl,
+              sourceType: "video/mp4",
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === `https://javtiful.com/zh/search?q=${number}`) {
+        return new Response("<html>No matching video</html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === readerUrl) {
+        assert.equal(init.headers.get("x-respond-with"), "html");
+        readerAttempts += 1;
+        if (readerAttempts === 1) {
+          return new Response(getavPage(getavSources.slice(0, 2)), {
+            headers: { "content-type": "text/html" },
+          });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        return new Response(getavPage(getavSources), {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === pageUrl) {
+        return new Response(getavPage(getavSources.slice(0, 2)), {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (publicUrls.includes(target)) {
+        assert.equal(init.headers.get("range"), "bytes=0-511");
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      if (getavUrls.includes(target)) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:6",
+          "#EXTINF:6,",
+          "segment.ts",
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (/\/rctd-744\/\d+\/segment\.ts$/.test(target)) {
+        return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+          status: 206,
+          headers: { "content-type": "video/mp2t" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-744/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  const elapsed = Date.now() - startedAt;
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
+  assert.equal(payload.MediaSourceCount, publicUrls.length + getavUrls.length);
+  const returnedSources = payload.MediaSources.map((source) =>
+    new URL(source.Path).searchParams.get("source")
+  );
+  assert.deepEqual(
+    returnedSources.filter(Boolean).sort(),
+    [...publicUrls, ...getavUrls].sort(),
+  );
+  assert.deepEqual(
+    payload.MediaSources
+      .filter((source) => String(source.Name || "").includes("GetAV"))
+      .map((source) =>
+        source.MediaStreams.find((stream) => stream.Type === "Video").Height
+      ),
+    [2160, 1080, 720, 480],
+  );
+  assert.ok(elapsed < 3500, `first detail response took ${elapsed}ms`);
+});
+
+test("returns available sources when a GetAV retry misses the first-screen window", async () => {
+  const number = "RCTD-745";
+  const publicUrls = [
+    "https://fast-stream.jav.si/rctd-745/fcjav-original.mp4",
+    "https://fast-stream.jav.si/rctd-745/fcjav-decode.mp4",
+    "https://fast-stream.jav.si/rctd-745/javgg-original.mp4",
+    "https://fast-stream.jav.si/rctd-745/javgg-decode.mp4",
+  ];
+  const getavSources = [
+    {
+      movieId: number,
+      type: "raw_4k",
+      url: "https://static.worldstatic.com/rctd-745/2160/index.txt",
+      quality: 2160,
+    },
+    {
+      movieId: number,
+      type: "raw_1080p",
+      url: "https://static.worldstatic.com/rctd-745/1080/index.txt",
+      quality: 1080,
+    },
+  ];
+  const getavUrls = getavSources.map((source) => source.url);
+  const pageUrl = "https://getav.net/zh/videos/rctd-745";
+  const readerUrl = `https://r.jina.ai/${pageUrl}`;
+  const getavPage =
+    `<html><title>${number} Test | GetAV</title>` +
+    `${JSON.stringify({ videoSources: getavSources })}</html>`;
+  let readerAttempts = 0;
+  const env = {
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 9000,
+    SELF_HOSTED_MERGE_BUDGET_MS: 40,
+  };
+  const startedAt = Date.now();
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/48"),
+    env,
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/48")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 48, number, title: `${number} Test` } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (
+        target.includes(`/api/v/resolve?code=${number}`) ||
+        target.includes(`/api/resolve?code=${number}`)
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return new Response(
+          JSON.stringify({
+            variants: publicUrls.map((sourceUrl, index) => ({
+              variant: index % 2 === 0 ? "original" : "decode",
+              sourceUrl,
+              sourceType: "video/mp4",
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === `https://javtiful.com/zh/search?q=${number}`) {
+        return new Response("<html>No matching video</html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === readerUrl) {
+        assert.equal(init.headers.get("x-respond-with"), "html");
+        readerAttempts += 1;
+        if (readerAttempts === 1) {
+          return new Response(getavPage, {
+            headers: { "content-type": "text/html" },
+          });
+        }
+        // 超过 7 秒的 GetAV 重试等待窗口，但会在请求超时前结束，避免测试
+        // 进程留下悬空定时器。首屏只能使用重试前已经发布的 4K/1080P。
+        await new Promise((resolve) => setTimeout(resolve, 7200));
+        return new Response(getavPage, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === pageUrl) {
+        return new Response(getavPage, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (publicUrls.includes(target)) {
+        assert.equal(init.headers.get("range"), "bytes=0-511");
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      if (getavUrls.includes(target)) {
+        return new Response([
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:6",
+          "#EXTINF:6,",
+          "segment.ts",
+          "#EXT-X-ENDLIST",
+        ].join("\n"), {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        });
+      }
+      if (/\/rctd-745\/\d+\/segment\.ts$/.test(target)) {
+        return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+          status: 206,
+          headers: { "content-type": "video/mp2t" },
+        });
+      }
+      assert.match(target, /\/api\/subtitle\?name=RCTD-745/);
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  const elapsed = Date.now() - startedAt;
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(
+    payload.MediaSources.some((source) =>
+      String(source.Name || "").includes("解析中")
+    ),
+    false,
+  );
+  assert.equal(payload.MediaSourceCount, publicUrls.length + getavUrls.length);
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ).filter(Boolean).sort(),
+    [...publicUrls, ...getavUrls].sort(),
+  );
+  assert.ok(elapsed >= 6800, `first detail response returned too early at ${elapsed}ms`);
+  assert.ok(elapsed < 8200, `first detail response took ${elapsed}ms`);
 });
 
 test("returns ready GetAV sources without waiting for a cold MemoJav probe", async () => {

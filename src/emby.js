@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-20-parallel-passthrough-90";
+const SERVER_BUILD_ID = "2026-10-20-first-partial-no-wait-98";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -340,7 +340,11 @@ const REMOTE_MEDIA_VERDICT_PLAYABLE = "playable";
 const REMOTE_MEDIA_VERDICT_DEAD = "definitely-dead";
 const REMOTE_MEDIA_VERDICT_UNKNOWN = "unknown";
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v52";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v57";
+// 播放源缓存除了“解析已收尾”还必须记录生成它的解析能力。否则旧版本把
+// GetAV 的 720P/480P 漏掉后，只要结果带 resolveComplete 就会被新版本继续
+// 当成可信快照，部署新代码也无法自动恢复缺失线路。
+const RESOLVED_VIDEO_CACHE_CAPABILITY = "getav-all-qualities-v7";
 const MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS = 90;
 const MEDIA_SEGMENT_PREFIX_ADJUSTED_HEADER = "x-emby-ts-prefix-adjusted";
 const DEFAULT_PAGE_SIZE = 1000;
@@ -1791,7 +1795,31 @@ async function attachHlsStreamIdentity(variant, fetchImpl, budget) {
   }
 }
 
+function dedupeGetavSemanticVariants(variants) {
+  const result = [];
+  const positions = new Map();
+  for (const variant of variants) {
+    const key = getavDedupeVariantKey(variant);
+    if (!key) {
+      result.push(variant);
+      continue;
+    }
+    const existingIndex = positions.get(key);
+    if (existingIndex === undefined) {
+      positions.set(key, result.length);
+      result.push(variant);
+      continue;
+    }
+    const existing = result[existingIndex];
+    if (!existing?.streamIdentity && variant?.streamIdentity) {
+      result[existingIndex] = variant;
+    }
+  }
+  return result;
+}
+
 function dedupeSameStreamVariants(variants) {
+  variants = dedupeGetavSemanticVariants(variants);
   const label = (value) =>
     String(value?.sourceName || value?.label || value?.variant || "").toLowerCase();
   // 首分片指纹相同不代表一定是同一条流：MPEG-TS 分片开头 512 字节里
@@ -10860,15 +10888,48 @@ function mergeResolvedVideoVariants(env, ...videos) {
   return normalizedResolvedVideo(variants);
 }
 
-async function validatedResolvedVideo(video, fetchImpl, env = {}) {
+async function validatedResolvedVideo(video, fetchImpl, env = {}, validationCache = null) {
   if (!isUsableResolvedVideo(video)) return null;
+  if (validationCache instanceof Map) {
+    const cacheKey = playbackVariants(video)
+      .map((variant) => [
+        String(variant.sourceUrl || variant.inlinePlaylist || ""),
+        String(variant.variant || ""),
+        String(variant.sourceType || ""),
+      ].join("|"))
+      .join("\u0000");
+    if (validationCache.has(cacheKey)) {
+      return validationCache.get(cacheKey);
+    }
+    const promise = validateResolvedVideoSnapshot(video, fetchImpl, env);
+    validationCache.set(cacheKey, promise);
+    // 同一次解析里失败应该留给下一次调用重试；不需要让失败快照固化。
+    promise.catch(() => validationCache.delete(cacheKey));
+    return promise;
+  }
+  return validateResolvedVideoSnapshot(video, fetchImpl, env);
+}
+
+async function validateResolvedVideoSnapshot(video, fetchImpl, env = {}) {
   const budgetMs = positiveEnvMilliseconds(
     env,
     "REMOTE_HLS_VALIDATION_BUDGET_MS",
     REMOTE_HLS_VALIDATION_BUDGET_MS,
   );
   const variants = await validatedVideoVariants(video, fetchImpl, budgetMs);
-  return normalizedResolvedVideo(variants);
+  const validated = normalizedResolvedVideo(variants);
+  if (
+    validated &&
+    video?.[RESOLVED_VIDEO_COMPLETE_FLAG] === true &&
+    video?.[RESOLVED_VIDEO_CACHE_CAPABILITY_FLAG] ===
+      RESOLVED_VIDEO_CACHE_CAPABILITY &&
+    getavRawQualitiesPreservedAfterValidation(video, validated)
+  ) {
+    // 校验只会剔除死线路；原始快照已经完成且来自当前解析能力时，保留
+    // 完整性/能力标记，避免每次走校验分支后又把缓存降级成“无标记”。
+    markResolvedVideoCacheComplete(validated);
+  }
+  return validated;
 }
 
 function resolverVideoUrls(code, env) {
@@ -10916,25 +10977,68 @@ async function fetchSelfHostedPageText(
   headers = {},
   timeoutMs = SELF_HOSTED_PAGE_TIMEOUT_MS,
 ) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetchImpl(String(url), {
-      headers: new Headers({
-        accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-        "user-agent": SELF_HOSTED_PAGE_USER_AGENT,
-        ...headers,
-      }),
-      redirect: "follow",
-      signal: controller.signal,
-    });
-    if (!response?.ok) {
-      throw new Error(`Self-hosted resolver HTTP ${response?.status || 0}`);
+  const maxAttempts = 4;
+  const host = (() => {
+    try {
+      return new URL(String(url)).host;
+    } catch {
+      return "";
     }
-    return await response.text();
-  } finally {
-    clearTimeout(timer);
+  })();
+  let lastStatus = 0;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let response;
+    let text = "";
+    try {
+      response = await fetchImpl(String(url), {
+        headers: new Headers({
+          accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+          "user-agent": SELF_HOSTED_PAGE_USER_AGENT,
+          ...headers,
+        }),
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      text = await response.text();
+    } finally {
+      clearTimeout(timer);
+    }
+    if (response.ok) {
+      dbgResolve("selfhosted-fetch", "", {
+        host,
+        status: response.status,
+        attempt,
+        bytes: text.length,
+        contentType: response.headers.get("content-type") || "",
+      });
+      return text;
+    }
+
+    lastStatus = response.status;
+    const retryAfter = response.headers.get("retry-after") || "";
+    dbgResolve("selfhosted-http-error", "", {
+      host,
+      status: response.status,
+      attempt,
+      retryAfter,
+      bytes: text.length,
+      body: text.slice(0, 240),
+    });
+    const retryable =
+      response.status === 429 ||
+      response.status === 502 ||
+      response.status === 503 ||
+      response.status === 504;
+    if (!retryable || attempt === maxAttempts) break;
+    const retryAfterSeconds = Number(retryAfter);
+    const delayMs = Number.isFinite(retryAfterSeconds)
+      ? Math.max(0, Math.min(5000, retryAfterSeconds * 1000 + 250))
+      : 500 * attempt;
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
+  throw new Error(`Self-hosted resolver HTTP ${lastStatus}`);
 }
 
 function parseJavtifulSearchResult(html, code) {
@@ -11141,29 +11245,196 @@ function getavVariantsFromPage(html, code) {
     .slice(0, SELF_HOSTED_VARIANT_LIMIT);
 }
 
-async function loadGetavVariants(code, fetchImpl) {
+const GETAV_REQUIRED_RAW_QUALITIES = [2160, 1080, 720, 480];
+const GETAV_INITIAL_MERGE_TIMEOUT_MS = 5000;
+const GETAV_RETRY_TIMEOUT_MS = 7000;
+
+function getavSemanticVariantInfo(variant) {
+  const parsed = parseGetavType(
+    String(variant?.variant || "").replace(/^getav_/i, ""),
+  );
+  if (!parsed) return null;
+  const quality = Number(parsed.quality) || Number(variant?.quality) || 0;
+  if (!quality) return null;
+  return {
+    family: parsed.family,
+    quality,
+    key: `${parsed.family}:${quality}`,
+  };
+}
+
+function getavSemanticVariantKey(variant) {
+  return getavSemanticVariantInfo(variant)?.key || "";
+}
+
+function getavDedupeVariantKey(variant) {
+  const semanticKey = getavSemanticVariantKey(variant);
+  if (!semanticKey) return "";
+  try {
+    const source = new URL(String(variant?.sourceUrl || ""));
+    return `${semanticKey}|${source.host}|${source.pathname}`;
+  } catch {
+    return semanticKey;
+  }
+}
+
+function getavVariantKey(variant) {
+  const semanticKey = getavSemanticVariantKey(variant);
+  if (semanticKey) return semanticKey;
+  return [
+    String(variant?.family || ""),
+    Number(variant?.quality) || 0,
+    String(variant?.variant || ""),
+  ].join(":");
+}
+
+function getavRawQualitySet(value) {
+  const variants = Array.isArray(value) ? value : playbackVariants(value);
+  const qualities = new Set();
+  for (const variant of variants) {
+    const info = getavSemanticVariantInfo(variant);
+    if (info?.family === "raw") qualities.add(info.quality);
+  }
+  return qualities;
+}
+
+function getavRawQualityCount(value) {
+  const qualities = getavRawQualitySet(value);
+  return GETAV_REQUIRED_RAW_QUALITIES.filter((quality) => qualities.has(quality))
+    .length;
+}
+
+function getavRawQualitiesComplete(value) {
+  const qualities = getavRawQualitySet(value);
+  return qualities.size === 0 ||
+    GETAV_REQUIRED_RAW_QUALITIES.every((quality) => qualities.has(quality));
+}
+
+function getavRawQualitiesPreservedAfterValidation(source, validated) {
+  const sourceQualities = getavRawQualitySet(source);
+  if (sourceQualities.size === 0) return true;
+  const validatedQualities = getavRawQualitySet(validated);
+  return validatedQualities.size > 0 &&
+    GETAV_REQUIRED_RAW_QUALITIES.every((quality) =>
+      validatedQualities.has(quality)
+    );
+}
+
+function mergeGetavVariantGroups(...groups) {
+  const familyOrder = new Map([["raw", 0], ["cn", 1], ["uc", 2]]);
+  const merged = new Map();
+  for (const group of groups) {
+    for (const variant of Array.isArray(group) ? group : []) {
+      const key = getavVariantKey(variant);
+      // 后抓到的页面通常带新的签名 URL；同语义线路用新值覆盖旧值，
+      // 同时保留前面页面独有的清晰度。
+      merged.set(key, variant);
+    }
+  }
+  return [...merged.values()]
+    .sort((left, right) =>
+      (familyOrder.get(left.family) || 0) - (familyOrder.get(right.family) || 0) ||
+      (Number(right.quality) || 0) - (Number(left.quality) || 0)
+    )
+    .slice(0, SELF_HOSTED_VARIANT_LIMIT);
+}
+
+async function loadGetavVariants(code, fetchImpl, options = {}) {
   const slug = String(code || "").trim().toLowerCase();
   const pageUrl = new URL(`/zh/videos/${encodeURIComponent(slug)}`, GETAV_ORIGIN);
   const readerUrl = `${JINA_READER_ORIGIN}/${pageUrl.toString()}`;
-  // Jina 偶尔会排队，直连也可能被上游拦截；两条链路同时启动并采用先返回的
-  // 有效页面，避免串行等待把一个链路的首包延迟叠加成 10 秒以上的补源超时。
-  const first = await firstNonEmptyVariantTask([
+  const parsePage = (html, via) => {
+    const variants = getavVariantsFromPage(html, code);
+    dbgResolve("selfhosted-getav-page", code, {
+      via,
+      bytes: String(html || "").length,
+      escapedSources: String(html || "").includes('\\"videoSources\\"'),
+      plainSources: String(html || "").includes('"videoSources":['),
+      title: (String(html || "").match(/<title>([^<]*)<\/title>/i) || [])[1] || "",
+      n: variants.length,
+    });
+    return variants;
+  };
+  const loadJinaVariants = (via = "jina") =>
+    fetchSelfHostedPageText(fetchImpl, readerUrl, {
+      "x-respond-with": "html",
+    })
+      .then((html) => parsePage(html, via))
+      .catch((error) => {
+        dbgResolve("selfhosted-getav-error", code, {
+          via,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return [];
+      });
+  // Jina 偶尔会排队，直连也可能被上游拦截；两条链路同时启动。先到的页面
+  // 只能作为第一批候选，不能因为它只有 4K/1080P 就提前结束：另一条链路
+  // 或 Jina 的下一次响应经常补出 720P/480P。
+  const tasks = [
     {
       name: "jina",
-      promise: fetchSelfHostedPageText(fetchImpl, readerUrl, {
-        "x-respond-with": "html",
-      })
-        .then((html) => getavVariantsFromPage(html, code))
-        .catch(() => []),
+      promise: loadJinaVariants(),
     },
     {
       name: "direct",
       promise: fetchSelfHostedPageText(fetchImpl, pageUrl)
-        .then((html) => getavVariantsFromPage(html, code))
-        .catch(() => []),
+        .then((html) => parsePage(html, "direct"))
+        .catch((error) => {
+          dbgResolve("selfhosted-getav-error", code, {
+            via: "direct",
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return [];
+        }),
     },
-  ]);
-  return first?.value || [];
+  ];
+  const first = await firstNonEmptyVariantTask(tasks);
+  const groups = first?.value ? [first.value] : [];
+  if (
+    first &&
+    getavRawQualityCount(first.value) < GETAV_REQUIRED_RAW_QUALITIES.length
+  ) {
+    for (const task of tasks) {
+      if (task === first.task) continue;
+      const value = await settledWithin(task.promise, GETAV_INITIAL_MERGE_TIMEOUT_MS);
+      if (Array.isArray(value)) groups.push(value);
+    }
+  }
+
+  let merged = mergeGetavVariantGroups(...groups);
+  const publishBatch = () => {
+    if (!merged.length || typeof options.onFirstBatch !== "function") return;
+    try {
+      options.onFirstBatch(merged);
+    } catch {
+      // 提前发布失败不能影响后续补抓。
+    }
+  };
+  publishBatch();
+  const sawGetavPage = groups.some(
+    (group) => Array.isArray(group) && group.length > 0,
+  );
+  if (
+    sawGetavPage &&
+    getavRawQualityCount(merged) < GETAV_REQUIRED_RAW_QUALITIES.length
+  ) {
+    // Jina 的缓存/队列偶尔返回一页缺少 720P/480P 的旧 HTML。首次页面即使
+    // HTTP 200 也不能当成完整结果，再给它一次重新抓取的机会。
+    const retry = await settledWithin(
+      loadJinaVariants("jina-retry"),
+      GETAV_RETRY_TIMEOUT_MS,
+    );
+    if (Array.isArray(retry)) merged = mergeGetavVariantGroups(merged, retry);
+    // 重试页常常补齐 720P/480P。这里必须再发布一次线路更多的快照，
+    // 否则详情页首屏已经拿到公共批次后，就再也看不到这次补抓的结果。
+    publishBatch();
+  }
+
+  dbgResolve("selfhosted-getav-merged", code, {
+    n: merged.length,
+    rawQualities: getavRawQualityCount(merged),
+  });
+  return merged;
 }
 
 function firstNonEmptyVariantTask(tasks) {
@@ -11206,9 +11477,71 @@ function selfHostedVariantsVideo(movie, code, env, merged) {
   return normalizedResolvedVideo(variants);
 }
 
+const SELF_HOSTED_GETAV_QUALITY_COMPLETENESS = new WeakMap();
+
+function markSelfHostedGetavQualityComplete(video, complete) {
+  if (video && typeof video === "object") {
+    SELF_HOSTED_GETAV_QUALITY_COMPLETENESS.set(video, complete === true);
+  }
+  return video;
+}
+
+function selfHostedGetavQualityComplete(video) {
+  return SELF_HOSTED_GETAV_QUALITY_COMPLETENESS.get(video) !== false;
+}
+
 async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl, options = {}) {
   // 数字番号也要查自建源，否则第一次进详情页只有公共线路（见 selfHostedSearchableCode）。
   if (!selfHostedSearchableCode(movie, code)) return null;
+  let firstBatchGeneration = 0;
+  let firstBatchSourceCount = -1;
+  const validationCache = options.validationCache instanceof Map
+    ? options.validationCache
+    : new Map();
+  const publishValidatedFirstBatch = (variants) => {
+    if (
+      typeof options.onFirstBatch !== "function" ||
+      !Array.isArray(variants) ||
+      !variants.length
+    ) {
+      return;
+    }
+    // GetAV 首批必须先剔除明显伪 HLS。否则“4K 真源 + 伪 1080P”的变体
+    // 会在校验前直接进首屏，客户端看到一条不可播的死线路。
+    const candidate = withoutDefinitelyFakeVariants(
+      selfHostedVariantsVideo(movie, code, env, variants),
+    );
+    if (!isUsableResolvedVideo(candidate)) {
+      return;
+    }
+    const generation = ++firstBatchGeneration;
+    // 校验会把 1080P 这类伪 HLS 从同批次中剔掉。尽管我们仍旧允许真源
+    // 在后台补齐后进入首屏，但这里不会把“真源 + 伪源”的脏快照直接外发。
+    validatedResolvedVideo(candidate, fetchImpl, env, validationCache).then(
+      (validated) => {
+        const publishable = withoutDefinitelyFakeVariants(validated);
+        const count = resolvedVideoSourceCount(publishable);
+        if (
+          generation !== firstBatchGeneration ||
+          !isUsableResolvedVideo(publishable) ||
+          count <= firstBatchSourceCount
+        ) {
+          return;
+        }
+        firstBatchSourceCount = count;
+        try {
+          options.onFirstBatch(publishable);
+        } catch {
+          // 提前发布失败不能影响正常解析。
+        }
+      },
+      (error) => {
+        dbgResolve("selfhosted-first-validation-error", code, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
+  };
   const tasks = [
     {
       name: "javtiful",
@@ -11222,7 +11555,11 @@ async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl, options 
     },
     {
       name: "getav",
-      promise: loadGetavVariants(code, fetchImpl).catch((error) => {
+      promise: loadGetavVariants(code, fetchImpl, {
+        onFirstBatch: (variants) => {
+          publishValidatedFirstBatch(variants);
+        },
+      }).catch((error) => {
         dbgResolve("selfhosted-error", code, {
           task: "getav",
           error: error instanceof Error ? error.message : String(error),
@@ -11254,25 +11591,36 @@ async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl, options 
   // 冷启动要 4~5 秒，若等它合并完再发布，详情页 6.5 秒预算往往已经耗尽，
   // 客户端只能看到“自动线路（解析中）”。先发第一批，合并完成后再用更多
   // 线路覆盖（resolveVideo 的 publishPartial 按线路条数单调递增地发布）。
-  if (typeof options.onFirstBatch === "function") {
-    try {
-      options.onFirstBatch(
-        selfHostedVariantsVideo(movie, code, env, first.value),
-      );
-    } catch {
-      // 提前发布失败不能影响正常解析。
-    }
-  }
+  publishValidatedFirstBatch(first.value);
 
   const merged = [...first.value];
+  let getavSettled = first.task?.name !== "getav";
+  let getavSawVariants = false;
+  let getavComplete = false;
+  const noteGetavResult = (value) => {
+    if (!Array.isArray(value)) return;
+    getavSettled = true;
+    if (!value.length) return;
+    getavSawVariants = true;
+    getavComplete =
+      getavRawQualityCount(value) >= GETAV_REQUIRED_RAW_QUALITIES.length;
+  };
+  if (first.task?.name === "getav") noteGetavResult(first.value);
   for (const task of tasks) {
     if (task === first.task) continue;
     const value = await settledWithin(task.promise, SELF_HOSTED_SECONDARY_MERGE_MS);
     if (Array.isArray(value)) merged.push(...value);
+    if (task.name === "getav") noteGetavResult(value);
   }
 
   dbgResolve("selfhosted-merged", code, { n: merged.length });
-  return selfHostedVariantsVideo(movie, code, env, merged);
+  const video = selfHostedVariantsVideo(movie, code, env, merged);
+  // 没抓到 GetAV 页面时不存在“清晰度缺失”；只要抓到页面却少于四条原始
+  // 清晰度，或者 GetAV 任务没能及时收尾，就不能把这份结果当完整缓存。
+  return markSelfHostedGetavQualityComplete(
+    video,
+    getavSettled && (!getavSawVariants || getavComplete),
+  );
 }
 
 async function resolveVideo(movie, env, fetchImpl, options = {}) {
@@ -11296,8 +11644,11 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   if (!code) {
     return null;
   }
+  // 同一条线路的清单/分片校验只在这一次解析里做一次。首屏、自建收尾和
+  // 最终合并都会请求校验，重复探测在云端会直接放大 503/1102 压力。
+  const resolveValidationCache = new Map();
   const finalizeVideo = async (video) => {
-    return validatedResolvedVideo(video, fetchImpl, env);
+    return validatedResolvedVideo(video, fetchImpl, env, resolveValidationCache);
   };
   const loadResolverVideo = async (resolverUrl) => {
     const resolverStartedAt = Date.now();
@@ -11329,15 +11680,20 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   };
   let selfHostedVideoTask = null;
   let selfHostedResolutionFinished = true;
+  let selfHostedQualityComplete = false;
   // 自建补源这一批的“收尾”只通知一次：真正收尾（拿到它全部能拿的线路，或失败）
   // 时立刻通知详情页首屏，不必再等公共解析器那条慢链路的合并窗口。
   let selfHostedPhaseNotified = false;
-  const notifySelfHostedPhaseSettled = () => {
-    if (selfHostedPhaseNotified) return;
-    selfHostedPhaseNotified = true;
+  const notifySelfHostedPhaseSettled = (provisional = false) => {
+    if (!provisional && selfHostedPhaseNotified) return;
+    if (!provisional) selfHostedPhaseNotified = true;
     if (!onSelfHostedPhaseSettled) return;
     try {
-      onSelfHostedPhaseSettled({ started: Boolean(selfHostedVideoTask) });
+      onSelfHostedPhaseSettled({
+        started: Boolean(selfHostedVideoTask),
+        finished: selfHostedResolutionFinished,
+        qualityComplete: selfHostedQualityComplete,
+      });
     } catch {
       // 回调异常不能影响正常解析。
     }
@@ -11354,14 +11710,19 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
           // 自建链路里第一条线路一到就对外发布，不再等另一条链路合并完
           // （Jina 代理取 GetAV 要 4~5 秒，解析预算常常等不到）。
           onFirstBatch: (video) => publishPartial(video),
+          validationCache: resolveValidationCache,
         },
       ).then(
         (video) => {
           selfHostedResolutionFinished = true;
+          selfHostedQualityComplete = video
+            ? selfHostedGetavQualityComplete(video)
+            : true;
           return video;
         },
         () => {
           selfHostedResolutionFinished = true;
+          selfHostedQualityComplete = true;
           return null;
         },
       );
@@ -11427,7 +11788,17 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   // 拿到真实线路和播放按钮。
   if (selfHostedSearchableCode(movie, code)) {
     startSelfHostedVideo().then(
-      (video) => publishPartial(video),
+      (video) => {
+        if (!video) return;
+        validatedResolvedVideo(video, fetchImpl, env, resolveValidationCache).then(
+          (validated) => publishPartial(validated),
+          (error) => {
+            dbgResolve("selfhosted-validation-error", code, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          },
+        );
+      },
       () => {},
     );
   }
@@ -11519,7 +11890,9 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
     ? await settledWithin(selfHostedVideoTask, selfHostedMergeBudget(env))
     : null;
   // 若任务到这时还没收尾（等满自建合并预算），也通知一次：详情页不该再为它空等。
-  notifySelfHostedPhaseSettled();
+  // 自建任务若仍在补抓，先发一份 provisional 状态（finished=false）。
+  // 后续任务真正收尾时还会再发最终状态，详情页不会把“仍在补抓”误当成“已收尾”。
+  notifySelfHostedPhaseSettled(!selfHostedResolutionFinished);
   // 收尾合并必须把“已经通过 publishPartial 发给客户端的中途快照”也算进来：
   // 自建补源（Javtiful / GetAV）的第一批线路会先发布给客户端，但它不一定能在
   // selfHostedMergeBudget（默认 3.5 秒）内等到 selfHostedVideoTask 收尾——超时后
@@ -11545,7 +11918,8 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
     // 停在“自动线路（解析中）”。
     markResolvedVideoResolutionComplete(
       validated,
-      !selfHostedVideoTask || selfHostedResolutionFinished,
+      !selfHostedVideoTask ||
+        (selfHostedResolutionFinished && selfHostedQualityComplete),
     );
     return validated;
   }
@@ -11990,17 +12364,24 @@ function resolvedVideoSourceCount(video) {
 // RESOLVED_VIDEO_COMPLETENESS 是 WeakMap，只在当前 isolate 内有效，而结果
 // 要经过边缘缓存 / D1 的 JSON 序列化后跨实例复用。
 const RESOLVED_VIDEO_COMPLETE_FLAG = "resolveComplete";
+const RESOLVED_VIDEO_CACHE_CAPABILITY_FLAG = "resolveCapability";
 
 function markResolvedVideoCacheComplete(video) {
+  if (!getavRawQualitiesComplete(video)) {
+    markResolvedVideoResolutionComplete(video, false);
+    return false;
+  }
   if (video && typeof video === "object") {
     try {
       video[RESOLVED_VIDEO_COMPLETE_FLAG] = true;
+      video[RESOLVED_VIDEO_CACHE_CAPABILITY_FLAG] =
+        RESOLVED_VIDEO_CACHE_CAPABILITY;
     } catch {
       // 冻结对象等异常场景退化为仅 WeakMap 标记。
     }
   }
   markResolvedVideoResolutionComplete(video, true);
-  return video;
+  return true;
 }
 
 // 缓存（内存 / 边缘 / D1）里的播放源能不能直接复用：
@@ -12009,6 +12390,13 @@ function markResolvedVideoCacheComplete(video) {
 // 后续补出更多线路；若把这种快照当完整缓存，客户端会长期少源。
 function resolvedVideoCacheIsTrustworthy(video) {
   if (!isUsableResolvedVideo(video)) return false;
+  if (
+    video[RESOLVED_VIDEO_CACHE_CAPABILITY_FLAG] !==
+    RESOLVED_VIDEO_CACHE_CAPABILITY
+  ) {
+    return false;
+  }
+  if (!getavRawQualitiesComplete(video)) return false;
   return video[RESOLVED_VIDEO_COMPLETE_FLAG] === true ||
     RESOLVED_VIDEO_COMPLETENESS.get(video) === true;
 }
@@ -12437,6 +12825,7 @@ function acquireResolveVideoSession(key) {
       latest: null,
       publicSettled: false,
       selfHostedSettled: false,
+      selfHostedInfo: null,
       settled: false,
     };
     RESOLVE_VIDEO_SESSIONS.set(key, session);
@@ -12471,7 +12860,11 @@ function subscribeResolveVideoSession(session, handlers = {}) {
       });
     }
     if (session.selfHostedSettled && subscriber.onSelfHostedPhaseSettled) {
-      subscriber.onSelfHostedPhaseSettled({ started: true });
+      subscriber.onSelfHostedPhaseSettled(session.selfHostedInfo || {
+        started: true,
+        finished: true,
+        qualityComplete: true,
+      });
     }
   } catch {
     // 补发失败不影响解析。
@@ -12675,7 +13068,12 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
   };
   const onSelfHostedPhaseSettled = (info) => {
     session.selfHostedSettled = true;
-    emitResolveVideoEvent(session, "onSelfHostedPhaseSettled", info);
+    session.selfHostedInfo = info && typeof info === "object" ? info : {
+      started: true,
+      finished: true,
+      qualityComplete: true,
+    };
+    emitResolveVideoEvent(session, "onSelfHostedPhaseSettled", session.selfHostedInfo);
   };
   // 不用 fetch() 的自动写缓存：如果 GetAV 补源仍在后台且当前只有公开薄
   // 线路，结果只能服务本次请求，不能进入 30 分钟内存缓存或长期 D1。
@@ -12736,7 +13134,9 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
         if (resolvedVideoResolutionComplete(video)) {
           // 打上“解析已收尾”标记再落缓存：下一次请求命中这份缓存时，即使只有
           // 一条线路也能判定为“上游本来就只有一条”，不必重新现场解析。
-          markResolvedVideoCacheComplete(video);
+          if (!markResolvedVideoCacheComplete(video)) {
+            return video;
+          }
           // 只有凑齐目标线路数的结果才写长期 D1（30 天）；线路偏少的“已收尾”
           // 结果仍然进内存 + 边缘缓存（30 分钟），避免上游本来就只有两条时
           // 每次点开都重新现场解析。
@@ -12871,6 +13271,11 @@ async function resolveVideoForResponse(
   let majorSeen = false;
   // 自建补源这一批是否已经落定（resolveVideo 的 onSelfHostedPhaseSettled）。
   let selfHostedPhaseSettled = false;
+  // 自建链路已经启动，但 GetAV 的清晰度补抓还没收齐。公共批次先收尾时，
+  // 不能因为线路数已经达到 2 条就走短静默期；否则 4K/1080P 先到、720P/480P
+  // 后补的常见批次会被截断。
+  let selfHostedQualityComplete = false;
+  let selfHostedExpected = false;
   const partialSettled = new Promise((resolve) => {
     partialResolve = resolve;
   });
@@ -12893,7 +13298,9 @@ async function resolveVideoForResponse(
     // - 只有 0~1 条线路：最多等 THIN_WAIT，避免首屏永久只有单源。
     // - 首屏上限仍作为最后保险，所有未完成任务由 keepAliveBounded() 继续跑。
     const enough = count >= RESOLVE_VIDEO_FIRST_SCREEN_TARGET_COUNT;
-    const bothSettled = publicPhaseSettled && selfHostedPhaseSettled;
+    const bothSettled = publicPhaseSettled &&
+      selfHostedPhaseSettled &&
+      selfHostedQualityComplete;
     const elapsed = Date.now() - startedAt;
     if (bothSettled) return { exit: true };
 
@@ -12903,7 +13310,11 @@ async function resolveVideoForResponse(
       // 已经见过公共快照但只有 1 条时，说明另一条公共解析端仍可能补齐
       // 一批线路（现场常见 0.2 秒 1 条、6.8 秒再补 5 条）。此时不能套用
       // 自建补源的 5.2 秒薄线路窗口，否则会稳定截断后到的主批次。
-      const waitTargetMs = majorSeen
+      // 自建链路已经收尾但只有一条、公共链路仍在解析时，自建侧已经不可能
+      // 再补出线路；这时 5.2 秒薄源窗口会把仍在途的公共 fcjav 批次截断。
+      // 至少等到 7 秒主批次窗口，仍由上面 7.6 秒硬上限兜底。
+      const waitTargetMs = majorSeen ||
+          (selfHostedPhaseSettled && !publicPhaseSettled)
         ? RESOLVE_VIDEO_FIRST_SCREEN_MAJOR_WAIT_MS
         : RESOLVE_VIDEO_FIRST_SCREEN_THIN_WAIT_MS;
       const waitLeftMs = waitTargetMs - elapsed;
@@ -12918,6 +13329,18 @@ async function resolveVideoForResponse(
 
     const idleMs = Date.now() - lastSnapshotAt;
     if (publicPhaseSettled) {
+      if (!selfHostedPhaseSettled || !selfHostedQualityComplete) {
+        // 公共解析器已经收尾，但 GetAV 仍在补抓清晰度。此时线路数达标并不
+        // 代表已经齐全，继续等到自建批次收尾；始终由首屏硬上限兜底。
+        const waitLeftMs = RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS - elapsed;
+        if (waitLeftMs <= 0) return { exit: true };
+        return {
+          delay: Math.max(
+            RESOLVE_VIDEO_FIRST_SCREEN_SETTLE_MS,
+            Math.min(capLeftMs, waitLeftMs),
+          ),
+        };
+      }
       const graceLeftMs = RESOLVE_VIDEO_FIRST_SCREEN_GRACE_MS - idleMs;
       if (graceLeftMs <= 0) return { exit: true };
       return {
@@ -12981,6 +13404,13 @@ async function resolveVideoForResponse(
   const armPartialWindow = (count, major) => {
     if (!partialResolve) return;
     if (major === true) majorSeen = true;
+    if (
+      partial.video &&
+      getavRawQualityCount(partial.video) >= GETAV_REQUIRED_RAW_QUALITIES.length
+    ) {
+      // 增量快照本身就证明四档已经到齐；无需等待可能已超时的批次状态回调。
+      selfHostedQualityComplete = true;
+    }
     currentCount = count;
     lastSnapshotAt = Date.now();
     dbgResolve("partial-window", debugCode, {
@@ -13004,8 +13434,11 @@ async function resolveVideoForResponse(
         armPartialWindow(resolvedVideoSourceCount(partial.video), false);
       }
     },
-    onSelfHostedPhaseSettled: () => {
-      selfHostedPhaseSettled = true;
+    onSelfHostedPhaseSettled: (info) => {
+      selfHostedExpected = info?.started !== false;
+      selfHostedPhaseSettled = !selfHostedExpected || info?.finished === true;
+      selfHostedQualityComplete = !selfHostedExpected ||
+        info?.qualityComplete === true;
       // 自建补源的合并完成时再重新计时：此时两条链路都落定才会改用短窗口。
       if (partialResolve && partialVideo()) {
         armPartialWindow(resolvedVideoSourceCount(partial.video), false);
@@ -13083,17 +13516,60 @@ async function resolveVideoForResponse(
         Math.min(remainingBudgetMs(), RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS),
       );
     } finally {
-      // 无论谁先结束，都不再让静默窗口继续计时（避免悬空定时器）。
-      clearPartialWindow();
+      const keepWaitingForIncompleteFull =
+        early?.kind === "full" &&
+        isUsableResolvedVideo(early.video) &&
+        !resolvedVideoResolutionComplete(early.video);
+      // 临时完整快照之后还可能有 GetAV 增量批次。保留 partialResolve，
+      // 让下面的补等逻辑能继续被后续快照唤醒；其余路径仍立即清理定时器。
+      if (!keepWaitingForIncompleteFull) clearPartialWindow();
     }
     if (early.kind === "full" && isUsableResolvedVideo(early.video)) {
-      dbgResolve("frs-exit", debugCode, { via: "full", n: resolvedVideoSourceCount(early.video) });
-      return {
-        video: early.video,
-        resolutionFinished: true,
-        stale: false,
-        error: null,
-      };
+      if (
+        !resolvedVideoResolutionComplete(early.video) &&
+        partialResolve
+      ) {
+        // resolveVideo 在自建补源仍于后台补抓 GetAV 时，会先用当前快照
+        // 收尾 resolveTask。这个结果不是首屏最终结果；若在这里直接返回，
+        // 4K/1080P 先到、720P/480P 后补的批次仍会在 ~100ms 被截断。
+        // 把它并入最近快照，再继续走可重复触发的首屏静默窗口。
+        if (
+          resolvedVideoSourceCount(early.video) >
+            resolvedVideoSourceCount(partialVideo())
+        ) {
+          partial.video = early.video;
+        }
+        armPartialWindow(
+          resolvedVideoSourceCount(partialVideo() || early.video),
+          false,
+        );
+        const followUpBudgetMs = Math.min(
+          remainingBudgetMs(),
+          Math.max(
+            0,
+            RESOLVE_VIDEO_FIRST_SCREEN_MAX_WAIT_MS -
+              (Date.now() - startedAt),
+          ),
+        );
+        early = await withTimeout(partialSettled, followUpBudgetMs).catch(
+          () => ({ kind: "partial" }),
+        );
+        dbgResolve("frs-wait-incomplete-full", debugCode, {
+          n: resolvedVideoSourceCount(partialVideo() || early.video),
+          next: early.kind,
+        });
+      } else {
+        dbgResolve("frs-exit", debugCode, {
+          via: "full",
+          n: resolvedVideoSourceCount(early.video),
+        });
+        return {
+          video: early.video,
+          resolutionFinished: true,
+          stale: false,
+          error: null,
+        };
+      }
     }
     if (early.kind === "error") {
       throw early.error || new Error("playback resolution failed");

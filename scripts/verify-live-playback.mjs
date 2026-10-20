@@ -33,7 +33,7 @@ const transportMode = String(process.env.PARALLEL_MODE || "parallel")
 const parallelDisabled = ["0", "false", "no", "off", "serial", "single"]
   .includes(transportMode);
 const expectedBuildId = String(
-  process.env.EXPECTED_BUILD_ID || "2026-10-20-parallel-passthrough-90",
+  process.env.EXPECTED_BUILD_ID || "2026-10-20-first-partial-no-wait-98",
 ).trim();
 const runDirectBench = /^(?:1|true|yes|on)$/i.test(
   String(process.env.RUN_DIRECT_BENCH || ""),
