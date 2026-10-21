@@ -15,6 +15,7 @@ import {
   createEmbyConcurrencyGateForTests,
   createMediaParallelRangeCoordinatorForTests,
   createMediaUpstreamSchedulerForTests,
+  dedupeGetavQualityVariantsForTests,
   dedupeSameStreamVariantsForTests,
   mediaParallelRangeCoordinatorStatsForTests,
   mediaSegmentCacheKeyForTests,
@@ -151,8 +152,8 @@ test("scopes resolved-video caches to the Worker or Pages deployment", () => {
     PLAYBACK_DEPLOY_TAG: "pages",
   });
 
-  assert.match(workerKey, /sources-v57\|worker\|TEST-001$/);
-  assert.match(pagesKey, /sources-v57\|pages\|TEST-001$/);
+  assert.match(workerKey, /sources-v58\|worker\|TEST-001$/);
+  assert.match(pagesKey, /sources-v58\|pages\|TEST-001$/);
   assert.notEqual(workerKey, pagesKey);
 });
 
@@ -434,6 +435,43 @@ test("collapses rotated signed URLs for the same GetAV family and quality", () =
     720,
     480,
   ]);
+});
+
+test("keeps one GetAV line per quality when signed paths rotate", () => {
+  const signed = (quality, delivery) => ({
+    variant: `getav_raw_${quality === 2160 ? "4k" : `${quality}p`}`,
+    label: "原版",
+    quality,
+    sourceUrl:
+      `https://static.worldstatic.com/cdn/assets/deliveries/v2/${delivery}/index.txt` +
+      `?t=1e7007c3ce&e=1829088000`,
+  });
+  const deduped = dedupeGetavQualityVariantsForTests([
+    signed(2160, "first-delivery"),
+    signed(1080, "first-delivery"),
+    signed(2160, "second-delivery"),
+    signed(1080, "second-delivery"),
+    signed(720, "third-delivery"),
+    signed(480, "fourth-delivery"),
+  ]);
+
+  assert.deepEqual(deduped.map((variant) => variant.quality), [
+    2160,
+    1080,
+    720,
+    480,
+  ]);
+  // 其它提供方的线路不能被 GetAV 的语义去重影响。
+  const fcjav = {
+    variant: "fcjav_original",
+    label: "fcjav 原版",
+    sourceUrl: "https://cdn.example.com/fcjav/index.m3u8",
+  };
+  const mixed = dedupeGetavQualityVariantsForTests([
+    signed(1080, "first-delivery"),
+    fcjav,
+  ]);
+  assert.equal(mixed.length, 2);
 });
 
 test("only trusts complete resolved-video cache entries from the current capability", () => {

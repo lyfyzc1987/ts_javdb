@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-20-first-partial-no-wait-98";
+const SERVER_BUILD_ID = "2026-10-21-getav-quality-dedupe-99";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -340,7 +340,7 @@ const REMOTE_MEDIA_VERDICT_PLAYABLE = "playable";
 const REMOTE_MEDIA_VERDICT_DEAD = "definitely-dead";
 const REMOTE_MEDIA_VERDICT_UNKNOWN = "unknown";
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v57";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v58";
 // 播放源缓存除了“解析已收尾”还必须记录生成它的解析能力。否则旧版本把
 // GetAV 的 720P/480P 漏掉后，只要结果带 resolveComplete 就会被新版本继续
 // 当成可信快照，部署新代码也无法自动恢复缺失线路。
@@ -1818,8 +1818,50 @@ function dedupeGetavSemanticVariants(variants) {
   return result;
 }
 
+// GetAV 每次抓页面都会给同一清晰度换一套签名 URL。按 URL 去重抓不住这种情况，
+// 于是同一个 4K 会以两条不同签名的线路同时进快照，客户端看到
+// “MemoJav GetAV 原版 4K · 1 / · 2”这种重复源。同一 family + quality 只保留
+// 一条（优先带分片指纹的那条），其它提供方的线路不受影响。
+// 注意：同一清晰度但投递方式不同（例如公开解析站直链 mp4 vs GetAV 的 HLS）
+// 是两条真正不同的线路，必须都保留，所以去重键里带上投递类型。
+function variantDeliveryKind(variant) {
+  if (variant?.inlinePlaylist) return "hls";
+  return isHlsManifestSource(
+    String(variant?.sourceUrl || ""),
+    String(variant?.sourceType || ""),
+  )
+    ? "hls"
+    : "progressive";
+}
+
+function dedupeGetavQualityVariants(variants) {
+  const list = Array.isArray(variants) ? variants : playbackVariants(variants);
+  if (list.length < 2) return variants;
+  const result = [];
+  const positions = new Map();
+  for (const variant of list) {
+    const info = getavSemanticVariantInfo(variant);
+    if (!info) {
+      result.push(variant);
+      continue;
+    }
+    const key = `${info.key}:${variantDeliveryKind(variant)}`;
+    const existingIndex = positions.get(key);
+    if (existingIndex === undefined) {
+      positions.set(key, result.length);
+      result.push(variant);
+      continue;
+    }
+    if (!result[existingIndex]?.streamIdentity && variant?.streamIdentity) {
+      result[existingIndex] = variant;
+    }
+  }
+  if (result.length === list.length) return variants;
+  return Array.isArray(variants) ? result : normalizedResolvedVideo(result);
+}
+
 function dedupeSameStreamVariants(variants) {
-  variants = dedupeGetavSemanticVariants(variants);
+  variants = dedupeGetavSemanticVariants(dedupeGetavQualityVariants(variants));
   const label = (value) =>
     String(value?.sourceName || value?.label || value?.variant || "").toLowerCase();
   // 首分片指纹相同不代表一定是同一条流：MPEG-TS 分片开头 512 字节里
@@ -10885,7 +10927,7 @@ function mergeResolvedVideoVariants(env, ...videos) {
       sourceUrl: sourceUrl.toString(),
     }];
   });
-  return normalizedResolvedVideo(variants);
+  return normalizedResolvedVideo(dedupeGetavQualityVariants(variants));
 }
 
 async function validatedResolvedVideo(video, fetchImpl, env = {}, validationCache = null) {
@@ -11752,7 +11794,10 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
     if (!onPartial) return;
     // 中途快照不会经过 validatedResolvedVideo 的分片探测，这里先剔除“同步即可
     // 判定为图片/字体”的伪 HLS 线路，避免首屏把假线路发给客户端。
-    const publishable = withoutDefinitelyFakeVariants(video);
+    // 同一 GetAV 清晰度的不同签名 URL 也只保留一条，首屏不会出现重复源。
+    const publishable = dedupeGetavQualityVariants(
+      withoutDefinitelyFakeVariants(video),
+    );
     if (!isUsableResolvedVideo(publishable)) return;
     const merged = publishedVideo
       ? mergeResolvedVideoVariants(env, publishedVideo, publishable) || publishable
@@ -18622,6 +18667,10 @@ export function resolvedVideoCacheKeyForTests(movie, env) {
 
 export function dedupeSameStreamVariantsForTests(variants) {
   return dedupeSameStreamVariants(variants);
+}
+
+export function dedupeGetavQualityVariantsForTests(variants) {
+  return dedupeGetavQualityVariants(variants);
 }
 
 export function resolvedVideoCacheIsTrustworthyForTests(video) {
