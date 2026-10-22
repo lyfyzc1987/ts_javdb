@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-22-serial-throughput-105";
+const SERVER_BUILD_ID = "2026-10-22-memo-parallel-variants-106";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -14766,7 +14766,48 @@ function selectedPlaybackVideo(video, itemId, requestUrl) {
 const MEMOJAV_EMBY_RESOLVE_BUDGET_MS = 200;
 const MEMOJAV_EMBY_BACKGROUND_GRACE_MS = 4000;
 
-async function resolveMemoSourcesForMovie(movie, env, fetchImpl, budgetMs, ctx) {
+function memoLookupCode(movie) {
+  const code = movieResolveCode(movie);
+  const normalizedCode = String(code || "").trim().toUpperCase();
+  if (!normalizedCode || !/^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(normalizedCode)) {
+    return "";
+  }
+  return normalizedCode;
+}
+
+/**
+ * 与播放源解析同时启动 MemoJav 查询。
+ * 旧写法是“等公共解析器跑完再查 MemoJav，且只给 200ms”，冷缓存时上游
+ * 查询约 1~2 秒，几乎必然超时，于是详情页/PlaybackInfo 里根本看不到
+ * MemoJav 线路（用户反馈“MemoJav 只有一个源/没有多源”）。现在改成并行，
+ * 公共解析器跑完时 MemoJav 结果通常已经就绪，等于零额外延迟。
+ */
+function startMemoResolution(movie, env, fetchImpl, ctx) {
+  const normalizedCode = memoLookupCode(movie);
+  if (!normalizedCode) return null;
+  return trackResolution(
+    Promise.resolve(
+      resolveMemoSourceCached(normalizedCode, env, ctx, fetchImpl),
+    ).catch(() => null),
+  );
+}
+
+async function resolveMemoSourcesForMovie(
+  movie,
+  env,
+  fetchImpl,
+  budgetMs,
+  ctx,
+  tracked = null,
+) {
+  if (tracked) {
+    const budget = Math.max(0, Number(budgetMs) || 0);
+    if (tracked.record.done) return tracked.record.value ?? null;
+    const info = budget > 0 ? await settledWithin(tracked.tracked, budget) : null;
+    if (info !== null && info !== undefined) return info;
+    keepAliveBounded(tracked.tracked, ctx, MEMOJAV_EMBY_BACKGROUND_GRACE_MS);
+    return null;
+  }
   const code = movieResolveCode(movie);
   const normalizedCode = String(code || "").trim().toUpperCase();
   if (!normalizedCode || !/^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(normalizedCode)) {
@@ -14839,6 +14880,7 @@ async function mediaSourcesForMovie(
       memo.fetchImpl,
       memo.budgetMs,
       memo.ctx,
+      memo.resolution || null,
     );
   }
   const memoSources = memoJavMediaSources(
@@ -15375,6 +15417,8 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   const subtitleResolution = trackResolution(
     resolveSubtitlesCached(movie, env, fetchImpl).catch(() => []),
   );
+  // MemoJav 查询与播放源解析并行启动（结果在下方按预算取用）。
+  const memoResolution = startMemoResolution(movie, env, fetchImpl, ctx);
   const videoResolution = await resolveVideoForResponse(
     movie,
     env,
@@ -15465,6 +15509,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
         MEMOJAV_EMBY_RESOLVE_BUDGET_MS,
         remainingRequestMs(requestDeadline, MEMOJAV_EMBY_RESOLVE_BUDGET_MS),
       ),
+      resolution: memoResolution,
     },
     requestUserAgent,
   );
@@ -18773,6 +18818,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       const subtitleResolution = trackResolution(
         resolveSubtitlesCached(movie, env, fetchImpl).catch(() => []),
       );
+      const memoResolution = startMemoResolution(movie, env, fetchImpl, ctx);
       // 与详情页一致：给真实解析留出足够预算，超时则返回空列表并继续后台解析，
       // 不再返回无地址的假线路。
       // 命中旧成功源时立即返回，同时后台继续刷新；上游解析账号临时停用时
@@ -18853,6 +18899,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
             MEMOJAV_EMBY_RESOLVE_BUDGET_MS,
             remainingRequestMs(requestDeadline, MEMOJAV_EMBY_RESOLVE_BUDGET_MS),
           ),
+          resolution: memoResolution,
         },
         requestUserAgent,
       );
@@ -19122,3 +19169,4 @@ export function resetEmbyCachesForTests() {
   MEMORY_PLAY_SESSIONS.clear();
   MEMORY_LEGACY_ADOPT_GUARDS.clear();
 }
+

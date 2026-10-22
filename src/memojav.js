@@ -255,7 +255,9 @@ function hostFromUrl(raw) {
 function hlsSource(url, checkedAt) {
   return {
     id: "hls",
-    name: "MemoJav HLS",
+    // 上游这条清单本身不带清晰度（单码率媒体清单），叫“原画”比“HLS”直观，
+    // 也不谎报 1080P / 720P。
+    name: "MemoJav 原画",
     kind: "hls",
     container: "m3u8",
     height: 0,
@@ -274,6 +276,99 @@ function mp4Sources(baseUrl, checkedAt) {
     url: `${baseUrl}=${quality.suffix}`,
     checkedAt,
   }));
+}
+
+const HLS_VARIANT_PROBE_MAX_BYTES = 65536;
+
+/**
+ * 从 master 清单里解析 `#EXT-X-STREAM-INF` 变体。
+ * 上游对部分番号确实提供多条不同分辨率的 HLS 变体，这时必须逐条给出
+ * 真实清晰度的 302 短链，而不是只暴露一条（用户反馈“MemoJav 只有一个
+ * 视频源”）。没有变体的媒体清单返回空数组，绝不伪造清晰度。
+ */
+export function parseHlsVariantSources(manifestText, baseUrl, checkedAt = new Date().toISOString()) {
+  const lines = String(manifestText || "").split(/\r?\n/);
+  const variants = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (!/^#EXT-X-STREAM-INF:/i.test(line)) continue;
+    const attrs = line.slice(line.indexOf(":") + 1);
+    let uri = "";
+    for (let next = index + 1; next < lines.length; next += 1) {
+      const candidate = lines[next].trim();
+      if (!candidate) continue;
+      if (candidate.startsWith("#")) break;
+      uri = candidate;
+      break;
+    }
+    if (!uri) continue;
+    let absolute = "";
+    try {
+      absolute = new URL(uri, baseUrl).href;
+    } catch {
+      continue;
+    }
+    const resolution = /RESOLUTION=(\d+)x(\d+)/i.exec(attrs);
+    const bandwidth = /(?:AVERAGE-)?BANDWIDTH=(\d+)/i.exec(attrs);
+    variants.push({
+      url: absolute,
+      height: resolution ? Number(resolution[2]) || 0 : 0,
+      bandwidth: bandwidth ? Number(bandwidth[1]) || 0 : 0,
+    });
+  }
+  return variants;
+}
+
+/**
+ * 上游 HLS 若是多清晰度 master，就展开成多条真实播放源；
+ * 单条媒体清单（memojav 目前绝大多数番号）保持原样，不制造假清晰度。
+ */
+async function expandHlsVariants(info, fetchImpl, prefetchedText = "") {
+  if (!info || !info.ok || info.type !== "hls") return info;
+  if (!Array.isArray(info.sources) || info.sources.length !== 1) return info;
+  const base = info.sources[0].url;
+  let text = String(prefetchedText || "");
+  if (!text) {
+    try {
+      const response = await fetchImpl(base, {
+        method: "GET",
+        headers: {
+          "user-agent": BROWSER_UA,
+          accept: "*/*",
+          range: `bytes=0-${HLS_VARIANT_PROBE_MAX_BYTES - 1}`,
+        },
+      });
+      if (!response.ok && response.status !== 206) return info;
+      text = await response.text();
+    } catch {
+      return info;
+    }
+  }
+  const variants = parseHlsVariantSources(text, base, info.checkedAt);
+  if (!variants.length) return info;
+  const byHeight = new Map();
+  for (const variant of variants) {
+    if (!variant.height || variant.height < 144) continue;
+    const existing = byHeight.get(variant.height);
+    if (!existing || variant.bandwidth > existing.bandwidth) {
+      byHeight.set(variant.height, variant);
+    }
+  }
+  const heights = [...byHeight.keys()].sort((left, right) => right - left);
+  if (heights.length < 2) return info;
+  info.sources = heights.map((height) => {
+    const variant = byHeight.get(height);
+    return {
+      id: `hls-${height}`,
+      name: `MemoJav ${height}P`,
+      kind: "hls",
+      container: "m3u8",
+      height,
+      url: variant.url,
+      checkedAt: info.checkedAt,
+    };
+  });
+  return info;
 }
 
 /** 解析 get_video_info.php 的响应（前面可能带 `for(;;);` 反 JSON 劫持前缀）。 */
@@ -354,7 +449,9 @@ async function resolveMemoInfo(code, env, fetchImpl = fetch) {
     });
     if (response.ok) {
       const info = parseMemoVideoInfo(await response.text(), checkedAt);
-      if (info) return addProxyFallback(info, env);
+      if (info) {
+        return addProxyFallback(await expandHlsVariants(info, fetchImpl), env);
+      }
     }
   } catch {
     // 接口失败时继续走旧版媒体域名探测，保证已上架 HLS 仍可播放。
@@ -389,15 +486,18 @@ async function resolveLegacySource(code, env, fetchImpl = fetch) {
         if (/#EXTM3U/i.test(head)) {
           const checkedAt = new Date().toISOString();
           return addProxyFallback(
-            {
-              ok: true,
-              type: "hls",
-              provider: "legacy-host",
-              host,
-              url,
-              sources: [hlsSource(url, checkedAt)],
-              checkedAt,
-            },
+            await expandHlsVariants(
+              {
+                ok: true,
+                type: "hls",
+                provider: "legacy-host",
+                host,
+                url,
+                sources: [hlsSource(url, checkedAt)],
+                checkedAt,
+              },
+              fetchImpl,
+            ),
             env,
           );
         }

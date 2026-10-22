@@ -33,7 +33,7 @@ const transportMode = String(process.env.PARALLEL_MODE || "parallel")
 const parallelDisabled = ["0", "false", "no", "off", "serial", "single"]
   .includes(transportMode);
 const expectedBuildId = String(
-  process.env.EXPECTED_BUILD_ID || "2026-10-22-serial-throughput-105",
+  process.env.EXPECTED_BUILD_ID || "2026-10-22-memo-parallel-variants-106",
 ).trim();
 const runDirectBench = /^(?:1|true|yes|on)$/i.test(
   String(process.env.RUN_DIRECT_BENCH || ""),
@@ -565,3 +565,4 @@ if (
 ) {
   process.exitCode = 1;
 }
+

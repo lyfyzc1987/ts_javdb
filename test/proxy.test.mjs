@@ -14586,7 +14586,9 @@ test("memo short link returns a 302 to the upstream m3u8 without proxying", asyn
 
   assert.equal(response.status, 302);
   assert.equal(response.headers.get("location"), upstreamUrl);
-  assert.equal(calls.length, 1);
+  // 第 1 次请求 get_video_info.php；第 2 次（可选）探测 master 清单里是否
+  // 存在多清晰度变体，用于展开多条真实 302 源。单清单时不会额外产出源。
+  assert.ok(calls.length >= 1 && calls.length <= 2);
   assert.match(calls[0].url, /^https:\/\/memojav\.org\/hls\/get_video_info\.php\?/);
 });
 
@@ -14649,6 +14651,93 @@ test("memo sources endpoint exposes real MP4 qualities and selects one", async (
   assert.equal(selectedResponse.status, 302);
   assert.equal(selectedResponse.headers.get("location"), `${baseUrl}=m22`);
   assert.equal(calls.length, 2);
+});
+
+test("memo hls master with real quality variants expands into multiple sources", async () => {
+  const upstreamUrl = "https://video10.memojav.net/stream/ROE-552/master.m3u8";
+  const master = [
+    "#EXTM3U",
+    "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=3840x2160",
+    "2160/index.m3u8",
+    "#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080",
+    "1080/index.m3u8",
+    "#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720",
+    "720/index.m3u8",
+  ].join("\n");
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    if (String(url).includes("get_video_info.php")) {
+      return memoInfoResponse("hls", upstreamUrl);
+    }
+    return new Response(master, {
+      headers: { "content-type": "application/vnd.apple.mpegurl" },
+    });
+  };
+
+  const listResponse = await handleProxy(
+    new Request("https://clone.example/memo/ROE-552?sources=1"),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(listResponse.status, 200);
+  const list = await listResponse.json();
+  assert.deepEqual(
+    list.sources.map((source) => [source.id, source.height, source.name]),
+    [
+      ["hls-2160", 2160, "MemoJav 2160P"],
+      ["hls-1080", 1080, "MemoJav 1080P"],
+      ["hls-720", 720, "MemoJav 720P"],
+      ["hls-proxy", 2160, "MemoJav 代理"],
+    ],
+  );
+  assert.equal(
+    list.sources[1].url,
+    "https://video10.memojav.net/stream/ROE-552/1080/index.m3u8",
+  );
+
+  const selectedResponse = await handleProxy(
+    new Request("https://clone.example/memo/ROE-552?source=hls-720&refresh=1"),
+    {},
+    {},
+    fetchImpl,
+  );
+  assert.equal(selectedResponse.status, 302);
+  assert.equal(
+    selectedResponse.headers.get("location"),
+    "https://video10.memojav.net/stream/ROE-552/720/index.m3u8",
+  );
+});
+
+test("memo hls single media playlist keeps exactly one real source", async () => {
+  const upstreamUrl = "https://video10.memojav.net/stream/START-642/master.m3u8";
+  const media = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    "#EXT-X-PLAYLIST-TYPE:VOD",
+    '#EXT-X-MAP:URI="init.mp4"',
+    "#EXTINF:8.341667,",
+    "master0.m4s",
+  ].join("\n");
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/START-642?sources=1"),
+    {},
+    {},
+    async (url) =>
+      String(url).includes("get_video_info.php")
+        ? memoInfoResponse("hls", upstreamUrl)
+        : new Response(media, {
+          headers: { "content-type": "application/vnd.apple.mpegurl" },
+        }),
+  );
+
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.deepEqual(
+    payload.sources.map((source) => source.id),
+    ["hls", "hls-proxy"],
+  );
 });
 
 test("memo sources endpoint can omit the optional proxy fallback", async () => {
