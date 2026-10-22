@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-22-memo-parallel-variants-106";
+const SERVER_BUILD_ID = "2026-10-23-memo-only-fallback-107";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -14765,6 +14765,13 @@ function selectedPlaybackVideo(video, itemId, requestUrl) {
 // 刷新）就能拿到完整线路。旧值 2500ms 会把 PlaybackInfo 推过客户端 10 秒超时。
 const MEMOJAV_EMBY_RESOLVE_BUDGET_MS = 200;
 const MEMOJAV_EMBY_BACKGROUND_GRACE_MS = 4000;
+// 公共解析器这一轮一条线路都没有时的 MemoJav 兜底预算。
+// 实测新片/冷门片经常只有 MemoJav 有源（例如 MIDA-797、SONE-638：
+// 上游解析器返回空，/memo/<番号> 却能给出真实 HLS）。旧逻辑在这种情况下
+// 直接返回“自动线路”占位源，客户端详情页就只剩一个播放源（用户反馈
+// “客户端只显示一个播放源 / MemoJav 只有一个源”）。冷缓存解析约 1~2 秒，
+// 这里给一份独立预算；超时就仍旧退回占位线路，不影响首屏速度。
+const MEMOJAV_ONLY_FALLBACK_BUDGET_MS = 2500;
 
 function memoLookupCode(movie) {
   const code = movieResolveCode(movie);
@@ -15477,6 +15484,39 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     // 再转发；PlayAccess 保持 Full；ETag 带 20 秒时间桶（pendingSources），
     // 客户端最迟 20 秒后重进详情页就会重新拉取，上游恢复或新片源上线时能自动
     // 变成真实线路，也不会再清空本地播放记录。
+    // 但公共解析器整轮为空、而 MemoJav 已经解析出真实线路时（新片很常见），
+    // 直接用这些真实线路，不再返回占位源——否则客户端只剩一个播放源。
+    const memoFallbackInfo = await resolveMemoSourcesForMovie(
+      movie,
+      env,
+      fetchImpl,
+      Math.min(
+        MEMOJAV_ONLY_FALLBACK_BUDGET_MS,
+        remainingRequestMs(requestDeadline, MEMOJAV_ONLY_FALLBACK_BUDGET_MS),
+      ),
+      ctx,
+      memoResolution,
+    );
+    const memoFallbackSources = memoJavMediaSources(
+      item,
+      request.url,
+      playbackToken,
+      null,
+      subtitles,
+      movie,
+      memoFallbackInfo,
+    );
+    if (memoFallbackSources.length) {
+      const memoSource = memoFallbackSources[0];
+      item.MediaSources = memoFallbackSources;
+      item.MediaStreams = memoSource.MediaStreams;
+      item.MediaSourceCount = memoFallbackSources.length;
+      item.Container = memoSource.Container;
+      item.Path = memoSource.Path;
+      item.HasSubtitles = subtitles.length > 0;
+      refreshDetailBackdropTags(item, movie);
+      return itemJsonResponse(item, request, { refreshSources: true });
+    }
     const sources = pendingMediaSources(
       item,
       request.url,
@@ -18864,6 +18904,41 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
         // 弹 “Connection timeout, try again later”，并把本地播放记录/进度条
         // 一起清掉。占位线路的 Path 不带 source 参数，播放时由 /Videos/{id}/stream
         // 现场解析真实地址并转发，所以生成播放会话是安全的。
+        // 与详情页一致：公共解析器为空但 MemoJav 有真实线路时优先给真实线路。
+        const memoFallbackInfo = await resolveMemoSourcesForMovie(
+          movie,
+          env,
+          fetchImpl,
+          Math.min(
+            MEMOJAV_ONLY_FALLBACK_BUDGET_MS,
+            remainingRequestMs(requestDeadline, MEMOJAV_ONLY_FALLBACK_BUDGET_MS),
+          ),
+          ctx,
+          memoResolution,
+        );
+        const memoFallbackSources = memoJavMediaSources(
+          item,
+          request.url,
+          playbackToken,
+          null,
+          subtitles,
+          movie,
+          memoFallbackInfo,
+        );
+        if (memoFallbackSources.length) {
+          const playSessionId = crypto.randomUUID();
+          rememberPlaySession(
+            await playbackStateKey(env, playbackToken),
+            item.Id,
+            playSessionId,
+          );
+          return jsonResponse({
+            PlaySessionId: playSessionId,
+            ItemId: item.Id,
+            MediaSources: memoFallbackSources,
+            MediaSourceCount: memoFallbackSources.length,
+          });
+        }
         const sources = pendingMediaSources(
           item,
           request.url,
