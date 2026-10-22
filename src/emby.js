@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-21-getav-quality-dedupe-99";
+const SERVER_BUILD_ID = "2026-10-21-expired-source-drop-103";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -340,7 +340,7 @@ const REMOTE_MEDIA_VERDICT_PLAYABLE = "playable";
 const REMOTE_MEDIA_VERDICT_DEAD = "definitely-dead";
 const REMOTE_MEDIA_VERDICT_UNKNOWN = "unknown";
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v58";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v61";
 // 播放源缓存除了“解析已收尾”还必须记录生成它的解析能力。否则旧版本把
 // GetAV 的 720P/480P 漏掉后，只要结果带 resolveComplete 就会被新版本继续
 // 当成可信快照，部署新代码也无法自动恢复缺失线路。
@@ -848,14 +848,58 @@ function hlsPlaylistLooksDefinitelyFake(playlist) {
   return segments > 0;
 }
 
+// 首屏快照没有时间做分片探测，但“签名已经过期”是纯字符串可判定的确定性
+// 死源证据（分片必然 403/410）。上游解析器偶尔会在清单里塞进早就过期的
+// 签名线路（例如 fcjav 去码版的 kx=…），这类线路如果先进首屏、再被收尾
+// 校验剔除，用户就会看到“第一次 8 条、之后 7 条”的源数倒退。这里在发布
+// 中途快照前同步剔除，让首屏和缓存后的线路数一致。
+// 判定保持 fail-open：扫描窗口内只要出现一条“没有过期参数”或“签名仍然
+// 有效”的分片就不判死。
+const INLINE_HLS_EXPIRY_SCAN_MAX_LINES = 8;
+
+function hlsPlaylistLooksExpired(playlist, nowMs = Date.now()) {
+  const text = String(playlist || "");
+  if (!text) return false;
+  let scanned = 0;
+  let expired = 0;
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    let lineEnd = text.indexOf("\n", lineStart);
+    if (lineEnd === -1) lineEnd = text.length;
+    let end = lineEnd;
+    if (end > lineStart && text.charCodeAt(end - 1) === 13) end -= 1;
+    const value = text.slice(lineStart, end).trim();
+    lineStart = lineEnd + 1;
+    if (!value || value.startsWith("#")) continue;
+    scanned += 1;
+    // 必须先检查签名，再判断资源类型。fcjav 的过期分片伪装成 .woff2；
+    // 若先走“非视频资源”分支，会把确定过期的线路当成普通伪 HLS 放过去。
+    const expiresMs = hlsUrlSignedExpiryMs(value);
+    if (expiresMs !== null) {
+      if (expiresMs >= nowMs) return false;
+      expired += 1;
+    } else if (!hlsUriLooksLikeNonVideo(value, "https://inline.invalid/")) {
+      // 没有可识别的签名参数，无法确定性判死，fail-open 保留整条线路。
+      return false;
+    }
+    if (scanned >= INLINE_HLS_EXPIRY_SCAN_MAX_LINES) break;
+    if (lineEnd >= text.length) break;
+  }
+  return expired > 0;
+}
+
 function resolverVariantLooksDefinitelyFake(variant) {
   if (!variant || typeof variant !== "object") return false;
   if (variant.inlinePlaylist) {
-    return hlsPlaylistLooksDefinitelyFake(variant.inlinePlaylist);
+    return hlsPlaylistLooksDefinitelyFake(variant.inlinePlaylist) ||
+      hlsPlaylistLooksExpired(variant.inlinePlaylist);
   }
   const sourceUrl = String(variant.sourceUrl || "").trim();
   return Boolean(sourceUrl) &&
-    hlsUriLooksLikeNonVideo(sourceUrl, "https://inline.invalid/");
+    (
+      hlsUriLooksLikeNonVideo(sourceUrl, "https://inline.invalid/") ||
+      hlsSignedUrlExpired(sourceUrl)
+    );
 }
 
 function withoutDefinitelyFakeVariants(video) {
@@ -1039,14 +1083,16 @@ const HLS_EXPIRY_QUERY_NAMES = [
   "kx",
 ];
 
-function hlsSignedUrlExpired(value, nowMs = Date.now()) {
+// 取出 URL 上的签名过期时间（毫秒）；没有可识别的过期参数时返回 null。
+// hlsSignedUrlExpired 与首屏“同步过期判定”共用这一份解析，保证两处判断一致。
+function hlsUrlSignedExpiryMs(value) {
   const uri = String(value || "");
-  if (!uri) return false;
+  if (!uri) return null;
   let url;
   try {
     url = new URL(uri);
   } catch {
-    return false;
+    return null;
   }
   for (const name of HLS_EXPIRY_QUERY_NAMES) {
     const raw = url.searchParams.get(name);
@@ -1054,10 +1100,14 @@ function hlsSignedUrlExpired(value, nowMs = Date.now()) {
     const numeric = Number(raw);
     if (!Number.isFinite(numeric)) continue;
     // 13 位按毫秒、其余按秒；任何“过去时间”都算过期。
-    const expiresMs = numeric > 1e12 ? numeric : numeric * 1000;
-    if (expiresMs < nowMs) return true;
+    return numeric > 1e12 ? numeric : numeric * 1000;
   }
-  return false;
+  return null;
+}
+
+function hlsSignedUrlExpired(value, nowMs = Date.now()) {
+  const expiresMs = hlsUrlSignedExpiryMs(value);
+  return expiresMs !== null && expiresMs < nowMs;
 }
 
 function bytesLookLikeFont(bytes) {
@@ -8257,6 +8307,73 @@ const GETAV_ORIGIN = GETAV_MEDIA_ORIGIN;
 const JINA_READER_ORIGIN = "https://r.jina.ai";
 const SELF_HOSTED_VARIANT_LIMIT = 8;
 
+// Jina Reader 是 Worker 侧唯一能抓到 getav.net 的通道（getav 对机房 IP 直接
+// 返回 403 质询页，第三方 CORS 代理同样被挡）。但匿名调用是"按来源 IP 限流"
+// 的：Cloudflare 出口 IP 被大量租户共享，线上实测连续 4 次重试全部 429，
+// 结果是 GetAV 的 720P/480P 永远抓不到，而且每点一次详情页就把额度再烧一遍。
+// 这里做两件事：
+//   1) 支持 JINA_API_KEY（配置后额度从 ~20 RPM 提到 200 RPM，基本不再 429）；
+//   2) 429 后进入冷却期，冷却期内直接跳过 Jina，不再重试放大限流。
+const JINA_RATE_LIMIT_COOLDOWN_MS = 45 * 1000;
+let jinaCooldownUntil = 0;
+
+// 备用渲染通道：Jina 的匿名额度按来源 IP 计，Cloudflare 出口 IP 被大量租户
+// 共享，线上经常整分钟 429。Microlink 用另一套机房渲染同一个页面，返回的是
+// 执行过 JS 的 HTML（含 videoSources 的全部清晰度），作为 Jina 之后的第二
+// 次机会；只在 Jina 拿不全时才启动，避免白烧额度。
+const MICROLINK_READER_ORIGIN = "https://api.microlink.io";
+const MICROLINK_READER_TIMEOUT_MS = 12 * 1000;
+// 备用渲染启动得越早越好：Jina 匿名额度经常整分钟 429，等它返回再启动
+// 备用通道，整条解析会多等 4~5 秒，直接错过详情页/自建补源的合并窗口。
+const MICROLINK_FALLBACK_DELAY_MS = 300;
+// 等备用通道的时间必须落在自建补源合并预算（3.5 秒）之内，否则收尾快照
+// 只能拿到 4K/1080P，补出来的 720P/480P 赶不上本次返回。
+const MICROLINK_WAIT_MS = 3000;
+
+function microlinkReaderUrl(pageUrl, env) {
+  const params = new URLSearchParams({
+    url: String(pageUrl),
+    meta: "false",
+    "data.html.selector": "html",
+    "data.html.type": "html",
+    timeout: "20s",
+  });
+  const key = String(env?.MICROLINK_API_KEY ?? "").trim();
+  if (key) params.set("apiKey", key);
+  return `${MICROLINK_READER_ORIGIN}/?${params.toString()}`;
+}
+
+function microlinkRenderedHtml(body) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(String(body || ""));
+  } catch {
+    return "";
+  }
+  const html = parsed?.data?.html;
+  return typeof html === "string" ? html : "";
+}
+
+function jinaReaderHeaders(env, extra = {}) {
+  const headers = { "x-respond-with": "html", ...extra };
+  const key = String(env?.JINA_API_KEY ?? "").trim();
+  if (key) headers.authorization = `Bearer ${key}`;
+  return headers;
+}
+
+function jinaRateLimited() {
+  return Date.now() < jinaCooldownUntil;
+}
+
+function noteJinaRateLimit(retryAfterSeconds) {
+  const seconds = Number(retryAfterSeconds);
+  const cooldown = Number.isFinite(seconds) && seconds > 0
+    ? Math.max(JINA_RATE_LIMIT_COOLDOWN_MS, Math.min(300, seconds) * 1000)
+    : JINA_RATE_LIMIT_COOLDOWN_MS;
+  const until = Date.now() + cooldown;
+  if (until > jinaCooldownUntil) jinaCooldownUntil = until;
+}
+
 function resolverMergeBudget(env, baseMs) {
   const override = Number(env?.RESOLVER_MERGE_BUDGET_MS);
   if (Number.isFinite(override) && override > 0) {
@@ -11018,8 +11135,11 @@ async function fetchSelfHostedPageText(
   url,
   headers = {},
   timeoutMs = SELF_HOSTED_PAGE_TIMEOUT_MS,
+  options = {},
 ) {
-  const maxAttempts = 4;
+  // 限流型通道（Jina）最多只打一次：429 是"每来源 IP"的额度，重试只会把
+  // 额度烧得更快，还会拖满详情页预算。普通通道保持原来的 4 次重试。
+  const maxAttempts = Math.max(1, Number(options.maxAttempts) || 4);
   const host = (() => {
     try {
       return new URL(String(url)).host;
@@ -11068,6 +11188,13 @@ async function fetchSelfHostedPageText(
       bytes: text.length,
       body: text.slice(0, 240),
     });
+    if (response.status === 429 && typeof options.onRateLimit === "function") {
+      try {
+        options.onRateLimit(retryAfter);
+      } catch {
+        // 回调异常不影响重试逻辑。
+      }
+    }
     const retryable =
       response.status === 429 ||
       response.status === 502 ||
@@ -11381,7 +11508,92 @@ function mergeGetavVariantGroups(...groups) {
     .slice(0, SELF_HOSTED_VARIANT_LIMIT);
 }
 
+// GetAV 页面抓取结果按番号落到 D1：Jina 是 Worker 侧唯一能拿到 getav.net 的
+// 通道，但它按来源 IP 限流（Cloudflare 出口 IP 共享，线上频繁 429）。一份
+// 成功抓到的页面（4K/1080P/720P/480P 四条带签名的 index.txt）在 7 天内都是
+// 有效的，所以抓一次就复用到所有 isolate / 所有用户，后续点击不再依赖 Jina。
+const GETAV_VARIANT_CACHE_NAMESPACE = "getav-variants-v1";
+const GETAV_VARIANT_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function getavVariantSignatureValid(variant) {
+  const raw = String(variant?.sourceUrl || "");
+  const match = raw.match(/[?&]e=(\d{9,13})/);
+  if (!match) return true;
+  const value = Number(match[1]);
+  const expiresAt = value > 1e12 ? value : value * 1000;
+  // 留 6 小时余量：签名快过期时宁可直接重抓，也不要把"马上就不能用"的
+  // 线路写进缓存。
+  return expiresAt > Date.now() + 6 * 60 * 60 * 1000;
+}
+
+async function readCachedGetavVariants(env, code) {
+  const db = playbackDb(env);
+  const key = String(code || "").trim().toLowerCase();
+  if (!db || !key) return null;
+  try {
+    const row = await durableDbRead(db, GETAV_VARIANT_CACHE_NAMESPACE, key);
+    if (!row || !Array.isArray(row.variants) || !row.variants.length) return null;
+    const savedAt = Number(row.savedAt) || 0;
+    if (Date.now() - savedAt > GETAV_VARIANT_CACHE_TTL_MS) return null;
+    if (!getavVariantSignatureValid(row.variants[0])) return null;
+    return row.variants;
+  } catch {
+    return null;
+  }
+}
+
+async function writeCachedGetavVariants(env, code, variants) {
+  const db = playbackDb(env);
+  const key = String(code || "").trim().toLowerCase();
+  if (!db || !key || !Array.isArray(variants) || !variants.length) return;
+  try {
+    // 后抓到的页面签名更新；与已有行合并，避免一次只拿到 4K/1080P 的重抓
+    // 把之前存下的 720P/480P 覆盖掉。
+    const existing = await readCachedGetavVariants(env, key);
+    const merged = existing && existing.length
+      ? mergeGetavVariantGroups(existing, variants)
+      : variants;
+    await durableDbWrite(db, GETAV_VARIANT_CACHE_NAMESPACE, key, {
+      variants: merged,
+      savedAt: Date.now(),
+    });
+  } catch {
+    // 缓存写失败不影响本次解析结果。
+  }
+}
+
 async function loadGetavVariants(code, fetchImpl, options = {}) {
+  const env = options.env || null;
+  const noteStatus = (status) => {
+    if (typeof options.onStatus !== "function") return;
+    try {
+      options.onStatus(status);
+    } catch {
+      // 状态回调异常不影响解析。
+    }
+  };
+  const complete = (value) =>
+    getavRawQualityCount(value) >= GETAV_REQUIRED_RAW_QUALITIES.length;
+  const cached = await readCachedGetavVariants(env, code);
+  if (cached && cached.length) {
+    dbgResolve("selfhosted-getav-cached", code, {
+      n: cached.length,
+      rawQualities: getavRawQualityCount(cached),
+      complete: complete(cached),
+    });
+    if (typeof options.onFirstBatch === "function") {
+      try {
+        options.onFirstBatch(cached);
+      } catch {
+        // 提前发布失败不影响返回值。
+      }
+    }
+    // 只有四档齐全的缓存可以直接复用。缺档缓存（Jina 被限流那次只存了
+    // 4K/1080P）继续往下去补抓，否则 720P/480P 会被这份不完整的缓存挡住
+    // 整整 7 天。
+    if (complete(cached)) return cached;
+  }
+  const cachedPartial = cached && cached.length ? cached : [];
   const slug = String(code || "").trim().toLowerCase();
   const pageUrl = new URL(`/zh/videos/${encodeURIComponent(slug)}`, GETAV_ORIGIN);
   const readerUrl = `${JINA_READER_ORIGIN}/${pageUrl.toString()}`;
@@ -11397,11 +11609,52 @@ async function loadGetavVariants(code, fetchImpl, options = {}) {
     });
     return variants;
   };
-  const loadJinaVariants = (via = "jina") =>
-    fetchSelfHostedPageText(fetchImpl, readerUrl, {
-      "x-respond-with": "html",
-    })
+  // 冷却期内不再请求 Jina：429 是按来源 IP 计额的，重试只会把额度烧光，
+  // 还会把详情页预算拖满（用户看到的就是"一直在转圈"）。
+  const loadJinaVariants = (via = "jina") => {
+    if (jinaRateLimited()) {
+      dbgResolve("selfhosted-getav-skip", code, { via, reason: "rate-limit-cooldown" });
+      noteStatus({ pageBlocked: true });
+      return Promise.resolve([]);
+    }
+    return fetchSelfHostedPageText(
+      fetchImpl,
+      readerUrl,
+      jinaReaderHeaders(env),
+      SELF_HOSTED_PAGE_TIMEOUT_MS,
+      {
+        // 只多给一次机会：Jina 的 429 是按来源 IP 计额的，4 次重试（旧实现）
+        // 会把额度彻底烧光，后面所有请求都拿不到页面。一次快速重试既能在
+        // 瞬时抖动时恢复，也不会把整分钟额度打空。
+        maxAttempts: 2,
+      },
+    )
       .then((html) => parsePage(html, via))
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/\b429\b/.test(message)) noteJinaRateLimit(0);
+        dbgResolve("selfhosted-getav-error", code, { via, error: message });
+        noteStatus({ pageBlocked: true });
+        return [];
+      });
+  };
+  const loadMicrolinkVariants = (via = "microlink") =>
+    fetchSelfHostedPageText(
+      fetchImpl,
+      microlinkReaderUrl(pageUrl, env),
+      {},
+      MICROLINK_READER_TIMEOUT_MS,
+      // 匿名额度有限，失败就交给别的通道，不在同一家连续重试。
+      { maxAttempts: 1 },
+    )
+      .then((body) => {
+        const html = microlinkRenderedHtml(body);
+        if (!html) {
+          dbgResolve("selfhosted-getav-error", code, { via, error: "empty-render" });
+          return [];
+        }
+        return parsePage(html, via);
+      })
       .catch((error) => {
         dbgResolve("selfhosted-getav-error", code, {
           via,
@@ -11409,13 +11662,32 @@ async function loadGetavVariants(code, fetchImpl, options = {}) {
         });
         return [];
       });
+  let jinaResult = [];
+  const jinaTask = loadJinaVariants().then((value) => {
+    jinaResult = Array.isArray(value) ? value : [];
+    return jinaResult;
+  });
+  // 备用渲染延迟启动：Jina 正常拿到四档时不必白烧额度；Jina 被限流、直连
+  // 又被 403 时它就是唯一能补出 720P/480P 的通道，所以从解析一开始就在
+  // 后台排队，不占首屏发布的等待窗口。
+  const microlinkPromise = (async () => {
+    await new Promise((resolve) => setTimeout(resolve, MICROLINK_FALLBACK_DELAY_MS));
+    if (complete(jinaResult)) return [];
+    const rendered = await loadMicrolinkVariants();
+    if (Array.isArray(rendered) && rendered.length) {
+      // 即使本轮已经过了等待窗口，也把补出来的清晰度写进 D1：下一次解析
+      // 直接命中四档缓存，不必再求人。
+      await writeCachedGetavVariants(env, code, rendered);
+    }
+    return rendered;
+  })();
   // Jina 偶尔会排队，直连也可能被上游拦截；两条链路同时启动。先到的页面
   // 只能作为第一批候选，不能因为它只有 4K/1080P 就提前结束：另一条链路
   // 或 Jina 的下一次响应经常补出 720P/480P。
   const tasks = [
     {
       name: "jina",
-      promise: loadJinaVariants(),
+      promise: jinaTask,
     },
     {
       name: "direct",
@@ -11432,10 +11704,7 @@ async function loadGetavVariants(code, fetchImpl, options = {}) {
   ];
   const first = await firstNonEmptyVariantTask(tasks);
   const groups = first?.value ? [first.value] : [];
-  if (
-    first &&
-    getavRawQualityCount(first.value) < GETAV_REQUIRED_RAW_QUALITIES.length
-  ) {
+  if (first && !complete(first.value)) {
     for (const task of tasks) {
       if (task === first.task) continue;
       const value = await settledWithin(task.promise, GETAV_INITIAL_MERGE_TIMEOUT_MS);
@@ -11443,7 +11712,10 @@ async function loadGetavVariants(code, fetchImpl, options = {}) {
     }
   }
 
-  let merged = mergeGetavVariantGroups(...groups);
+  let merged = mergeGetavVariantGroups(cachedPartial, ...groups);
+  let sawGetavPage = groups.some(
+    (group) => Array.isArray(group) && group.length > 0,
+  );
   const publishBatch = () => {
     if (!merged.length || typeof options.onFirstBatch !== "function") return;
     try {
@@ -11452,30 +11724,51 @@ async function loadGetavVariants(code, fetchImpl, options = {}) {
       // 提前发布失败不能影响后续补抓。
     }
   };
+  // 先把已经拿到的线路发出去（首屏要的是真线路，不能因为备用渲染慢而拖住）。
   publishBatch();
-  const sawGetavPage = groups.some(
-    (group) => Array.isArray(group) && group.length > 0,
-  );
-  if (
-    sawGetavPage &&
-    getavRawQualityCount(merged) < GETAV_REQUIRED_RAW_QUALITIES.length
-  ) {
+  if (!complete(merged)) {
+    const rendered = await settledWithin(
+      microlinkPromise,
+      MICROLINK_WAIT_MS,
+    );
+    if (Array.isArray(rendered) && rendered.length) {
+      merged = mergeGetavVariantGroups(merged, rendered);
+      sawGetavPage = true;
+      dbgResolve("selfhosted-getav-microlink", code, {
+        n: rendered.length,
+        rawQualities: getavRawQualityCount(rendered),
+      });
+      publishBatch();
+    }
+  }
+  if (sawGetavPage && !complete(merged)) {
     // Jina 的缓存/队列偶尔返回一页缺少 720P/480P 的旧 HTML。首次页面即使
     // HTTP 200 也不能当成完整结果，再给它一次重新抓取的机会。
     const retry = await settledWithin(
       loadJinaVariants("jina-retry"),
       GETAV_RETRY_TIMEOUT_MS,
     );
-    if (Array.isArray(retry)) merged = mergeGetavVariantGroups(merged, retry);
-    // 重试页常常补齐 720P/480P。这里必须再发布一次线路更多的快照，
-    // 否则详情页首屏已经拿到公共批次后，就再也看不到这次补抓的结果。
-    publishBatch();
+    if (Array.isArray(retry) && retry.length) {
+      merged = mergeGetavVariantGroups(merged, retry);
+      publishBatch();
+    }
+    // 重试页常常补齐 720P/480P。上面已经再发布一次线路更多的快照，
+    // 否则详情页首屏拿到公共批次后，就再也看不到这次补抓的结果。
   }
 
   dbgResolve("selfhosted-getav-merged", code, {
     n: merged.length,
     rawQualities: getavRawQualityCount(merged),
   });
+  if (!sawGetavPage) noteStatus({ pageBlocked: true });
+  if (
+    merged.length &&
+    (!cachedPartial.length || complete(merged) || merged.length > cachedPartial.length)
+  ) {
+    // 抓到的线路（哪怕只有 4K/1080P）也落库：720P/480P 常常是下一次
+    // 抓取才补齐的，先存住已有的既有清晰度，后面的重抓会覆盖成更全的版本。
+    await writeCachedGetavVariants(env, code, merged);
+  }
   return merged;
 }
 
@@ -11598,8 +11891,22 @@ async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl, options 
     {
       name: "getav",
       promise: loadGetavVariants(code, fetchImpl, {
+        env,
         onFirstBatch: (variants) => {
           publishValidatedFirstBatch(variants);
+        },
+        // GetAV 页面被 403/429 挡住时（机房 IP + Jina 按 IP 限流），
+        // 上游公共解析器最多只给 4K/1080P。这不是"我们解析没跑完"，而是
+        // "上游这一路暂时拿不到"，不能因此把整份结果判成残次品永远不缓存，
+        // 否则每点一次详情页都要重新解析（线上 503/1102 的主要来源）。
+        onStatus: (status) => {
+          if (status?.pageBlocked && typeof options.onGetavStatus === "function") {
+            try {
+              options.onGetavStatus(status);
+            } catch {
+              // 状态透传失败不影响解析。
+            }
+          }
         },
       }).catch((error) => {
         dbgResolve("selfhosted-error", code, {
@@ -11723,6 +12030,10 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   let selfHostedVideoTask = null;
   let selfHostedResolutionFinished = true;
   let selfHostedQualityComplete = false;
+  // GetAV 页面本身拿不到（getav.net 对机房 IP 返回 403；Jina 按来源 IP
+  // 限流返回 429）时为 true。此时上游公共解析器只带 4K/1080P，缺的
+  // 720P/480P 不是"解析没跑完"，不能据此把结果判成不完整。
+  let getavPageBlocked = false;
   // 自建补源这一批的“收尾”只通知一次：真正收尾（拿到它全部能拿的线路，或失败）
   // 时立刻通知详情页首屏，不必再等公共解析器那条慢链路的合并窗口。
   let selfHostedPhaseNotified = false;
@@ -11752,6 +12063,9 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
           // 自建链路里第一条线路一到就对外发布，不再等另一条链路合并完
           // （Jina 代理取 GetAV 要 4~5 秒，解析预算常常等不到）。
           onFirstBatch: (video) => publishPartial(video),
+          onGetavStatus: (status) => {
+            if (status?.pageBlocked) getavPageBlocked = true;
+          },
           validationCache: resolveValidationCache,
         },
       ).then(
@@ -11954,6 +12268,19 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   ) || publishedVideo;
   const validated = await finalizeVideo(merged);
   if (validated) {
+    // GetAV 页面整条抓取链路被挡（403/429）时，上游只带 4K/1080P 两档；
+    // 缺 720P/480P 属于"上游这一路暂时拿不到"，不是本轮解析没跑完。
+    // 打上标记后允许进 30 分钟边缘缓存（不写长期 D1），既不让客户端每次
+    // 点开都重新解析，也给冷却期过后重新补齐留出机会。
+    const getavLimited = getavPageBlocked &&
+      !getavRawQualitiesComplete(validated);
+    if (getavLimited) {
+      try {
+        validated[RESOLVED_VIDEO_GETAV_LIMITED_FLAG] = true;
+      } catch {
+        // 冻结对象等异常场景退化为只按 incomplete 处理。
+      }
+    }
     // “本次解析已经收尾”才算完成：
     // - 没启动自建补源（公共线路本来就够了），或
     // - 自建补源任务真的跑完了（拿到了它全部能拿到的东西）
@@ -11964,7 +12291,8 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
     markResolvedVideoResolutionComplete(
       validated,
       !selfHostedVideoTask ||
-        (selfHostedResolutionFinished && selfHostedQualityComplete),
+        (selfHostedResolutionFinished && selfHostedQualityComplete) ||
+        getavLimited,
     );
     return validated;
   }
@@ -12410,9 +12738,14 @@ function resolvedVideoSourceCount(video) {
 // 要经过边缘缓存 / D1 的 JSON 序列化后跨实例复用。
 const RESOLVED_VIDEO_COMPLETE_FLAG = "resolveComplete";
 const RESOLVED_VIDEO_CACHE_CAPABILITY_FLAG = "resolveCapability";
+// GetAV 抓取链路被上游挡住（403/429）时打的标记：这类结果的上游只有
+// 4K/1080P，可以进 30 分钟边缘缓存，但不能写长期 D1（等抓取恢复后要能
+// 立刻换成含 720P/480P 的完整版本）。
+const RESOLVED_VIDEO_GETAV_LIMITED_FLAG = "resolveGetavLimited";
 
 function markResolvedVideoCacheComplete(video) {
-  if (!getavRawQualitiesComplete(video)) {
+  const getavLimited = Boolean(video?.[RESOLVED_VIDEO_GETAV_LIMITED_FLAG]);
+  if (!getavLimited && !getavRawQualitiesComplete(video)) {
     markResolvedVideoResolutionComplete(video, false);
     return false;
   }
@@ -12421,6 +12754,7 @@ function markResolvedVideoCacheComplete(video) {
       video[RESOLVED_VIDEO_COMPLETE_FLAG] = true;
       video[RESOLVED_VIDEO_CACHE_CAPABILITY_FLAG] =
         RESOLVED_VIDEO_CACHE_CAPABILITY;
+      if (getavLimited) video[RESOLVED_VIDEO_GETAV_LIMITED_FLAG] = true;
     } catch {
       // 冻结对象等异常场景退化为仅 WeakMap 标记。
     }
@@ -12441,7 +12775,12 @@ function resolvedVideoCacheIsTrustworthy(video) {
   ) {
     return false;
   }
-  if (!getavRawQualitiesComplete(video)) return false;
+  if (
+    !getavRawQualitiesComplete(video) &&
+    video[RESOLVED_VIDEO_GETAV_LIMITED_FLAG] !== true
+  ) {
+    return false;
+  }
   return video[RESOLVED_VIDEO_COMPLETE_FLAG] === true ||
     RESOLVED_VIDEO_COMPLETENESS.get(video) === true;
 }
@@ -13185,8 +13524,11 @@ async function resolveVideoCached(movie, env, fetchImpl, ctx = null, options = {
           // 只有凑齐目标线路数的结果才写长期 D1（30 天）；线路偏少的“已收尾”
           // 结果仍然进内存 + 边缘缓存（30 分钟），避免上游本来就只有两条时
           // 每次点开都重新现场解析。
-          const durable = resolvedVideoSourceCount(video) >=
-            RESOLVER_SOURCE_TARGET_COUNT;
+          // GetAV 被限流时上游只有 4K/1080P，这类结果不进长期层：抓取恢复后
+          // 必须能立刻换成含 720P/480P 的完整版本。
+          const durable =
+            video[RESOLVED_VIDEO_GETAV_LIMITED_FLAG] !== true &&
+            resolvedVideoSourceCount(video) >= RESOLVER_SOURCE_TARGET_COUNT;
           await settleCacheWrite(
             Promise.all([
               edgeCacheWrite(
@@ -18681,6 +19023,15 @@ export function validatedVideoVariantsForTests(video, fetchImpl, budgetMs) {
   return validatedVideoVariants(video, fetchImpl, budgetMs);
 }
 
+export function resolverVariantDroppedSyncForTests(variant, nowMs = Date.now()) {
+  if (!variant || typeof variant !== "object") return false;
+  if (variant.inlinePlaylist) {
+    return hlsPlaylistLooksDefinitelyFake(variant.inlinePlaylist) ||
+      hlsPlaylistLooksExpired(variant.inlinePlaylist, nowMs);
+  }
+  return resolverVariantLooksDefinitelyFake(variant);
+}
+
 export function mediaSourceIdForIndexForTests(itemId, index) {
   return mediaSourceIdForIndex(itemId, index);
 }
@@ -18698,6 +19049,9 @@ export function resetEmbyCachesForTests() {
   RESOLVE_VIDEO_CACHE.clear();
   RESOLVE_VIDEO_SESSIONS.clear();
   RESOLVE_VIDEO_GATE.reset();
+  // Jina 的限流冷却期是模块级状态，测试之间必须清掉，否则前一个用例的
+  // 429 会让后面的用例静默跳过 GetAV 页面抓取。
+  jinaCooldownUntil = 0;
   clearResolverJsonMemory();
   RESOLVER_JSON_INFLIGHT.clear();
   PARTIAL_RESOLVE_CACHE.clear();

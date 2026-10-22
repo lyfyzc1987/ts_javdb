@@ -27,6 +27,7 @@ import {
   rewrittenHlsEntryBytesForTests,
   rewrittenHlsCacheStatsForTests,
   resetEmbyCachesForTests,
+  resolverVariantDroppedSyncForTests,
   selectedPlaybackVideoForTests,
   validatedVideoVariantsForTests,
 } from "../src/emby.js";
@@ -152,8 +153,8 @@ test("scopes resolved-video caches to the Worker or Pages deployment", () => {
     PLAYBACK_DEPLOY_TAG: "pages",
   });
 
-  assert.match(workerKey, /sources-v58\|worker\|TEST-001$/);
-  assert.match(pagesKey, /sources-v58\|pages\|TEST-001$/);
+  assert.match(workerKey, /sources-v61\|worker\|TEST-001$/);
+  assert.match(pagesKey, /sources-v61\|pages\|TEST-001$/);
   assert.notEqual(workerKey, pagesKey);
 });
 
@@ -301,6 +302,70 @@ test("removes only sources with definitive dead-media evidence", async () => {
   );
 
   assert.deepEqual(result, []);
+});
+
+test("drops expired-signature sources from the first-screen snapshot", () => {
+  const nowMs = Date.UTC(2026, 9, 21);
+  const inline = (...segmentUrls) => ({
+    variant: "probe",
+    sourceType: "application/vnd.apple.mpegurl",
+    inlinePlaylist: [
+      "#EXTM3U",
+      ...segmentUrls.flatMap((url) => ["#EXTINF:6,", url]),
+      "#EXT-X-ENDLIST",
+    ].join("\n"),
+  });
+
+  // fcjav 去码版线上就是这样：kx 已过期（分片必然 403/410）。首屏必须先剔除，
+  // 否则客户端会看到“第一次 8 条、缓存后 7 条”的源数倒退。
+  assert.equal(
+    resolverVariantDroppedSyncForTests(
+      inline(
+        "https://sn3k.summitdigitalhub.space/v4/cvo/x/seg-1-f2-v1-a1.woff2?k=abc&kx=1791245139",
+        "https://sn3k.summitdigitalhub.space/v4/cvo/x/seg-2-f2-v1-a1.woff2?k=abc&kx=1791245139",
+      ),
+      nowMs,
+    ),
+    true,
+  );
+  // 签名仍然有效：必须保留。
+  assert.equal(
+    resolverVariantDroppedSyncForTests(
+      inline(
+        "https://p16-ad-site-sign-sg.tiktokcdn.com/a/seg-1.ts?x-expires=1814258524",
+      ),
+      nowMs,
+    ),
+    false,
+  );
+  // GetAV 的 AES 分片同样使用 .woff2 伪装，但 expires=1999999999 有效；
+  // 不能把扩展名当成过期证据，也不能误删这类真实线路。
+  assert.equal(
+    resolverVariantDroppedSyncForTests(
+      inline(
+        "https://static.worldstatic.com/rctd-740/2160/seg-0.woff2?expires=1999999999",
+      ),
+      nowMs,
+    ),
+    false,
+  );
+  // 没有过期参数：无法判定，fail-open 保留。
+  assert.equal(
+    resolverVariantDroppedSyncForTests(
+      inline("https://p19-ad-site-sign-sg.tiktokcdn.com/a/seg-1.ts?token=abc"),
+      nowMs,
+    ),
+    false,
+  );
+  // 远端清单 URL 自身签名过期：同样直接剔除。
+  assert.equal(
+    resolverVariantDroppedSyncForTests({
+      variant: "remote",
+      sourceType: "application/vnd.apple.mpegurl",
+      sourceUrl: "https://fast-stream.jav.si/x/index.m3u8?expires=1700000000",
+    }, nowMs),
+    true,
+  );
 });
 
 test("keeps four AES GetAV qualities disguised as signed woff2 segments", async () => {
@@ -6100,6 +6165,124 @@ test("waits for a late self-hosted line after the public phase settles", async (
   );
 });
 
+test("returns the full first-screen batch when one real source arrives before four more", async () => {
+  // 用户现场最常见的首次进入时序：自建补源先给出 1 条真实线路，公共解析器
+  // 约 2 秒再补齐 4 条。详情响应必须直接包含合并后的 5 条，不能先把单条
+  // 快照交给客户端，再要求用户退出详情页重进。
+  const code = "RCTD-745";
+  const detailUrl = `https://javtiful.com/zh/video/90008/${code}`;
+  const firstUrl =
+    "https://fast-stream.jav.si/rctd-745/self-first-1080.mp4";
+  const laterUrls = [
+    "https://fast-stream.jav.si/rctd-745/public-original-1080.mp4",
+    "https://fast-stream.jav.si/rctd-745/public-original-720.mp4",
+    "https://fast-stream.jav.si/rctd-745/public-decoded-1080.mp4",
+    "https://fast-stream.jav.si/rctd-745/public-decoded-720.mp4",
+  ];
+  const allUrls = [firstUrl, ...laterUrls];
+  const env = {
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 6500,
+  };
+  const startedAt = Date.now();
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/47"),
+    env,
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v4/movies/47")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movie: {
+                id: 47,
+                number: code,
+                title: `${code} First Screen Batch`,
+              },
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`/api/v/resolve?code=${code}`)) {
+        await new Promise((resolve) => setTimeout(resolve, 1900));
+        return new Response(
+          JSON.stringify({
+            variants: laterUrls.map((sourceUrl, index) => ({
+              variant: index < 2
+                ? `fcjav_original_${index}`
+                : `fcjav_reducing_${index}`,
+              label: index < 2 ? "原版" : "去码版",
+              sourceUrl,
+              sourceType: "video/mp4",
+            })),
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === `https://javtiful.com/zh/search?q=${code}`) {
+        return new Response(`<a href="${detailUrl}">${code}</a>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            videoTitle: code,
+            playerSources: [{
+              src: firstUrl,
+              type: "video/mp4",
+              size: 1080,
+            }],
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (
+        target.includes("getav.net") ||
+        target.includes("r.jina.ai") ||
+        target.includes("api.microlink.io")
+      ) {
+        return new Response("<html><title>Not found</title></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (allUrls.includes(target)) {
+        return new Response(new Uint8Array([0, 0, 0, 32]), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-3/4",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      assert.match(target, new RegExp(`/api/subtitle\\?name=${code}`));
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  const elapsed = Date.now() - startedAt;
+  assert.equal(response.status, 200);
+  assert.equal(payload.PlayAccess, "Full");
+  assert.equal(payload.MediaSourceCount, allUrls.length);
+  assert.deepEqual(
+    payload.MediaSources.map((source) =>
+      new URL(source.Path).searchParams.get("source")
+    ).sort(),
+    [...allUrls].sort(),
+  );
+  assert.ok(
+    elapsed >= 1800,
+    `first screen answered before the remaining sources arrived at ${elapsed}ms`,
+  );
+  assert.ok(elapsed < 4500, `first screen took ${elapsed}ms`);
+});
+
 test("keeps a cold detail request alive for a real source just past the old deadline", async () => {
   // 线上 JUX-844 实测：元数据约 1.2 秒，首条真实源约 8.43 秒才到。
   // 旧总截止 8.4 秒会先返回“自动线路（解析中）”；这里把时间线固定为
@@ -7258,6 +7441,452 @@ test("loads all GetAV qualities through parallel page requests", async () => {
     payload.MediaSources.map((source) =>
       source.MediaStreams.find((stream) => stream.Type === "Video").Height
     ),
+    [2160, 1080, 720, 480],
+  );
+});
+
+test("stops calling the reader while the Jina rate limit is in effect", async () => {
+  const readerCalls = [];
+  const movies = { 42: "RCTD-750", 43: "RCTD-751" };
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    if (/\/v4\/movies\/(42|43)$/.test(target)) {
+      const id = Number(target.split("/").pop());
+      const number = movies[id];
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: { movie: { id, number, title: `${number} Test` } },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("/api/v/resolve?code=")) {
+      const code = new URL(target).searchParams.get("code").toLowerCase();
+      return new Response(
+        JSON.stringify({
+          variants: [
+            {
+              variant: "original",
+              label: "原版",
+              sourceUrl: `https://fast-stream.jav.si/${code}/fcjav-original.mp4`,
+              sourceType: "video/mp4",
+            },
+          ],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("javtiful.com/zh/search")) {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target.startsWith("https://r.jina.ai/")) {
+      readerCalls.push(target);
+      return new Response(
+        JSON.stringify({ code: 429, message: "Per IP rate limit exceeded" }),
+        {
+          status: 429,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": "0",
+          },
+        },
+      );
+    }
+    if (/getav\.net\/zh\/videos\//.test(target)) {
+      return new Response("<html><title>Access denied</title></html>", {
+        status: 403,
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target.includes("fast-stream.jav.si")) {
+      return new Response(new Uint8Array([0, 0, 0, 32]), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp4",
+        },
+      });
+    }
+    return new Response(JSON.stringify({ code: 0, data: [] }), {
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  for (const id of [42, 43]) {
+    const response = await handleProxy(
+      new Request(`https://clone.example/Items/${id}/PlaybackInfo`, {
+        method: "POST",
+      }),
+      {},
+      {},
+      fetchImpl,
+    );
+    assert.equal(response.status, 200);
+  }
+
+  // 第一次解析：Jina 429 后只再给一次机会（2 次请求）。第二次解析落在冷却期，
+  // 一次都不该再打 Jina——否则 Cloudflare 共享出口 IP 的额度会被瞬间打空，
+  // 后面所有用户都拿不到 720P/480P。
+  assert.equal(readerCalls.length, 2);
+});
+
+test("reuses cached GetAV qualities from D1 without another reader request", async () => {
+  const db = createPlaybackD1();
+  const number = "RCTD-752";
+  const slug = number.toLowerCase();
+  const readerUrl = `https://r.jina.ai/https://getav.net/zh/videos/${slug}`;
+  const getavSources = [
+    ["raw_4k", 2160],
+    ["raw_1080p", 1080],
+    ["raw_720p", 720],
+    ["raw_480p", 480],
+  ].map(([type, quality]) => ({
+    movieId: number,
+    type,
+    quality,
+    url: `https://static.worldstatic.com/${slug}/${quality}/index.txt`,
+  }));
+  const getavUrls = getavSources.map((source) => source.url);
+  const page = `<html><title>${number} Test | GetAV</title>` +
+    `${JSON.stringify({ videoSources: getavSources })}</html>`;
+  let readerCalls = 0;
+  let readerAvailable = true;
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    if (target.includes("/v4/movies/48")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: { movie: { id: 48, number, title: `${number} Test` } },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("/api/v/resolve?code=")) {
+      return new Response(
+        JSON.stringify({
+          variants: [
+            {
+              variant: "original",
+              label: "原版",
+              sourceUrl: `https://fast-stream.jav.si/${slug}/fcjav-original.mp4`,
+              sourceType: "video/mp4",
+            },
+          ],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("javtiful.com/zh/search")) {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target === readerUrl) {
+      readerCalls += 1;
+      if (!readerAvailable) {
+        return new Response("{}", {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": "0" },
+        });
+      }
+      return new Response(page, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+    if (/getav\.net\/zh\/videos\//.test(target)) {
+      return new Response("<html><title>Access denied</title></html>", {
+        status: 403,
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target.includes("fast-stream.jav.si")) {
+      return new Response(new Uint8Array([0, 0, 0, 32]), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp4",
+        },
+      });
+    }
+    if (getavUrls.includes(target)) {
+      return new Response([
+        "#EXTM3U",
+        "#EXT-X-TARGETDURATION:6",
+        "#EXTINF:6,",
+        "segment.ts",
+        "#EXT-X-ENDLIST",
+      ].join("\n"), {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    }
+    return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+      status: 206,
+      headers: { "content-type": "video/mp2t" },
+    });
+  };
+  const env = { PLAYBACK_DB: db };
+
+  const first = await handleProxy(
+    new Request("https://clone.example/Items/48/PlaybackInfo", { method: "POST" }),
+    env,
+    {},
+    fetchImpl,
+  );
+  const firstPayload = await first.json();
+  assert.equal(
+    firstPayload.MediaSources.filter((source) =>
+      String(source.Name || "").includes("GetAV")
+    ).length,
+    4,
+  );
+  const readerCallsAfterFirst = readerCalls;
+  assert.equal(readerCallsAfterFirst >= 1, true);
+
+  // 第二次请求：内存缓存清空、Jina 已经不可用；如果 D1 里的 GetAV 线路
+  // 没有复用，720P/480P 会直接消失。
+  resetEmbyCachesForTests();
+  readerAvailable = false;
+  const second = await handleProxy(
+    new Request("https://clone.example/Items/48/PlaybackInfo", { method: "POST" }),
+    env,
+    {},
+    fetchImpl,
+  );
+  const secondPayload = await second.json();
+  assert.deepEqual(
+    secondPayload.MediaSources
+      .filter((source) => String(source.Name || "").includes("GetAV"))
+      .map((source) =>
+        source.MediaStreams.find((stream) => stream.Type === "Video").Height
+      )
+      .sort((left, right) => right - left),
+    [2160, 1080, 720, 480],
+  );
+  assert.equal(readerCalls, readerCallsAfterFirst);
+});
+
+test("fills GetAV qualities through the Microlink renderer when Jina is rate limited", async () => {
+  const number = "RCTD-753";
+  const slug = number.toLowerCase();
+  const getavSources = [
+    ["raw_4k", 2160],
+    ["raw_1080p", 1080],
+    ["raw_720p", 720],
+    ["raw_480p", 480],
+  ].map(([type, quality]) => ({
+    movieId: number,
+    type,
+    quality,
+    url: `https://static.worldstatic.com/${slug}/${quality}/index.txt`,
+  }));
+  const getavUrls = getavSources.map((source) => source.url);
+  const page = `<html><title>${number} Test | GetAV</title>` +
+    `${JSON.stringify({ videoSources: getavSources })}</html>`;
+  let microlinkCalls = 0;
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    if (target.includes("/v4/movies/49")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: { movie: { id: 49, number, title: `${number} Test` } },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("/api/v/resolve?code=")) {
+      return new Response(
+        JSON.stringify({
+          variants: [
+            {
+              variant: "original",
+              label: "原版",
+              sourceUrl: `https://fast-stream.jav.si/${slug}/fcjav-original.mp4`,
+              sourceType: "video/mp4",
+            },
+          ],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("javtiful.com/zh/search")) {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target.startsWith("https://r.jina.ai/")) {
+      return new Response("{}", {
+        status: 429,
+        headers: { "content-type": "application/json", "retry-after": "0" },
+      });
+    }
+    if (target.startsWith("https://api.microlink.io/")) {
+      microlinkCalls += 1;
+      return new Response(
+        JSON.stringify({ status: "success", data: { html: page } }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (/getav\.net\/zh\/videos\//.test(target)) {
+      return new Response("<html><title>Access denied</title></html>", {
+        status: 403,
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (getavUrls.includes(target)) {
+      return new Response(
+        [
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:6",
+          "#EXTINF:6,",
+          "segment.ts",
+          "#EXT-X-ENDLIST",
+        ].join("\n"),
+        { headers: { "content-type": "application/vnd.apple.mpegurl" } },
+      );
+    }
+    return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+      status: 206,
+      headers: { "content-type": "video/mp2t" },
+    });
+  };
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/49/PlaybackInfo", { method: "POST" }),
+    { ITEM_DETAIL_RESOLVE_BUDGET_MS: 12000 },
+    {},
+    fetchImpl,
+  );
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(microlinkCalls >= 1, true);
+  assert.deepEqual(
+    payload.MediaSources
+      .filter((source) => String(source.Name || "").includes("GetAV"))
+      .map((source) => source.MediaStreams.find((stream) => stream.Type === "Video").Height)
+      .sort((left, right) => right - left),
+    [2160, 1080, 720, 480],
+  );
+});
+
+test("refetches GetAV when the stored variants are missing qualities", async () => {
+  const db = createPlaybackD1();
+  const number = "RCTD-754";
+  const slug = number.toLowerCase();
+  const allSources = [
+    ["raw_4k", 2160],
+    ["raw_1080p", 1080],
+    ["raw_720p", 720],
+    ["raw_480p", 480],
+  ].map(([type, quality]) => ({
+    movieId: number,
+    type,
+    quality,
+    url: `https://static.worldstatic.com/${slug}/${quality}/index.txt`,
+  }));
+  // 上一次只抓到 4K/1080P 就落了库：这份缺档缓存不能挡住后续重抓。
+  db.rows.set(
+    `getav-variants-v1\u0000${slug}`,
+    JSON.stringify({
+      variants: allSources.slice(0, 2).map((source) => ({
+        sourceUrl: source.url,
+        sourceType: "application/vnd.apple.mpegurl",
+        label: "原版 (GetAV)",
+        variant: `getav_${source.type}`,
+        title: `${number} Test`,
+        quality: source.quality,
+        family: "raw",
+      })),
+      savedAt: Date.now(),
+    }),
+  );
+  const page = `<html><title>${number} Test | GetAV</title>` +
+    `${JSON.stringify({ videoSources: allSources })}</html>`;
+  const getavUrls = allSources.map((source) => source.url);
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    if (target.includes("/v4/movies/50")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: { movie: { id: 50, number, title: `${number} Test` } },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("/api/v/resolve?code=")) {
+      return new Response(
+        JSON.stringify({
+          variants: [
+            {
+              variant: "original",
+              label: "原版",
+              sourceUrl: `https://fast-stream.jav.si/${slug}/fcjav-original.mp4`,
+              sourceType: "video/mp4",
+            },
+          ],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("javtiful.com/zh/search")) {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target.startsWith("https://api.microlink.io/")) {
+      return new Response(
+        JSON.stringify({ status: "success", data: { html: page } }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.startsWith("https://r.jina.ai/")) {
+      return new Response("{}", {
+        status: 429,
+        headers: { "content-type": "application/json", "retry-after": "0" },
+      });
+    }
+    if (/getav\.net\/zh\/videos\//.test(target)) {
+      return new Response("<html><title>Access denied</title></html>", {
+        status: 403,
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (getavUrls.includes(target)) {
+      return new Response(
+        [
+          "#EXTM3U",
+          "#EXT-X-TARGETDURATION:6",
+          "#EXTINF:6,",
+          "segment.ts",
+          "#EXT-X-ENDLIST",
+        ].join("\n"),
+        { headers: { "content-type": "application/vnd.apple.mpegurl" } },
+      );
+    }
+    return new Response(new Uint8Array([0x47, 0x40, 0x11, 0x10, 0, 0]), {
+      status: 206,
+      headers: { "content-type": "video/mp2t" },
+    });
+  };
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/50/PlaybackInfo", { method: "POST" }),
+    { PLAYBACK_DB: db, ITEM_DETAIL_RESOLVE_BUDGET_MS: 12000 },
+    {},
+    fetchImpl,
+  );
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    payload.MediaSources
+      .filter((source) => String(source.Name || "").includes("GetAV"))
+      .map((source) => source.MediaStreams.find((stream) => stream.Type === "Video").Height)
+      .sort((left, right) => right - left),
     [2160, 1080, 720, 480],
   );
 });
@@ -13319,6 +13948,11 @@ test("refreshes a stale media URL and accepts SenPlayer stream path variants", a
           { headers: { "content-type": "application/json" } },
         );
       }
+      if (target.includes("api.microlink.io")) {
+        // GetAV 的后台渲染备援可能在本测试断言之后才发出；这里给个
+        // 明确的空响应，避免落进下面的兜底断言造成未捕获异常。
+        return new Response("", { status: 404 });
+      }
       assert.equal(target, "https://fast-stream.jav.si/video/fresh.mp4");
       freshRanges.push(init.headers.get("range"));
       return new Response(videoBytes, {
@@ -13338,8 +13972,17 @@ test("refreshes a stale media URL and accepts SenPlayer stream path variants", a
   // 先试旧地址、再查影片、然后并发解析（解析器必须在其中）、最后拉新地址。
   assert.equal(calls[0], "https://fast-stream.jav.si/video/stale.mp4");
   assert.equal(calls[1], "https://jdforrepam.com/api/v4/movies/42");
+  // 媒体请求可能晚于响应头返回（流式读取在 arrayBuffer() 时才发生），
+  // 这里只固定解析链路的集合，媒体请求单独在最后校验。
   assert.deepEqual(
-    [...calls.slice(2, -2)].sort(),
+    calls
+      .filter(
+        (target) =>
+          !target.startsWith("https://fast-stream.jav.si/video/") &&
+          !target.includes("/v4/movies/42") &&
+          !target.includes("api.microlink.io"),
+      )
+      .sort(),
     [
       `${RESOLVER}/api/v/resolve?code=TEST-001&lang=zh`,
       "https://javtiful.com/zh/search?q=TEST-001",
@@ -13347,12 +13990,13 @@ test("refreshes a stale media URL and accepts SenPlayer stream path variants", a
       "https://getav.net/zh/videos/test-001",
     ].sort(),
   );
-  assert.deepEqual(calls.slice(-2), [
-    "https://fast-stream.jav.si/video/fresh.mp4",
-    "https://fast-stream.jav.si/video/fresh.mp4",
-  ]);
-  assert.deepEqual(freshRanges, ["bytes=0-511", "bytes=0-3"]);
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), videoBytes);
+  assert.equal(
+    calls.filter((target) => target === "https://fast-stream.jav.si/video/fresh.mp4")
+      .length,
+    2,
+  );
+  assert.deepEqual(freshRanges, ["bytes=0-511", "bytes=0-3"]);
 });
 
 test("fails over to the next line when an upstream never returns response headers", async () => {
@@ -13521,8 +14165,17 @@ test("streams relative URLs from alternate resolver response fields", async () =
   // 一个微任务。两条链路是并发的，彼此的相对顺序不是契约：这里只固定“先查
   // 影片、再并发解析（解析器必须在其中）、最后拉媒体”的有语义顺序。
   assert.equal(calls[0], "https://jdforrepam.com/api/v4/movies/42");
+  // GetAV 的备用渲染通道（Microlink）也在并发链路里，它是否被触发取决于
+  // Jina 的返回时机，不属于本用例要固定的语义顺序，这里单独排除。
   assert.deepEqual(
-    [...calls.slice(1, -2)].sort(),
+    calls
+      .slice(1)
+      .filter(
+        (target) =>
+          !target.startsWith(`${UPSTREAM}/video/fresh.mp4`) &&
+          !target.includes("api.microlink.io"),
+      )
+      .sort(),
     [
       `${RESOLVER}/api/v/resolve?code=TEST-001&lang=zh`,
       "https://javtiful.com/zh/search?q=TEST-001",
@@ -13530,10 +14183,10 @@ test("streams relative URLs from alternate resolver response fields", async () =
       "https://getav.net/zh/videos/test-001",
     ].sort(),
   );
-  assert.deepEqual(calls.slice(-2), [
-    `${UPSTREAM}/video/fresh.mp4`,
-    `${UPSTREAM}/video/fresh.mp4`,
-  ]);
+  assert.equal(
+    calls.filter((target) => target === `${UPSTREAM}/video/fresh.mp4`).length,
+    2,
+  );
   assert.deepEqual(freshRanges, ["bytes=0-511", "bytes=0-3"]);
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), videoBytes);
 });
