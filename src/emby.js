@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-21-expired-source-drop-103";
+const SERVER_BUILD_ID = "2026-10-22-serial-throughput-105";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -281,11 +281,21 @@ const MEDIA_PARALLEL_RANGE_DISABLE_MS = 5 * 60 * 1000;
 // error document) is not transient. Do not retry that host for a longer period.
 const MEDIA_PARALLEL_RANGE_INCOMPATIBLE_DISABLE_MS = 30 * 60 * 1000;
 const MEDIA_PARALLEL_RANGE_FAILURES = new Map();
-// Verified pseudo-TS segments use bounded parallel ranges by default. The
-// fan-out coordinator below keeps this from multiplying with HLS.js requests.
-const MEDIA_PARALLEL_RANGE_DEFAULT_ENABLED = true;
+// 默认关闭服务端并行 Range（可用 MEDIA_PARALLEL_RANGE_ENABLED=true 打开）。
+// 2026-10-22 在真实上游做的 A/B（同一资源 10 个 4MB 分片，一次只跑一个请求）：
+//   单连接串行：平均 0.828 MiB/s，最慢 5.1 秒
+//   两路并行窗口：平均 0.487 MiB/s，其中两段 13.1 / 15.2 秒
+// 该 CDN 对同主机并发连接是总量限速而不是单连接限速，拆成多路只会把同一份
+// 带宽切碎，还额外占连接预算（503/1102 与短读的来源）。10 秒的分片跑 13~15
+// 秒，播放器必然等不到数据 → 卡顿、花屏、跳段。因此并行管道保留为可选实现，
+// 默认走单连接串行流（本来就是最快、最省连接的那条路）。
+const MEDIA_PARALLEL_RANGE_DEFAULT_ENABLED = false;
 const MEDIA_PARALLEL_FANOUT_GLOBAL_MAX = 2;
-const MEDIA_PARALLEL_FANOUT_HOST_MAX = 1;
+// 线上实测：单主机 fanout=1 时，播放器自己的第二个分片请求即使已在响应
+// 队列里，也只能等前一个 4MB 并行管道收尾，前端吞吐会跌到 0.34MiB/s，
+// 低于 10 秒分片所需的播放速率。放宽到 2 后，同一 isolate 内两个分片各占
+// 一条 fanout；上游并发仍由 per-host scheduler / 全局 scheduler 限制。
+const MEDIA_PARALLEL_FANOUT_HOST_MAX = 2;
 const MEDIA_PARALLEL_RANGE_OPEN_STAGGER_MS = 60;
 const MEDIA_PARALLEL_RANGE_EXPAND_WINDOW_MS = 6000;
 // 显式 Range 达到整段长度的 90% 才按“整段”并行；其余 Range 直接透传，
@@ -299,7 +309,14 @@ const MEDIA_PARALLEL_RANGE_HEADER = "x-catemby-parallel-range";
 // 生产默认每主机 1 条，同时整个 isolate 总数也不超过 2 条。只限制单主机并不够：
 // p16 / p19 等不同 CDN 主机可以各自开一条长连接，合起来仍会超过实例预算。
 const MEDIA_UPSTREAM_CONNECTION_MAX = 1;
-const MEDIA_UPSTREAM_CONNECTION_GLOBAL_MAX = 2;
+// 2026-10-22 实测：出口带宽只有 ~0.7~1.0 MiB/s（speed.cloudflare.com 30MB
+// 下载 39.6 秒），而一路 10 秒分片是 4MB。两路并发并不会提高总吞吐，只会把
+// 这条窄管道切成两条 0.4 MiB/s：两段各要 10 秒以上，而每段只有 10 秒时长，
+// 播放器来不及 → 卡顿、花屏、跳段，退出播放时上游还会 503/1102
+// （同一 isolate 里 A/B：单连接 0.83~1.01 MiB/s；两路并发合计 0.487~0.582 MiB/s）。
+// 因此串行路径改成“全局 1 条”：p16 / p19 这类不同 CDN 主机也不能同时下，
+// 播放器提前预取的下一个分片会排队等当前分片读完，带宽始终给正在播的这段。
+const MEDIA_UPSTREAM_CONNECTION_GLOBAL_MAX = 1;
 // 服务端并行 Range 的初始窗口本身就要 4 条连接；给内部拆分的原始响应留
 // 1 条余量，避免探针连接和初始窗口互相等待。
 const MEDIA_UPSTREAM_CONNECTION_PARALLEL_MAX = MEDIA_PARALLEL_RANGE_WINDOW;
@@ -2760,8 +2777,8 @@ function embeddedTsRangeResponse(body, metadata, range) {
 function embeddedTsParallelRangeResponse(parallel, metadata, range) {
   const total = parallel.total;
   if (
-    !parallel?.bytes ||
-    parallel.bytes.byteLength !== total
+    !parallel?.body &&
+    parallel?.bytes?.byteLength !== total
   ) {
     return null;
   }
@@ -2778,11 +2795,14 @@ function embeddedTsParallelRangeResponse(parallel, metadata, range) {
   if (parallel.timing) {
     headers.set(MEDIA_PARALLEL_RANGE_HEADER, `range;${parallel.timing}`);
   }
-  return new Response(parallel.bytes, {
-    status: 206,
-    statusText: "Partial Content",
-    headers,
-  });
+  return new Response(
+    parallel.body ? guardExactMediaStreamBody(parallel.body, total) : parallel.bytes,
+    {
+      status: 206,
+      statusText: "Partial Content",
+      headers,
+    },
+  );
 }
 
 // 整段伪 TS 请求的并行响应：与普通 200 流保持相同的外部语义，但响应体直接
@@ -2790,11 +2810,10 @@ function embeddedTsParallelRangeResponse(parallel, metadata, range) {
 function embeddedTsParallelWholeResponse(parallel, metadata) {
   const total = metadata.upstreamTotal - metadata.prefixLength;
   if (
-    !parallel?.bytes ||
-    parallel.bytes.byteLength !== total ||
     !Number.isSafeInteger(total) ||
     total <= 0 ||
-    parallel.total !== total
+    parallel.total !== total ||
+    (!parallel.body && parallel.bytes?.byteLength !== total)
   ) {
     return null;
   }
@@ -2809,7 +2828,9 @@ function embeddedTsParallelWholeResponse(parallel, metadata) {
     headers.set(MEDIA_PARALLEL_RANGE_HEADER, `hit;${parallel.timing}`);
   }
   return new Response(
-    parallel.bytes,
+    parallel.body
+      ? guardExactMediaStreamBody(parallel.body, total)
+      : parallel.bytes,
     {
       status: 200,
       statusText: "OK",
@@ -4299,11 +4320,12 @@ async function openLegacyParallelMediaRangeStream(
 }
 
 // 有界、按序的 Range 管道：按 512KB 分块，初始两路，只有首块完成且第二块
-// 在启动预算内完整到达时才扩到最多四块。所有块先在服务端按序完整收齐并校验，
-// 之后才把整段字节交给调用方。响应头一旦发给客户端就不能再安全回退，因此这里
-// 不允许把中途短读的并行结果直接流出去。
-// 某块中途短读/断流时，从尚未收到的偏移改走单 Range 续传；若续传也失败，
-// 返回错误给调用方，由调用方改用已打开或重新建立的单连接完整响应。
+// 在启动预算内完整到达时才扩到最多四块。当前块边收边发给播放器，后续块在
+// 后台预取；任何时刻都按原始字节顺序输出。
+// 某块中途短读/断流时，从尚未收到的偏移改走单 Range 续传；续传仍失败则让
+// 响应体报错，由播放器重试整段。绝不能把截断或错位的数据当成完整分片下发。
+// 注意：这里不能先 await 把整段读完再返回，否则 4MB 分片的首字节要等十几秒，
+// HLS 播放器会超时、重试并跳过该段，表现就是“卡顿 + 花屏 + 跳段”。
 async function openRollingParallelMediaRangeStream(
   start,
   end,
@@ -4351,7 +4373,6 @@ async function openRollingParallelMediaRangeStream(
   let finished = false;
   let fanoutReleased = false;
   let lastFailure = "";
-  let bufferedReader = null;
   let abortListener = null;
 
   const releaseFanoutLease = () => {
@@ -4408,7 +4429,6 @@ async function openRollingParallelMediaRangeStream(
       if (finished || aborted) return;
       aborted = true;
       void cancelAll();
-      void bufferedReader?.cancel(options.signal.reason);
     };
     options.signal.addEventListener("abort", abortListener, { once: true });
   }
@@ -4863,51 +4883,14 @@ async function openRollingParallelMediaRangeStream(
     },
     async cancel() {
       finished = true;
+      detachAbortListener();
       await cancelAll();
     },
   });
-
-  const total = plan.reduce((sum, part) => sum + part.length, 0);
-  let buffered = null;
-  try {
-    buffered = await readMediaBodyFullyWithIdleTimeout(
-      new Response(body),
-      total,
-      {
-        onReader(reader) {
-          bufferedReader = reader;
-        },
-      },
-    );
-  } finally {
-    detachAbortListener();
-  }
-  if (aborted || options.signal?.aborted) {
-    await cancelAll();
-    return { error: "client-aborted" };
-  }
-  if (
-    !buffered?.complete ||
-    !buffered.bytes ||
-    buffered.bytes.byteLength !== total
-  ) {
-    return fail(
-      lastFailure ||
-        `incomplete-buffer-${buffered?.bytes?.byteLength || 0}/${total}`,
-    );
-  }
-  if (
-    total >= MPEG_TS_MIN_JUDGE_BYTES &&
-    (buffered.bytes[0] !== 0x47 || mpegTsLengthTruncated(total))
-  ) {
-    return fail(`packet-misaligned-${total}`);
-  }
-  finished = true;
-  await cancelAll();
   return {
-    bytes: buffered.bytes,
-    total,
-    timing: `buffered;${Date.now() - startedAt}ms;window=${windowSize};chunks=${
+    body,
+    total: plan.reduce((sum, part) => sum + part.length, 0),
+    timing: `streamed;${Date.now() - startedAt}ms;window=${windowSize};chunks=${
       plan.length
     }`,
   };
@@ -5607,10 +5590,10 @@ async function streamEmbeddedTsMediaResponse(upstream, sourceUrl, options = {}) 
         await prefixResult.reader?.cancel?.();
       } catch {}
       body = streamMediaBodyWithPrefix(
-        parallel.bytes,
+        parallel.body ? new Uint8Array(0) : parallel.bytes,
         null,
-        null,
-        true,
+        parallel.body ? parallel.body.getReader() : null,
+        !parallel.body,
         // 并行管道本身已经按段占用最多 8MB。再复制一份完整分片到本地缓存会在
         // 多个 HLS 请求重叠时把内存峰值翻倍，正是 1102 的高风险来源。
         { ...cacheOptions, cacheKey: "", cacheLimit: 0 },
@@ -7001,7 +6984,11 @@ async function fetchMediaUpstreamResponse(
       },
     )
     : null;
-  if (parallel?.bytes && parallel.total === range.end - range.start + 1) {
+  if (
+    parallel &&
+    (parallel.body || parallel.bytes) &&
+    parallel.total === range.end - range.start + 1
+  ) {
     return embeddedTsParallelRangeResponse(
       parallel,
       metadata,
@@ -8493,7 +8480,12 @@ const MAX_RESOLVE_CACHE_ENTRIES = 1000;
 // TTL 故意很短：完整结果（含补源）落地到 RESOLVE_VIDEO_CACHE 后，
 // 这份中途快照就没有意义了；万一后台补源被 Worker 回收打断，也只会
 // 影响 20 秒，不会让“只有两条源”的结果污染 30 分钟缓存。
-const PARTIAL_RESOLVE_TTL_MS = 20 * 1000;
+// 冷启动的“完整补源”偶尔要超过一个详情请求的 8 秒预算。若只保留 20 秒，
+// 用户在详情页停留一会儿后，后续请求既拿不到完整结果，也拿不到已发布的
+// 真实线路快照，就会退回“自动线路”。这里延长到 60 秒：覆盖一次详情页
+// 浏览，又不会像完整缓存那样长期钉住少线路的半成品；完整结果落地时仍会
+// 主动清掉这份快照。
+const PARTIAL_RESOLVE_TTL_MS = 60 * 1000;
 const MAX_LIST_CACHE_ENTRIES = 400;
 // 全量扫描类列表（搜索 / 标签 / 演员 / 自定义排序）的“扫描窗口”：整轮上游扫描
 // 只做一次，把前 LIST_PAGE_WINDOW 条按窗口缓存，客户端翻页时从窗口里切。
@@ -11850,6 +11842,20 @@ async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl, options 
       return;
     }
     const generation = ++firstBatchGeneration;
+    // 首屏预算只有 7.6 秒，而整批校验（抓 HLS 清单 + 探分片）往往要
+    // 8 秒以上。实测冷启动时校验结果总是比 frs-timeout 晚 1 秒左右到达，
+    // 于是每次“冷”请求都退回“自动线路（解析中）”。
+    // 这里先把“静态剔除过的首批”同步发出去（publishPartial 内部还会
+    // 再做一次静态剔除），校验结果到达后再按“线路更多”单调覆盖。
+    const staticCount = resolvedVideoSourceCount(candidate);
+    if (staticCount > firstBatchSourceCount) {
+      firstBatchSourceCount = staticCount;
+      try {
+        options.onFirstBatch(candidate, { provisional: true });
+      } catch {
+        // 提前发布失败不能影响正常解析。
+      }
+    }
     // 校验会把 1080P 这类伪 HLS 从同批次中剔掉。尽管我们仍旧允许真源
     // 在后台补齐后进入首屏，但这里不会把“真源 + 伪源”的脏快照直接外发。
     validatedResolvedVideo(candidate, fetchImpl, env, validationCache).then(
@@ -11859,13 +11865,18 @@ async function loadSelfHostedResolvedVideo(movie, code, env, fetchImpl, options 
         if (
           generation !== firstBatchGeneration ||
           !isUsableResolvedVideo(publishable) ||
-          count <= firstBatchSourceCount
+          count <= 0
         ) {
           return;
         }
+        // 校验结果即使更少也要发布：它剔除的是伪 HLS，属于纠正，不是倒退。
+        // 但只要这一批里没有真正剔掉任何东西，就不必重复发一次同样的快照。
+        if (count === firstBatchSourceCount) return;
         firstBatchSourceCount = count;
         try {
-          options.onFirstBatch(publishable);
+          // 校验后的快照覆盖同一批次的临时快照：伪 HLS 必须能被剔除，
+          // 否则它会跟着“越换越多”的合并规则永远留在首屏。
+          options.onFirstBatch(publishable, { replacePrevious: true });
         } catch {
           // 提前发布失败不能影响正常解析。
         }
@@ -12062,7 +12073,7 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
         {
           // 自建链路里第一条线路一到就对外发布，不再等另一条链路合并完
           // （Jina 代理取 GetAV 要 4~5 秒，解析预算常常等不到）。
-          onFirstBatch: (video) => publishPartial(video),
+          onFirstBatch: (video, meta) => publishPartial(video, false, meta),
           onGetavStatus: (status) => {
             if (status?.pageBlocked) getavPageBlocked = true;
           },
@@ -12098,13 +12109,19 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   // 的快照合并进一份累积结果，只有线路条数真的增加时才对外发布。
   let publishedVideo = null;
   let publishedSourceCount = -1;
+  // 自建 GetAV 首批的“临时快照”来源集合。校验完成后会用同批次的校验结果
+  // 覆盖它（伪 HLS 必须能被剔除），此时允许线路条数变少；除此之外仍然
+  // 只允许“越换越多”，否则详情页会出现 4 条 → 1 条的倒退。
+  let provisionalSourceKeys = null;
+  const partialSourceKey = (variant) =>
+    String(variant?.sourceUrl || variant?.inlinePlaylist || "");
   // 是否至少发布过一次“主批次”（公共解析器）快照。详情页首屏用它判断
   // “上游的全部线路是不是已经到齐”。
   let majorPublished = false;
   // major=true 表示这份快照来自“主批次”（公共解析器）：它基本代表了上游
   // 到底有几条线路，之后通常只会再有零星补充。自建补源的第一批（Javtiful
   // 秒回 1~2 条）不是主批次，详情页不能拿它当“线路齐了”就提前返回。
-  const publishPartial = (video, major = false) => {
+  const publishPartial = (video, major = false, meta = null) => {
     if (!onPartial) return;
     // 中途快照不会经过 validatedResolvedVideo 的分片探测，这里先剔除“同步即可
     // 判定为图片/字体”的伪 HLS 线路，避免首屏把假线路发给客户端。
@@ -12113,13 +12130,33 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
       withoutDefinitelyFakeVariants(video),
     );
     if (!isUsableResolvedVideo(publishable)) return;
-    const merged = publishedVideo
-      ? mergeResolvedVideoVariants(env, publishedVideo, publishable) || publishable
+    const replacePrevious = meta?.replacePrevious === true;
+    let base = publishedVideo;
+    if (replacePrevious && provisionalSourceKeys && base) {
+      const kept = playbackVariants(base).filter(
+        (variant) => !provisionalSourceKeys.has(partialSourceKey(variant)),
+      );
+      base = kept.length ? normalizedResolvedVideo(kept) : null;
+    }
+    const merged = base
+      ? mergeResolvedVideoVariants(env, base, publishable) || publishable
       : publishable;
     const count = resolvedVideoSourceCount(merged);
-    if (count <= publishedSourceCount) return;
+    if (replacePrevious) {
+      const hadProvisional = provisionalSourceKeys !== null;
+      provisionalSourceKeys = null;
+      if (count <= 0) return;
+      if (!hadProvisional && count <= publishedSourceCount) return;
+    } else if (count <= publishedSourceCount) {
+      return;
+    }
     publishedVideo = merged;
     publishedSourceCount = count;
+    if (meta?.provisional === true) {
+      provisionalSourceKeys = new Set(
+        playbackVariants(publishable).map(partialSourceKey),
+      );
+    }
     if (major === true) majorPublished = true;
     dbgResolve("partial", code, { n: count, major: major === true });
     try {
@@ -12150,7 +12187,11 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
       (video) => {
         if (!video) return;
         validatedResolvedVideo(video, fetchImpl, env, resolveValidationCache).then(
-          (validated) => publishPartial(validated),
+          // 这一份是自建补源的完整校验结果，包含首批那些“临时快照”来源，
+          // 允许它把临时快照里的伪 HLS 剔掉（仍保留其它链路已发布的线路）。
+          (validated) => publishPartial(validated, false, {
+            replacePrevious: true,
+          }),
           (error) => {
             dbgResolve("selfhosted-validation-error", code, {
               error: error instanceof Error ? error.message : String(error),

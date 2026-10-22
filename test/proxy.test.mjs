@@ -10741,7 +10741,7 @@ test("buffers a verified whole pseudo TS segment from ordered 512KiB ranges", as
   assert.equal(probeRequests, 1);
   assert.match(
     response.headers.get("x-catemby-parallel-range") || "",
-    /^hit;buffered;/,
+    /^hit;streamed;/,
   );
   const delivered = new Uint8Array(await response.arrayBuffer());
   const expected = rawBytes.slice(prefixLength);
@@ -10975,7 +10975,9 @@ test("probes a whole pseudo TS segment and reuses the probe as one serial stream
     new Request(
       `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`,
     ),
-    {},
+    // 服务端并行 Range 默认已关闭（实测并发反而更慢）。这条用例验证的是
+    // “并行模式下的探测请求被复用成一条串行流”，因此必须显式打开并行。
+    { MEDIA_PARALLEL_RANGE_ENABLED: "true" },
     {},
     async (_url, init = {}) => {
       upstreamRequests += 1;
@@ -11170,7 +11172,8 @@ test("keeps the range window at two when the second chunk misses the expansion b
     releaseSecondRange = resolve;
   });
 
-  const releaseTimer = setTimeout(releaseSecondRange, 80);
+  // 第二块被 80ms 的闸门挡在预算之外：窗口必须停在两路并发。
+  setTimeout(releaseSecondRange, 80).unref?.();
   const response = await handleProxy(
     new Request(
       `https://clone.example/emby-media/?url=${encodeURIComponent(sourceUrl)}&kind=segment&hls=1`,
@@ -11243,12 +11246,12 @@ test("keeps the range window at two when the second chunk misses the expansion b
       });
     },
   );
-  clearTimeout(releaseTimer);
-
   assert.equal(response.status, 200);
+  // 并行管道现在是“边收边发”：响应一返回就只打开了窗口内的前两路，后续
+  // 块要等播放器真正读走数据才会依次打开，所以断言必须放在消费响应体之后。
+  const delivered = new Uint8Array(await response.arrayBuffer());
   assert.equal(maxActiveMediaRanges, 2);
   assert.ok(openedStarts.size > 2);
-  const delivered = new Uint8Array(await response.arrayBuffer());
   assert.deepEqual(delivered, rawBytes.slice(prefixLength));
 });
 
@@ -11496,6 +11499,19 @@ test("cancels later rolling-window chunks after the fifth and sixth start", asyn
     },
   );
 
+  const response = await proxyResponse;
+  // 响应头一旦下发，后续块就由读取进度驱动打开：这里持续消费响应体，等
+  // 第五、第六块真正开始（然后挂住）后再取消读取，验证取消能传到上游。
+  assert.equal(response.status, 200);
+  const reader = response.body.getReader();
+  const pump = (async () => {
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) return;
+      }
+    } catch {}
+  })();
   let timeout;
   try {
     await Promise.race([
@@ -11511,9 +11527,9 @@ test("cancels later rolling-window chunks after the fifth and sixth start", asyn
     clearTimeout(timeout);
   }
   assert.ok(openedStarts.size >= 2);
+  await reader.cancel("client exited early");
   controller.abort();
-  const response = await proxyResponse;
-  assert.equal(response.status, 499);
+  await pump;
   const laterStarts = [...openedStarts];
   assert.deepEqual(
     [...cancelledStarts].sort((left, right) => left - right),
@@ -11802,7 +11818,7 @@ test("resumes a short-read pseudo PNG range from the missing byte offset", async
   assert.equal(parallelAttempts, 7);
 });
 
-test("falls back to one complete upstream stream when a parallel short-read cannot be resumed", async () => {
+test("errors the parallel stream instead of delivering a truncated segment", async () => {
   const prefixLength = 70;
   const rawBytes = pseudoPngTsBytes(prefixLength, 14000);
   const sourceUrl =
@@ -11860,11 +11876,16 @@ test("falls back to one complete upstream stream when a parallel short-read cann
   );
 
   assert.equal(response.status, 200);
-  assert.equal(fullRequests, 1);
-  assert.deepEqual(
-    new Uint8Array(await response.arrayBuffer()),
-    rawBytes.slice(prefixLength),
+  // 流式并行管道一旦在响应头下发后遇到无法续传的短读，必须让响应体报错，
+  // 不能把截断数据当成完整分片下发（静默截断正是“花屏 + 跳段”的来源）。
+  // 播放器收到错误后会重试整段，语义与单连接串行失败一致。
+  const delivered = await response.arrayBuffer().then(
+    (buffer) => ({ ok: true, buffer }),
+    (error) => ({ ok: false, error }),
   );
+  assert.equal(delivered.ok, false);
+  // 冷缓存探测已经定位到外壳偏移，这条失败路径不该再额外开一条完整单连接。
+  assert.equal(fullRequests, 0);
 });
 
 test("stops attempting parallel ranges after repeated failures on a host", async () => {

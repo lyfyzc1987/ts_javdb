@@ -16,6 +16,8 @@ const env = {
   EMBY_GUEST_ACCESS: process.env.EMBY_GUEST_ACCESS || "true",
   EMBY_GUEST_TOKEN: process.env.EMBY_GUEST_TOKEN || "bbjavdb-guest",
   EXTRA_MEDIA_HOSTS: process.env.EXTRA_MEDIA_HOSTS || "",
+  HLS_VIRTUAL_SPLIT_PARTS: process.env.HLS_VIRTUAL_SPLIT_PARTS || "",
+  RESOLVE_DEBUG: process.env.RESOLVE_DEBUG || "",
 };
 
 function nodeFetch(url, init) {
