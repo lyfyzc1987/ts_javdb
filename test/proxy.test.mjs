@@ -19,6 +19,7 @@ import {
   dedupeSameStreamVariantsForTests,
   mediaParallelRangeCoordinatorStatsForTests,
   mediaSegmentCacheKeyForTests,
+  mediaSourceDisplayNameForTests,
   mediaSourceIdForIndexForTests,
   mediaSourceIdsForVariantsForTests,
   rewriteHlsManifestCachedForTests,
@@ -31,7 +32,12 @@ import {
   selectedPlaybackVideoForTests,
   validatedVideoVariantsForTests,
 } from "../src/emby.js";
-import { resetMemoJavCachesForTests } from "../src/memojav.js";
+import {
+  memoQualityLabel,
+  memoSourceName,
+  parseMp4TrackDimensions,
+  resetMemoJavCachesForTests,
+} from "../src/memojav.js";
 
 const UPSTREAM = "https://catembylegacy.fastcdn.dpdns.org";
 const RESOLVER = "https://catembylegacy.fastcdn.dpdns.org";
@@ -4872,10 +4878,10 @@ test("merges one public resolver source with two Javtiful qualities", async () =
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["原版", "MemoJav Javtiful 1080P", "MemoJav Javtiful 720P"],
+    ["原版", "MemoJav 1080P Javtiful", "MemoJav 720P Javtiful"],
   );
   const javtifulSources = payload.MediaSources.filter((source) =>
-    source.Name.includes("Javtiful ")
+    source.Name.includes("Javtiful")
   );
   assert.equal(javtifulSources.length, 2);
   for (const source of javtifulSources) {
@@ -5128,7 +5134,7 @@ test("GetAV sources use 302 for compatible players and proxy fallback for okhttp
   assert.equal(embyGetavSources.length, 2);
   assert.deepEqual(
     embyGetavSources.map((source) => source.Name).sort(),
-    ["MemoJav GetAV 原版 1080P", "MemoJav GetAV 原版 720P"],
+    ["MemoJav 1080P GetAV 原版", "MemoJav 720P GetAV 原版"],
   );
   assert.deepEqual(
     embyGetavSources
@@ -7097,7 +7103,7 @@ test("drops pseudo-HLS supplements and keeps validated self-hosted lines", async
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name).sort(),
-    ["原版", "MemoJav Javtiful 720P", "GetAV 原版 4K"].sort(),
+    ["原版", "MemoJav 720P Javtiful", "GetAV 原版 4K"].sort(),
   );
   assert.equal(calls.includes(pseudoImageUrl), false);
 });
@@ -7300,7 +7306,7 @@ test("loads Javtiful MP4 qualities in order and probes each stream", async () =>
   assert.equal(response.status, 200);
   assert.deepEqual(
     payload.MediaSources.map((source) => source.Name),
-    ["MemoJav Javtiful 1080P", "MemoJav Javtiful 720P"],
+    ["MemoJav 1080P Javtiful", "MemoJav 720P Javtiful"],
   );
   assert.deepEqual(
     payload.MediaSources.map((source) =>
@@ -13507,7 +13513,7 @@ test("keeps waiting when the public resolver fails fast and GetAV lines are stil
   // 关键断言：没有停在“自建链路第一条”的半成品上，3 条都在首屏。
   assert.equal(payload.MediaSourceCount, 3);
   const names = payload.MediaSources.map((source) => String(source.Name));
-  assert.equal(names.some((name) => name.includes("Javtiful 720P")), true);
+  assert.equal(names.includes("MemoJav 720P Javtiful"), true, names.join(" | "));
   assert.equal(
     names.filter((name) => name.includes("GetAV")).length,
     2,
@@ -14571,6 +14577,22 @@ function memoInfoResponse(type, url) {
   );
 }
 
+// 造一个只含 moov/trak/tkhd 的最小 init 段，用于验证分辨率探测。
+function memoInitMp4(width, height) {
+  const tkhd = new Uint8Array(92);
+  const tkhdView = new DataView(tkhd.buffer);
+  tkhdView.setUint32(0, 92);
+  tkhd.set([0x74, 0x6b, 0x68, 0x64], 4); // 'tkhd'
+  tkhdView.setUint32(84, width * 65536);
+  tkhdView.setUint32(88, height * 65536);
+  const moov = new Uint8Array(8 + tkhd.length);
+  const moovView = new DataView(moov.buffer);
+  moovView.setUint32(0, moov.length);
+  moov.set([0x6d, 0x6f, 0x6f, 0x76], 4); // 'moov'
+  moov.set(tkhd, 8);
+  return moov;
+}
+
 test("memo short link returns a 302 to the upstream m3u8 without proxying", async () => {
   const calls = [];
   const upstreamUrl = "https://video10.memojav.net/stream/ROE-552/master.m3u8";
@@ -14686,10 +14708,10 @@ test("memo hls master with real quality variants expands into multiple sources",
   assert.deepEqual(
     list.sources.map((source) => [source.id, source.height, source.name]),
     [
-      ["hls-2160", 2160, "MemoJav 2160P"],
+      ["hls-2160", 2160, "MemoJav 4K"],
       ["hls-1080", 1080, "MemoJav 1080P"],
       ["hls-720", 720, "MemoJav 720P"],
-      ["hls-proxy", 2160, "MemoJav 代理"],
+      ["hls-proxy", 2160, "MemoJav 代理 4K"],
     ],
   );
   assert.equal(
@@ -14738,6 +14760,194 @@ test("memo hls single media playlist keeps exactly one real source", async () =>
     payload.sources.map((source) => source.id),
     ["hls", "hls-proxy"],
   );
+});
+
+test("memo quality labels use 4K/2K/P instead of 原画", async () => {
+  assert.equal(memoQualityLabel(2160), "4K");
+  assert.equal(memoQualityLabel(1080), "1080P");
+  assert.equal(memoQualityLabel(720), "720P");
+  assert.equal(memoQualityLabel(0), "");
+  assert.equal(memoSourceName(0), "MemoJav HLS");
+  assert.equal(memoSourceName(1080), "MemoJav 1080P");
+  assert.equal(memoSourceName(1080, "代理"), "MemoJav 代理 1080P");
+});
+
+test("memo display names always put a quality token right after MemoJav", async () => {
+  assert.equal(
+    mediaSourceDisplayNameForTests("MemoJav GetAV 原版 1080P"),
+    "MemoJav 1080P GetAV 原版",
+  );
+  assert.equal(
+    mediaSourceDisplayNameForTests("MemoJav Javtiful 720P"),
+    "MemoJav 720P Javtiful",
+  );
+  assert.equal(
+    mediaSourceDisplayNameForTests("MemoJav 代理 1080P"),
+    "MemoJav 代理 1080P",
+  );
+  // 上游元数据没有高度时也不能退化成“原画”或 “MemoJav GetAV 原版”。
+  assert.equal(
+    mediaSourceDisplayNameForTests("MemoJav GetAV 原版"),
+    "MemoJav HLS GetAV 原版",
+  );
+  assert.equal(
+    mediaSourceDisplayNameForTests("MemoJav 原画"),
+    "MemoJav HLS",
+  );
+  assert.equal(
+    mediaSourceDisplayNameForTests("MemoJav 代理 原画"),
+    "MemoJav 代理 HLS",
+  );
+  // 已经是合规格式时不得重复插入清晰度。
+  assert.equal(mediaSourceDisplayNameForTests("MemoJav 1080P"), "MemoJav 1080P");
+  assert.equal(mediaSourceDisplayNameForTests("MemoJav HLS"), "MemoJav HLS");
+});
+
+test("memo reads real resolution from the fMP4 init segment", async () => {
+  const init = memoInitMp4(1920, 1080);
+  assert.deepEqual(parseMp4TrackDimensions(init), { width: 1920, height: 1080 });
+
+  const upstreamUrl = "https://video10.memojav.net/stream/START-642/master.m3u8";
+  const media = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    '#EXT-X-MAP:URI="init.mp4"',
+    "#EXTINF:8.341667,",
+    "master0.m4s",
+  ].join("\n");
+  const probed = [];
+  const response = await handleProxy(
+    new Request("https://clone.example/memo/START-642?sources=1"),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("get_video_info.php")) return memoInfoResponse("hls", upstreamUrl);
+      if (target.endsWith("/stream/START-642/init.mp4")) {
+        probed.push(target);
+        return new Response(memoInitMp4(1920, 1080), {
+          status: 206,
+          headers: { "content-type": "video/mp4" },
+        });
+      }
+      return new Response(media, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    },
+  );
+
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(probed.length, 1);
+  assert.deepEqual(
+    payload.sources.map((source) => [source.id, source.height, source.name]),
+    [
+      ["hls", 1080, "MemoJav 1080P"],
+      ["hls-proxy", 1080, "MemoJav 代理 1080P"],
+    ],
+  );
+});
+
+test("playback info waits for MemoJav when the resolver returns a single line", async () => {
+  const number = "MIDA-797";
+  const publicUrl = "https://fast-stream.jav.si/mida-797/single.mp4";
+  const memoUrl = "https://video10.memojav.net/stream/MIDA-797/master.m3u8";
+  const media = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    '#EXT-X-MAP:URI="init.mp4"',
+    "#EXTINF:8.341667,",
+    "master0.m4s",
+  ].join("\n");
+  let memoCalls = 0;
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    if (target.includes("/v4/movies/77")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: { movie: { id: 77, number, title: `${number} Single Line` } },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target.includes("/api/v/resolve") || target.includes("/api/resolve")) {
+      return new Response(
+        JSON.stringify({
+          variants: [{
+            variant: "getav_raw_1080p",
+            label: "原版 1080P (GetAV)",
+            sourceUrl: publicUrl,
+            sourceType: "video/mp4",
+            quality: 1080,
+          }],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target === `https://javtiful.com/zh/search?q=${number}`) {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target.includes("getav.net") || target.includes("r.jina.ai")) {
+      return new Response("<html><title>Not found</title></html>", {
+        status: 404,
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (target.startsWith("https://memojav.org/hls/get_video_info.php")) {
+      memoCalls += 1;
+      // 冷缓存解析约 600ms；旧的 200ms 预算会直接丢掉这条链路。
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      return memoInfoResponse("hls", memoUrl);
+    }
+    if (target.endsWith("/stream/MIDA-797/init.mp4")) {
+      return new Response(memoInitMp4(1920, 1080), {
+        status: 206,
+        headers: { "content-type": "video/mp4" },
+      });
+    }
+    if (target === memoUrl) {
+      return new Response(media, {
+        headers: { "content-type": "application/vnd.apple.mpegurl" },
+      });
+    }
+    if (target === publicUrl) {
+      return new Response(new Uint8Array([0, 0, 0, 32]), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp4",
+        },
+      });
+    }
+    if (target.includes(`/api/subtitle?name=${number}`)) {
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const startedAt = Date.now();
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/77/PlaybackInfo", { method: "POST" }),
+    { RESOLVER_MERGE_BUDGET_MS: 30, SELF_HOSTED_MERGE_BUDGET_MS: 30 },
+    {},
+    fetchImpl,
+  );
+  const elapsedMs = Date.now() - startedAt;
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(memoCalls, 1);
+  assert.ok(elapsedMs >= 550, `PlaybackInfo returned too early at ${elapsedMs}ms`);
+  assert.ok(payload.MediaSources.length >= 3, `expected >=3 sources, got ${payload.MediaSources.length}`);
+  const names = payload.MediaSources.map((source) => String(source.Name || ""));
+  assert.ok(names.some((name) => name.includes("MemoJav 1080P")), names.join(" | "));
+  assert.ok(names.includes("MemoJav 代理 1080P"), names.join(" | "));
 });
 
 test("memo sources endpoint can omit the optional proxy fallback", async () => {

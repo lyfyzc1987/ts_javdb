@@ -24,7 +24,7 @@
 
 export const MEMOJAV_ROUTE_PREFIX = "/memo/";
 
-export const MEMOJAV_BUILD_ID = "2026-10-12-memojav-multisource-4";
+export const MEMOJAV_BUILD_ID = "2026-10-23-memojav-quality-labels-5";
 
 // 上游媒体域名。video10 是 2026-09 实测唯一可用的域名；其余留作候选，
 // 按顺序探测，命中第一个真正返回 HLS 清单的域名。
@@ -255,15 +255,140 @@ function hostFromUrl(raw) {
 function hlsSource(url, checkedAt) {
   return {
     id: "hls",
-    // 上游这条清单本身不带清晰度（单码率媒体清单），叫“原画”比“HLS”直观，
-    // 也不谎报 1080P / 720P。
-    name: "MemoJav 原画",
+    // 上游这条清单本身不带清晰度（单码率媒体清单）。名称先留中性标签，
+    // 由 expandHlsVariants 探测真实分辨率后改成 “MemoJav 1080P” 这种格式；
+    // 探测失败时也不会出现用户明确否掉的“原画”字样。
+    name: memoSourceName(0),
     kind: "hls",
     container: "m3u8",
     height: 0,
     url,
     checkedAt,
   };
+}
+
+// 清晰度标签：把探测到的真实高度换成客户端列表里的常见写法。
+// 2160 → 4K、1440 → 2K，其余按 1080P / 720P / 480P / 360P / 240P 归档。
+const MEMO_QUALITY_TIERS = [
+  { height: 2160, label: "4K" },
+  { height: 1440, label: "2K" },
+  { height: 1080, label: "1080P" },
+  { height: 720, label: "720P" },
+  { height: 480, label: "480P" },
+  { height: 360, label: "360P" },
+  { height: 240, label: "240P" },
+];
+
+export function memoQualityLabel(height) {
+  const value = Number(height) || 0;
+  if (value <= 0) return "";
+  let best = null;
+  let bestDiff = Number.POSITIVE_INFINITY;
+  for (const tier of MEMO_QUALITY_TIERS) {
+    const diff = Math.abs(value - tier.height);
+    if (diff < bestDiff) {
+      best = tier;
+      bestDiff = diff;
+    }
+  }
+  if (best && bestDiff <= 200) return best.label;
+  return `${Math.round(value)}P`;
+}
+
+/** “MemoJav + 清晰度”。高度未知时退化成 “MemoJav HLS”，不再使用“原画”。 */
+export function memoSourceName(height, extra = "") {
+  const quality = memoQualityLabel(height);
+  const suffix = String(extra || "").trim();
+  if (quality && suffix) return `MemoJav ${suffix} ${quality}`;
+  if (quality) return `MemoJav ${quality}`;
+  if (suffix) return `MemoJav ${suffix}`;
+  return "MemoJav HLS";
+}
+
+// 从 fMP4 的 init 段（moov/trak/tkhd）里读出真实分辨率。
+// 上游 HLS 只有一条单码率清单，但媒体是真的 1080P/720P：
+// 读 tkhd 的 width/height（16.16 定点）即可，不必下载整个视频。
+export function parseMp4TrackDimensions(bytes) {
+  const buffer = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  if (buffer.length < 16) return null;
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  const readUint32 = (offset) => (offset + 4 <= buffer.length ? view.getUint32(offset) : 0);
+  const walk = (start, end, depth) => {
+    let offset = start;
+    while (offset + 8 <= end && depth <= 6) {
+      const size = readUint32(offset);
+      const type = String.fromCharCode(
+        buffer[offset + 4],
+        buffer[offset + 5],
+        buffer[offset + 6],
+        buffer[offset + 7],
+      );
+      let headerSize = 8;
+      let boxSize = size;
+      if (size === 1) {
+        // 64 位 largesize
+        if (offset + 16 > end) return null;
+        const high = readUint32(offset + 8);
+        const low = readUint32(offset + 12);
+        boxSize = high * 4294967296 + low;
+        headerSize = 16;
+      } else if (size === 0) {
+        boxSize = end - offset;
+      }
+      if (boxSize < headerSize || offset + boxSize > end) return null;
+      if (type === "tkhd") {
+        const version = buffer[offset + 8];
+        // v0：ver/flags 4 + 时间/ID 20 + reserved 8 + layer/…8 + matrix 36 → width
+        // v1：creation/modification/duration 各 8 字节，整体多 12 字节。
+        const widthOffset = offset + headerSize + (version === 1 ? 88 : 76);
+        if (widthOffset + 8 > offset + boxSize) return null;
+        const width = Math.round(readUint32(widthOffset) / 65536);
+        const height = Math.round(readUint32(widthOffset + 4) / 65536);
+        if (width > 0 && height > 0) return { width, height };
+      }
+      if (type === "moov" || type === "trak" || type === "mdia") {
+        const found = walk(offset + headerSize, offset + boxSize, depth + 1);
+        if (found) return found;
+      }
+      offset += boxSize;
+    }
+    return null;
+  };
+  return walk(0, buffer.length, 0);
+}
+
+const HLS_INIT_PROBE_MAX_BYTES = 262144;
+
+/** 从单码率 HLS 清单里找出 init 段（#EXT-X-MAP）地址。 */
+export function parseHlsInitUri(manifestText, baseUrl) {
+  const match = /#EXT-X-MAP:[^\n\r]*URI="([^"]+)"/i.exec(String(manifestText || ""));
+  if (!match) return "";
+  try {
+    return new URL(match[1], baseUrl).href;
+  } catch {
+    return "";
+  }
+}
+
+async function probeHlsHeight(manifestText, baseUrl, fetchImpl) {
+  const initUrl = parseHlsInitUri(manifestText, baseUrl);
+  if (!initUrl) return 0;
+  try {
+    const response = await fetchImpl(initUrl, {
+      method: "GET",
+      headers: {
+        "user-agent": BROWSER_UA,
+        accept: "*/*",
+        range: `bytes=0-${HLS_INIT_PROBE_MAX_BYTES - 1}`,
+      },
+    });
+    if (!response.ok && response.status !== 206) return 0;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const dimensions = parseMp4TrackDimensions(bytes);
+    return dimensions ? dimensions.height : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function mp4Sources(baseUrl, checkedAt) {
@@ -345,7 +470,16 @@ async function expandHlsVariants(info, fetchImpl, prefetchedText = "") {
     }
   }
   const variants = parseHlsVariantSources(text, base, info.checkedAt);
-  if (!variants.length) return info;
+  if (!variants.length) {
+    // 单码率媒体清单：没有 STREAM-INF，但 init 段里有真实分辨率。
+    // 探测成功就把 “MemoJav 原画” 换成 “MemoJav 1080P” 这类带清晰度的名称。
+    const height = await probeHlsHeight(text, base, fetchImpl);
+    if (height > 0) {
+      info.sources[0].height = height;
+      info.sources[0].name = memoSourceName(height);
+    }
+    return info;
+  }
   const byHeight = new Map();
   for (const variant of variants) {
     if (!variant.height || variant.height < 144) continue;
@@ -355,12 +489,18 @@ async function expandHlsVariants(info, fetchImpl, prefetchedText = "") {
     }
   }
   const heights = [...byHeight.keys()].sort((left, right) => right - left);
-  if (heights.length < 2) return info;
+  if (!heights.length) return info;
+  // 只有一条变体时也把真实清晰度写进名称，而不是退回“原画”。
+  if (heights.length === 1) {
+    info.sources[0].height = heights[0];
+    info.sources[0].name = memoSourceName(heights[0]);
+    return info;
+  }
   info.sources = heights.map((height) => {
     const variant = byHeight.get(height);
     return {
       id: `hls-${height}`,
-      name: `MemoJav ${height}P`,
+      name: memoSourceName(height),
       kind: "hls",
       container: "m3u8",
       height,
@@ -420,7 +560,7 @@ function addProxyFallback(info, env) {
   const primary = info.sources.find((source) => source.id === "hls") || info.sources[0];
   info.sources.push({
     id: "hls-proxy",
-    name: "MemoJav 代理",
+    name: memoSourceName(primary.height || 0, "代理"),
     kind: "hls",
     container: "m3u8",
     height: primary.height || 0,

@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-23-memo-only-fallback-107";
+const SERVER_BUILD_ID = "2026-10-23-late-snapshot-113";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -9935,6 +9935,15 @@ function itemJsonResponse(item, request, options = {}) {
     expires: "0",
     pragma: "no-cache",
   };
+  // 诊断用：把详情页各阶段耗时放在响应头里。线上排查“首屏几个播放源、为什么
+  // 慢、是不是被 MemoJav 兜底拖长”时不必再开 RESOLVE_DEBUG 重放日志。
+  // 只暴露毫秒数，不含任何上游地址或凭证，客户端/播放器会忽略这个头。
+  if (options.timing && typeof options.timing === "object") {
+    const parts = Object.entries(options.timing)
+      .filter(([, ms]) => Number.isFinite(Number(ms)))
+      .map(([name, ms]) => `${name};dur=${Math.max(0, Math.round(Number(ms)))}`);
+    if (parts.length) headers["server-timing"] = parts.join(", ");
+  }
   // refreshSources 时绝不回 304：Emby 客户端把整份 DTO 存在本地库里，
   // 304 会让它继续用“没有播放源、没有播放按钮”或“上一次部署时的旧详情页”。
   // 始终回 200 + 变化的 ETag，客户端才会在重新进入详情页时替换成最新内容。
@@ -13109,6 +13118,40 @@ async function peekPartialResolvedVideo(movie, env) {
   return null;
 }
 
+// 首屏“只出现一条视频源”的根因是解析预算刚耗尽时，快照里往往只有第一条
+// 真实线路，其余清晰度/来源还在后台补齐。这里在预算之后做一次很短的有界
+// 轮询（默认 1.2 秒），拿到 ≥2 条就立刻返回；到点仍只有一条也返回那一条，
+// 绝不让调用方退回占位源。轮询期间解析链本身仍在跑，属于纯等待，不产生
+// 新的上游请求。
+const LATE_SNAPSHOT_WAIT_MS = 1200;
+const LATE_SNAPSHOT_POLL_MS = 180;
+
+async function awaitLateResolvedVideo(
+  movie,
+  env,
+  waitMs = LATE_SNAPSHOT_WAIT_MS,
+) {
+  let best = await peekPartialResolvedVideo(movie, env).catch(() => null);
+  const budget = Math.max(0, Number(waitMs) || 0);
+  // 按次数而不是按 Date.now 计时：测试会把 Date.now 冻结成常量，
+  // 用时间差做循环条件会变成死循环。
+  const attempts = Math.floor(budget / LATE_SNAPSHOT_POLL_MS);
+  for (let i = 0; i < attempts; i += 1) {
+    if (isUsableResolvedVideo(best) && resolvedVideoSourceCount(best) >= 2) {
+      return best;
+    }
+    await new Promise((resolve) => setTimeout(resolve, LATE_SNAPSHOT_POLL_MS));
+    const next = await peekPartialResolvedVideo(movie, env).catch(() => null);
+    if (
+      isUsableResolvedVideo(next) &&
+      (!isUsableResolvedVideo(best) ||
+        resolvedVideoSourceCount(next) > resolvedVideoSourceCount(best))
+    ) {
+      best = next;
+    }
+  }
+  return best;
+}
 // 把“解析到一半”的公共线路快照写到边缘缓存，让跨 isolate / 跨 PoP 的后续
 // 请求也能立刻看到真实线路。
 // 刻意只写边缘、不写 D1：长期持久层（video-persist-v1）的键里不含
@@ -14310,7 +14353,49 @@ function mediaSourceDisplayName(value, fallback) {
       .replace(/\s{2,}/g, " ")
       .trim(),
   );
-  return clean(value) || clean(fallback) || "自动线路";
+  const name = clean(value) || clean(fallback) || "自动线路";
+  // MemoJav 前缀是“取流方式”（302/代理），后面的 GetAV / 服务器GG 才是真实来源。
+  // 显示顺序统一成「MemoJav 清晰度」在前、「来源」在后：
+  //   MemoJav GetAV 原版 1080P → MemoJav 1080P GetAV 原版
+  // 带“代理”的条目保留在清晰度后面，避免把代理和上游来源混成一个名字。
+  //
+  // 注意“代理”必须先剥离再用正则匹配清晰度：否则 `. +?` 会把“代理”当成来源，
+  // 生成 “MemoJav 1080P 代理” 这种顺序错误的名字。
+  const memoRest = /^MemoJav\s+(.+)$/i.exec(name);
+  if (!memoRest) return name;
+  let rest = memoRest[1].trim();
+  let proxy = "";
+  if (/^代理(?:\s+|$)/i.test(rest)) {
+    proxy = "代理 ";
+    rest = rest.replace(/^代理\s*/i, "").trim();
+  }
+  // 已经是「清晰度在前」的格式（MemoJav 1080P / MemoJav 代理 4K）直接返回，
+  // 避免二次处理变成 “MemoJav HLS 1080P”。
+  if (/^(?:4K|2K|\d{3,4}P)(?:\s|$)/i.test(rest)) {
+    return `MemoJav ${proxy}${rest}`.replace(/\s{2,}/g, " ").trim();
+  }
+  const memoMatch = /^(.+?)\s+((?:4K|2K|\d{3,4}P))(\s+.*)?$/i.exec(rest);
+  if (memoMatch) {
+    const provider = memoMatch[1].trim();
+    const quality = memoMatch[2].toUpperCase();
+    const tail = String(memoMatch[3] || "").trim();
+    const details = tail
+      ? tail.replace(/\b(?:4K|2K|\d{3,4}P)\b/gi, "").replace(/\s{2,}/g, " ").trim()
+      : "";
+    return `MemoJav ${proxy}${quality} ${provider}${details ? ` ${details}` : ""}`
+      .replace(/\s{2,}/g, " ")
+      .trim();
+  }
+  // 少数 GetAV 线路的上游元数据没有高度。仍然保留“MemoJav + 清晰度字段”
+  // 的固定顺序，用 HLS 表示自适应清晰度，避免退化成 “MemoJav GetAV 原版”
+  // 或用户明确否掉的 “MemoJav 原画”。
+  if (!rest || /^HLS(?:\s|$)/i.test(rest)) {
+    return `MemoJav ${proxy}${rest}`.replace(/\s{2,}/g, " ").trim();
+  }
+  rest = rest.replace(/^原画(?:\s*·\s*\d+)?$/i, "").trim();
+  return `MemoJav ${proxy}HLS${rest ? ` ${rest}` : ""}`
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function mediaSource(
@@ -14771,7 +14856,22 @@ const MEMOJAV_EMBY_BACKGROUND_GRACE_MS = 4000;
 // 直接返回“自动线路”占位源，客户端详情页就只剩一个播放源（用户反馈
 // “客户端只显示一个播放源 / MemoJav 只有一个源”）。冷缓存解析约 1~2 秒，
 // 这里给一份独立预算；超时就仍旧退回占位线路，不影响首屏速度。
-const MEMOJAV_ONLY_FALLBACK_BUDGET_MS = 2500;
+// 实测冷缓存一次完整 MemoJav 解析（get_video_info + 清单 + init 段探测清晰度）
+// 约 1.0~2.7 秒，主要是 memojav.org 自身 1.2 秒左右的响应时间，
+// 因此预算给到 4 秒：既不会拖过客户端 10 秒超时，也不会在冷缓存时丢线路。
+const MEMOJAV_ONLY_FALLBACK_BUDGET_MS = 4000;
+
+// 公共解析器这一轮只给出一条线路时，200ms 的 MemoJav 同步窗口几乎必然
+// 拿不到冷缓存结果，详情页就只剩一条源（用户反馈“有些资源没有加载出多
+// 视频源”）。这种情况下放宽到和“零线路兜底”同一份预算：多等一次冷解析，
+// 换来 MemoJav 的 2~3 条真实线路。已经有多条线路时仍走 200ms，不拖慢首屏。
+function memoResolveBudgetMs(video, requestDeadline) {
+  const variantCount = playbackVariants(video).length;
+  const budget = variantCount >= 2
+    ? MEMOJAV_EMBY_RESOLVE_BUDGET_MS
+    : MEMOJAV_ONLY_FALLBACK_BUDGET_MS;
+  return Math.min(budget, remainingRequestMs(requestDeadline, budget));
+}
 
 function memoLookupCode(movie) {
   const code = movieResolveCode(movie);
@@ -14863,7 +14963,27 @@ async function mediaSourcesForMovie(
   memo = {},
   clientUserAgent = "",
 ) {
-  const variants = playbackVariants(video);
+  // 首屏只解析出一条线路时，后台往往已经把更多线路写进了中途快照。
+  // 这里纯读缓存（不等待、不重试）：快照线路更多就直接用快照，
+  // 避免出现“第一次进详情页一条、退出再进才多条”。
+  let sourceVideo = video;
+  if (memo && memo.env) {
+    const currentCount = playbackVariants(sourceVideo).length;
+    if (currentCount < 2) {
+      const snapshot = await peekPartialResolvedVideo(
+        movie || item.movie || item,
+        memo.env,
+      ).catch(() => null);
+      if (
+        isUsableResolvedVideo(snapshot) &&
+        resolvedVideoSourceCount(snapshot) >= 2 &&
+        resolvedVideoSourceCount(snapshot) > currentCount
+      ) {
+        sourceVideo = snapshot;
+      }
+    }
+  }
+  const variants = playbackVariants(sourceVideo);
   const mediaSourceIds = mediaSourceIdsForVariants(item.Id, variants);
   const sources = variants.map((variant, index) =>
     mediaSource(
@@ -14894,7 +15014,7 @@ async function mediaSourcesForMovie(
     item,
     requestUrl,
     token,
-    video,
+    sourceVideo,
     subtitles,
     movie,
     memoInfo,
@@ -15384,7 +15504,12 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
       await readPlaybackState(env, token),
     ));
   }
-  const requestDeadline = Date.now() + ITEM_REQUEST_DEADLINE_MS;
+  const requestStartedAt = Date.now();
+  const requestDeadline = requestStartedAt + ITEM_REQUEST_DEADLINE_MS;
+  const timing = {};
+  const markTiming = (name) => {
+    timing[name] = Date.now() - requestStartedAt;
+  };
   // 播放记录、元数据、字幕和播放源互不依赖：从请求一开始全部并行。旧顺序在
   // 取到元数据后先 await D1，再启动播放源解析，慢几十到几百毫秒就会把公共
   // 解析器冷启动窗口挤到截止线外，首次详情只剩一条占位源。
@@ -15406,6 +15531,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     return errorResponse(404, "Movie not found");
   }
 
+  markTiming("meta");
   const item = mapMovie(movie, request.url, env);
 
   // 详情页不应被“解析播放源/字幕”这类慢请求拖住：解析服务首次冷启动时
@@ -15441,6 +15567,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     ),
   );
   video = videoResolution.video;
+  markTiming("video");
   const subtitleWaitMs = Math.min(
     ITEM_DETAIL_SUBTITLE_WAIT_MS,
     remainingRequestMs(requestDeadline, ITEM_DETAIL_SUBTITLE_WAIT_MS),
@@ -15451,6 +15578,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   if (!Array.isArray(subtitles)) {
     subtitles = await peekCachedSubtitles(movie, env);
   }
+  markTiming("subs");
   if (!subtitleResolution.record.done) {
     // 有界登记：字幕链路最坏要等上游聚合，不能让它把实例挂到 waitUntil 上限。
     keepAliveBounded(subtitleResolution.tracked, ctx, BACKGROUND_SUBTITLE_GRACE_MS);
@@ -15466,6 +15594,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
     item,
     playbackState && typeof playbackState === "object" ? playbackState : {},
   );
+  markTiming("state");
 
   const playbackToken = token || (guestAccessEnabled(env) ? guestToken(env) : "");
   const requestUserAgent = clientUserAgent(request);
@@ -15497,7 +15626,16 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
       ctx,
       memoResolution,
     );
-    const memoFallbackSources = memoJavMediaSources(
+    markTiming("memo");
+    // 上面的 MemoJav 兜底（最多几秒）正好给后台解析链留出了补齐时间：
+    // resolveVideoForResponse 的预算耗尽时只代表“这一次没等到”，解析链仍在
+    // keepAliveBounded 里继续跑，此刻往往已经把公共批次的多条真实线路写进
+    // 中途快照。这里再读一次快照（纯缓存读，不做 HLS 校验），能拿到就直接走
+    // 下面的真实多线路分支——否则首屏会退回一条「自动线路」，用户要退出详情页
+    // 再点一次才看到多视频源。
+    // MemoJav 已经有真实线路时不做额外轮询（这一屏本来就有源），
+    // 只有“什么源都没有”的冷门番号才多等一会儿，尽量凑出第二条。
+    const preMemoSources = memoJavMediaSources(
       item,
       request.url,
       playbackToken,
@@ -15506,33 +15644,51 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
       movie,
       memoFallbackInfo,
     );
-    if (memoFallbackSources.length) {
-      const memoSource = memoFallbackSources[0];
-      item.MediaSources = memoFallbackSources;
-      item.MediaStreams = memoSource.MediaStreams;
-      item.MediaSourceCount = memoFallbackSources.length;
-      item.Container = memoSource.Container;
-      item.Path = memoSource.Path;
-      item.HasSubtitles = subtitles.length > 0;
-      refreshDetailBackdropTags(item, movie);
-      return itemJsonResponse(item, request, { refreshSources: true });
-    }
-    const sources = pendingMediaSources(
-      item,
-      request.url,
-      playbackToken,
-      subtitles,
-      requestUserAgent,
+    const lateSnapshot = await awaitLateResolvedVideo(
+      movie,
+      env,
+      preMemoSources.length ? 0 : LATE_SNAPSHOT_WAIT_MS,
     );
-    item.MediaSources = sources;
-    item.MediaStreams = sources[0].MediaStreams;
-    item.MediaSourceCount = sources.length;
-    item.Container = sources[0].Container;
-    item.Path = sources[0].Path;
-    item.HasSubtitles = subtitles.length > 0;
-    // 艺术图同样按 20 秒时间桶换 tag，客户端重进详情页时会重新取图。
-    refreshDetailBackdropTags(item, movie);
-    return itemJsonResponse(item, request, { pendingSources: true });
+    if (
+      isUsableResolvedVideo(lateSnapshot) &&
+      resolvedVideoSourceCount(lateSnapshot) >= 2
+    ) {
+      video = lateSnapshot;
+    } else {
+      const memoFallbackSources = preMemoSources;
+      if (memoFallbackSources.length) {
+        const memoSource = memoFallbackSources[0];
+        item.MediaSources = memoFallbackSources;
+        item.MediaStreams = memoSource.MediaStreams;
+        item.MediaSourceCount = memoFallbackSources.length;
+        item.Container = memoSource.Container;
+        item.Path = memoSource.Path;
+        item.HasSubtitles = subtitles.length > 0;
+        refreshDetailBackdropTags(item, movie);
+        return itemJsonResponse(item, request, { refreshSources: true, timing });
+      }
+      // 中途快照里只有 1 条线路时不能直接用：那一份是未校验的半成品，
+      // 可能是 .image 伪 m3u8、字体段或已过期签名（详情页会给出永远播不了的
+      // 按钮）。至少 2 条才采用，否则仍回按需线路，播放时现场解析真实地址。
+      {
+        const sources = pendingMediaSources(
+          item,
+          request.url,
+          playbackToken,
+          subtitles,
+          requestUserAgent,
+        );
+        item.MediaSources = sources;
+        item.MediaStreams = sources[0].MediaStreams;
+        item.MediaSourceCount = sources.length;
+        item.Container = sources[0].Container;
+        item.Path = sources[0].Path;
+        item.HasSubtitles = subtitles.length > 0;
+        // 艺术图同样按 20 秒时间桶换 tag，客户端重进详情页时会重新取图。
+        refreshDetailBackdropTags(item, movie);
+        return itemJsonResponse(item, request, { pendingSources: true, timing });
+      }
+    }
   }
   const mediaSources = await mediaSourcesForMovie(
     item,
@@ -15545,10 +15701,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
       env,
       fetchImpl,
       ctx,
-      budgetMs: Math.min(
-        MEMOJAV_EMBY_RESOLVE_BUDGET_MS,
-        remainingRequestMs(requestDeadline, MEMOJAV_EMBY_RESOLVE_BUDGET_MS),
-      ),
+      budgetMs: memoResolveBudgetMs(video, requestDeadline),
       resolution: memoResolution,
     },
     requestUserAgent,
@@ -15563,7 +15716,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   // 详情页每 20 秒允许客户端刷新一次：解析完成后重新进入能拿到最新线路、
   // 字幕轨和艺术图，而不是客户端本地库里那份上一次部署时的旧 DTO。
   refreshDetailBackdropTags(item, movie);
-  return itemJsonResponse(item, request, { refreshSources: true });
+  return itemJsonResponse(item, request, { refreshSources: true, timing });
 }
 
 function itemQuery(items, startIndex = 0) {
@@ -18877,7 +19030,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
           ),
         ),
       );
-      const video = videoResolution.video;
+      let video = videoResolution.video;
       const subtitleWaitMs = Math.min(
         PLAYBACK_INFO_SUBTITLE_WAIT_MS,
         remainingRequestMs(requestDeadline, PLAYBACK_INFO_SUBTITLE_WAIT_MS),
@@ -18916,7 +19069,10 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
           ctx,
           memoResolution,
         );
-        const memoFallbackSources = memoJavMediaSources(
+        // 与详情页一致：等待 MemoJav 兜底期间，后台解析链通常已经补出公共线路。
+        // 再读一次中途快照（纯缓存读），有真实线路就走下面的多线路分支，
+        // 不再退化成一条占位线路。
+        const preMemoSources = memoJavMediaSources(
           item,
           request.url,
           playbackToken,
@@ -18925,7 +19081,72 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
           movie,
           memoFallbackInfo,
         );
-        if (memoFallbackSources.length) {
+        const lateSnapshot = await awaitLateResolvedVideo(
+          movie,
+          env,
+          preMemoSources.length ? 0 : LATE_SNAPSHOT_WAIT_MS,
+        );
+        if (
+          isUsableResolvedVideo(lateSnapshot) &&
+          resolvedVideoSourceCount(lateSnapshot) >= 2
+        ) {
+          video = lateSnapshot;
+          // 继续走公共路径（下方 mediaSourcesForMovie 会合并 MemoJav），
+          // 用 IIFE 之外的普通流程无法直接跳出 if，这里单独返回。
+          const lateSources = await mediaSourcesForMovie(
+            item,
+            request.url,
+            playbackToken,
+            video,
+            subtitles,
+            movie,
+            {
+              env,
+              fetchImpl,
+              ctx,
+              budgetMs: memoResolveBudgetMs(video, requestDeadline),
+              resolution: memoResolution,
+            },
+            requestUserAgent,
+          );
+          const lateSessionId = crypto.randomUUID();
+          rememberPlaySession(
+            await playbackStateKey(env, playbackToken),
+            item.Id,
+            lateSessionId,
+          );
+          if (lateSources.length) {
+            return jsonResponse({
+              PlaySessionId: lateSessionId,
+              ItemId: item.Id,
+              MediaSources: lateSources,
+              MediaSourceCount: lateSources.length,
+            });
+          }
+        }
+        {
+          const memoFallbackSources = preMemoSources;
+          if (memoFallbackSources.length) {
+            const playSessionId = crypto.randomUUID();
+            rememberPlaySession(
+              await playbackStateKey(env, playbackToken),
+              item.Id,
+              playSessionId,
+            );
+            return jsonResponse({
+              PlaySessionId: playSessionId,
+              ItemId: item.Id,
+              MediaSources: memoFallbackSources,
+              MediaSourceCount: memoFallbackSources.length,
+            });
+          }
+          const sources = pendingMediaSources(
+            item,
+            request.url,
+            playbackToken,
+            subtitles,
+            requestUserAgent,
+          );
           const playSessionId = crypto.randomUUID();
           rememberPlaySession(
             await playbackStateKey(env, playbackToken),
@@ -18935,29 +19156,10 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
           return jsonResponse({
             PlaySessionId: playSessionId,
             ItemId: item.Id,
-            MediaSources: memoFallbackSources,
-            MediaSourceCount: memoFallbackSources.length,
+            MediaSources: sources,
+            MediaSourceCount: sources.length,
           });
         }
-        const sources = pendingMediaSources(
-          item,
-          request.url,
-          playbackToken,
-          subtitles,
-          requestUserAgent,
-        );
-        const playSessionId = crypto.randomUUID();
-        rememberPlaySession(
-          await playbackStateKey(env, playbackToken),
-          item.Id,
-          playSessionId,
-        );
-        return jsonResponse({
-          PlaySessionId: playSessionId,
-          ItemId: item.Id,
-          MediaSources: sources,
-          MediaSourceCount: sources.length,
-        });
       }
       const mediaSources = await mediaSourcesForMovie(
         item,
@@ -18970,10 +19172,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
           env,
           fetchImpl,
           ctx,
-          budgetMs: Math.min(
-            MEMOJAV_EMBY_RESOLVE_BUDGET_MS,
-            remainingRequestMs(requestDeadline, MEMOJAV_EMBY_RESOLVE_BUDGET_MS),
-          ),
+          budgetMs: memoResolveBudgetMs(video, requestDeadline),
           resolution: memoResolution,
         },
         requestUserAgent,
@@ -19205,6 +19404,10 @@ export function mediaSourceIdsForVariantsForTests(itemId, variants) {
 
 export function selectedPlaybackVideoForTests(video, itemId, requestUrl) {
   return selectedPlaybackVideo(video, itemId, requestUrl);
+}
+
+export function mediaSourceDisplayNameForTests(value, fallback) {
+  return mediaSourceDisplayName(value, fallback);
 }
 
 export function resetEmbyCachesForTests() {
