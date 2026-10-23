@@ -159,8 +159,9 @@ test("scopes resolved-video caches to the Worker or Pages deployment", () => {
     PLAYBACK_DEPLOY_TAG: "pages",
   });
 
-  assert.match(workerKey, /sources-v61\|worker\|TEST-001$/);
-  assert.match(pagesKey, /sources-v61\|pages\|TEST-001$/);
+  // 版本号随“播放源结构变更”递增，这里只要求带上版本段，避免每次升级都要改测试。
+  assert.match(workerKey, /sources-v\d+\|worker\|TEST-001$/);
+  assert.match(pagesKey, /sources-v\d+\|pages\|TEST-001$/);
   assert.notEqual(workerKey, pagesKey);
 });
 
@@ -14711,7 +14712,7 @@ test("memo hls master with real quality variants expands into multiple sources",
       ["hls-2160", 2160, "MemoJav 4K"],
       ["hls-1080", 1080, "MemoJav 1080P"],
       ["hls-720", 720, "MemoJav 720P"],
-      ["hls-proxy", 2160, "MemoJav 代理 4K"],
+      ["hls-proxy", 2160, "MemoJav 代理"],
     ],
   );
   assert.equal(
@@ -14769,38 +14770,54 @@ test("memo quality labels use 4K/2K/P instead of 原画", async () => {
   assert.equal(memoQualityLabel(0), "");
   assert.equal(memoSourceName(0), "MemoJav HLS");
   assert.equal(memoSourceName(1080), "MemoJav 1080P");
-  assert.equal(memoSourceName(1080, "代理"), "MemoJav 代理 1080P");
+  assert.equal(memoSourceName(1440), "MemoJav 2K");
 });
 
 test("memo display names always put a quality token right after MemoJav", async () => {
   assert.equal(
-    mediaSourceDisplayNameForTests("MemoJav GetAV 原版 1080P"),
+    mediaSourceDisplayNameForTests("MemoJav GetAV 原版 1080P", "", { memoDirect: true }),
     "MemoJav 1080P GetAV 原版",
   );
   assert.equal(
-    mediaSourceDisplayNameForTests("MemoJav Javtiful 720P"),
+    mediaSourceDisplayNameForTests("MemoJav Javtiful 720P", "", { memoDirect: true }),
     "MemoJav 720P Javtiful",
   );
   assert.equal(
-    mediaSourceDisplayNameForTests("MemoJav 代理 1080P"),
-    "MemoJav 代理 1080P",
+    mediaSourceDisplayNameForTests("MemoJav 代理", "", { memoDirect: false }),
+    "MemoJav 代理",
   );
   // 上游元数据没有高度时也不能退化成“原画”或 “MemoJav GetAV 原版”。
   assert.equal(
-    mediaSourceDisplayNameForTests("MemoJav GetAV 原版"),
+    mediaSourceDisplayNameForTests("MemoJav GetAV 原版", "", { memoDirect: true }),
     "MemoJav HLS GetAV 原版",
   );
   assert.equal(
-    mediaSourceDisplayNameForTests("MemoJav 原画"),
+    mediaSourceDisplayNameForTests("MemoJav 原画", "", { memoDirect: true }),
     "MemoJav HLS",
   );
   assert.equal(
-    mediaSourceDisplayNameForTests("MemoJav 代理 原画"),
-    "MemoJav 代理 HLS",
+    mediaSourceDisplayNameForTests("MemoJav 代理 原画", "", { memoDirect: false }),
+    "MemoJav 代理 原画",
   );
   // 已经是合规格式时不得重复插入清晰度。
-  assert.equal(mediaSourceDisplayNameForTests("MemoJav 1080P"), "MemoJav 1080P");
-  assert.equal(mediaSourceDisplayNameForTests("MemoJav HLS"), "MemoJav HLS");
+  assert.equal(
+    mediaSourceDisplayNameForTests("MemoJav 1080P", "", { memoDirect: true }),
+    "MemoJav 1080P",
+  );
+  assert.equal(
+    mediaSourceDisplayNameForTests("MemoJav HLS", "", { memoDirect: true }),
+    "MemoJav HLS",
+  );
+  // 非 302 直连的线路一律原样返回，不能因为显示层被改成 MemoJav 命名。
+  for (const name of [
+    "原版",
+    "fcjav 原版",
+    "服务器GG 去码版",
+    "GetAV 原版 1080P",
+    "MemoJav 代理",
+  ]) {
+    assert.equal(mediaSourceDisplayNameForTests(name, "回退名"), name);
+  }
 });
 
 test("memo reads real resolution from the fMP4 init segment", async () => {
@@ -14843,7 +14860,7 @@ test("memo reads real resolution from the fMP4 init segment", async () => {
     payload.sources.map((source) => [source.id, source.height, source.name]),
     [
       ["hls", 1080, "MemoJav 1080P"],
-      ["hls-proxy", 1080, "MemoJav 代理 1080P"],
+      ["hls-proxy", 1080, "MemoJav 代理"],
     ],
   );
 });
@@ -14947,7 +14964,7 @@ test("playback info waits for MemoJav when the resolver returns a single line", 
   assert.ok(payload.MediaSources.length >= 3, `expected >=3 sources, got ${payload.MediaSources.length}`);
   const names = payload.MediaSources.map((source) => String(source.Name || ""));
   assert.ok(names.some((name) => name.includes("MemoJav 1080P")), names.join(" | "));
-  assert.ok(names.includes("MemoJav 代理 1080P"), names.join(" | "));
+  assert.ok(names.includes("MemoJav 代理"), names.join(" | "));
 });
 
 test("memo sources endpoint can omit the optional proxy fallback", async () => {

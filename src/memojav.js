@@ -560,7 +560,9 @@ function addProxyFallback(info, env) {
   const primary = info.sources.find((source) => source.id === "hls") || info.sources[0];
   info.sources.push({
     id: "hls-proxy",
-    name: memoSourceName(primary.height || 0, "代理"),
+    // 这一条不是 302 直连（清单和分片都要经本服务中转），名称保持原样，
+    // 不跟 302 线路一起改成「MemoJav 清晰度」。
+    name: "MemoJav 代理",
     kind: "hls",
     container: "m3u8",
     height: primary.height || 0,

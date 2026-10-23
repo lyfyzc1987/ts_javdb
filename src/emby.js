@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-23-late-snapshot-113";
+const SERVER_BUILD_ID = "2026-10-23-memo302-only-115";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -357,7 +357,7 @@ const REMOTE_MEDIA_VERDICT_PLAYABLE = "playable";
 const REMOTE_MEDIA_VERDICT_DEAD = "definitely-dead";
 const REMOTE_MEDIA_VERDICT_UNKNOWN = "unknown";
 // 修改播放源结构或解析回退逻辑后提升缓存版本，避免已经缓存成“只有一条”的旧结果继续命中。
-const RESOLVE_VIDEO_CACHE_VERSION = "sources-v61";
+const RESOLVE_VIDEO_CACHE_VERSION = "sources-v62";
 // 播放源缓存除了“解析已收尾”还必须记录生成它的解析能力。否则旧版本把
 // GetAV 的 720P/480P 漏掉后，只要结果带 resolveComplete 就会被新版本继续
 // 当成可信快照，部署新代码也无法自动恢复缺失线路。
@@ -14345,7 +14345,11 @@ function providerFirstSourceName(value) {
 
 // “解析中”是过渡状态，不应作为媒体信息显示。无论名称来自实时解析、旧缓存
 // 还是上游异常数据，都在 DTO 出口统一移除，保证客户端不会首屏看到该字样。
-function mediaSourceDisplayName(value, fallback) {
+//
+// 只有真正的 302 零流量线路（options.memoDirect）才重排成「MemoJav 清晰度 来源」；
+// 走本服务代理的线路（服务器GG / fcjav / javto 等，以及 MemoJav 代理兜底源）
+// 必须原样保留上游来源名，不能因为显示层改动而变成 MemoJav 命名。
+function mediaSourceDisplayName(value, fallback, options = {}) {
   const clean = (input) => providerFirstSourceName(
     String(input || "")
       .replace(/[（(]\s*解析中\s*[）)]/g, "")
@@ -14354,6 +14358,7 @@ function mediaSourceDisplayName(value, fallback) {
       .trim(),
   );
   const name = clean(value) || clean(fallback) || "自动线路";
+  if (!options.memoDirect) return name;
   // MemoJav 前缀是“取流方式”（302/代理），后面的 GetAV / 服务器GG 才是真实来源。
   // 显示顺序统一成「MemoJav 清晰度」在前、「来源」在后：
   //   MemoJav GetAV 原版 1080P → MemoJav 1080P GetAV 原版
@@ -14544,6 +14549,7 @@ function mediaSource(
         }`
         : providerPrefixedLabel(video.sourceName || video.title, video.variant),
       item.Name,
+      { memoDirect: isZeroTransferSource },
     ),
     Path: streamUrl.toString(),
     DirectStreamUrl: `${streamUrl.pathname}${streamUrl.search}`,
@@ -14737,7 +14743,15 @@ function memoJavMediaSources(
     return {
       Id: mediaSourceId,
       MediaSourceId: mediaSourceId,
-      Name: providerFirstSourceName(entry.name) || "MemoJav",
+      // 302 短链（/memo/<番号>）统一成「MemoJav 清晰度」；代理兜底源
+      // （?proxy=1，媒体经本服务中转）保持原样 “MemoJav 代理”，不做重排。
+      Name: entry.proxy
+        ? providerFirstSourceName(entry.name) || "MemoJav 代理"
+        : mediaSourceDisplayName(
+          providerFirstSourceName(entry.name) || "MemoJav",
+          "MemoJav",
+          { memoDirect: true },
+        ),
       Path: memoUrl.toString(),
       DirectStreamUrl: directUrl,
       Protocol: "Http",
@@ -19406,8 +19420,8 @@ export function selectedPlaybackVideoForTests(video, itemId, requestUrl) {
   return selectedPlaybackVideo(video, itemId, requestUrl);
 }
 
-export function mediaSourceDisplayNameForTests(value, fallback) {
-  return mediaSourceDisplayName(value, fallback);
+export function mediaSourceDisplayNameForTests(value, fallback, options = {}) {
+  return mediaSourceDisplayName(value, fallback, options);
 }
 
 export function resetEmbyCachesForTests() {
