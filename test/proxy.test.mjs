@@ -4736,6 +4736,111 @@ test("drops resolver sources marked metadata_invalid_reference", async () => {
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
 });
 
+test("names a single real resolver line instead of the pending placeholder", async () => {
+  const sourceUrl = "https://fast-stream.jav.si/video/jux-990-fcjav.mp4";
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const target = String(url);
+    calls.push(target);
+    if (target.includes("/v4/movies/42")) {
+      return new Response(
+        JSON.stringify({
+          success: 1,
+          data: {
+            movie: {
+              id: 42,
+              number: "JUX-990",
+              title: "JUX-990 Single Line",
+            },
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (
+      target.includes("/api/v/resolve?code=JUX-990") ||
+      target.includes("/api/resolve?code=JUX-990")
+    ) {
+      return new Response(
+        JSON.stringify({
+          variants: [{
+            variant: "fcjav_original",
+            label: "原版",
+            sourceUrl,
+            sourceType: "video/mp4",
+            quality: 720,
+          }],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    if (target === sourceUrl) {
+      assert.equal(init.headers.get("range"), "bytes=0-511");
+      return new Response(new Uint8Array([0, 0, 0, 32]), {
+        status: 206,
+        headers: {
+          "content-range": "bytes 0-3/4",
+          "content-type": "video/mp4",
+        },
+      });
+    }
+    if (
+      target.includes("javtiful.com") ||
+      target.includes("r.jina.ai") ||
+      target.includes("getav.net")
+    ) {
+      return new Response("<html>No matching video</html>", {
+        headers: { "content-type": "text/html" },
+      });
+    }
+    assert.match(target, /\/api\/subtitle\?name=JUX-990/);
+    return new Response(
+      JSON.stringify({ code: 0, data: [] }),
+      { headers: { "content-type": "application/json" } },
+    );
+  };
+  const env = {
+    ITEM_DETAIL_RESOLVE_BUDGET_MS: 1500,
+    PLAYBACK_INFO_RESOLVE_BUDGET_MS: 1500,
+    RESOLVER_MERGE_BUDGET_MS: 20,
+  };
+
+  const detail = await handleProxy(
+    new Request("https://clone.example/Items/42"),
+    env,
+    {},
+    fetchImpl,
+  );
+  const detailPayload = await detail.json();
+  assert.equal(detail.status, 200);
+  // 上游本来只有一条 fcjav 线路时，详情页必须用它自己的名称，不能退回
+  // “自动线路”占位源，也不能拿影片标题当播放源名。
+  assert.deepEqual(
+    detailPayload.MediaSources.map((source) => source.Name),
+    ["fcjav 原版"],
+  );
+  assert.equal(
+    new URL(detailPayload.MediaSources[0].Path).searchParams.get("source"),
+    sourceUrl,
+  );
+
+  resetEmbyCachesForTests();
+  const playback = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    env,
+    {},
+    fetchImpl,
+  );
+  const playbackPayload = await playback.json();
+  assert.equal(playback.status, 200);
+  assert.deepEqual(
+    playbackPayload.MediaSources.map((source) => source.Name),
+    ["fcjav 原版"],
+  );
+});
+
 test("keeps a valid root-relative resolver source while starting self-hosted supplements", async () => {
   const sourceUrl = `${UPSTREAM}/video/relative.mp4`;
   const calls = [];

@@ -197,7 +197,7 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-23-memo302-only-115";
+const SERVER_BUILD_ID = "2026-10-24-thin-source-117";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -12015,7 +12015,11 @@ async function resolveVideo(movie, env, fetchImpl, options = {}) {
   }
   // 同一条线路的清单/分片校验只在这一次解析里做一次。首屏、自建收尾和
   // 最终合并都会请求校验，重复探测在云端会直接放大 503/1102 压力。
-  const resolveValidationCache = new Map();
+  // 调用方（详情页 / PlaybackInfo）也会对“中途快照”做单线路校验，
+  // 复用同一份结果可以避免同一条线路在一次请求里被探测两次（503/1102 的主要来源）。
+  const resolveValidationCache = options.validationCache instanceof Map
+    ? options.validationCache
+    : new Map();
   const finalizeVideo = async (video) => {
     return validatedResolvedVideo(video, fetchImpl, env, resolveValidationCache);
   };
@@ -13152,6 +13156,40 @@ async function awaitLateResolvedVideo(
   }
   return best;
 }
+// 中途快照只有一条线路时，详情页/PlaybackInfo 过去会直接丢弃它退回
+// “自动线路”占位源——上游本来就只有一条线（如 fcjav 单片）的番号因此永远
+// 只显示一个假名称。这里对单线路快照做一次快速校验：通过就用真实名称，
+// 校验失败（伪 m3u8 / 过期签名）才退回占位源。
+const THIN_SNAPSHOT_VALIDATION_MS = 900;
+
+async function acceptThinResolvedVideo(
+  video,
+  fetchImpl,
+  env,
+  validationCache = null,
+) {
+  if (!isUsableResolvedVideo(video)) return null;
+  if (resolvedVideoSourceCount(video) >= 2) return video;
+  if (resolvedVideoCacheIsTrustworthy(video)) return video;
+  // 只做静态剔除（.image 伪 m3u8 / 字体段），这是同步、零成本的。
+  const staticallyPlayable = withoutDefinitelyFakeVariants(
+    dedupeGetavQualityVariants(video),
+  );
+  if (!isUsableResolvedVideo(staticallyPlayable)) return null;
+  try {
+    const validated = await withTimeout(
+      validatedResolvedVideo(staticallyPlayable, fetchImpl, env, validationCache),
+      THIN_SNAPSHOT_VALIDATION_MS,
+    );
+    // 校验跑完且明确把所有线路都剔掉了：这条源确实放不了，继续用占位源。
+    return isUsableResolvedVideo(validated) ? validated : null;
+  } catch {
+    // 校验超时 / 探测异常（不是“源无效”的证据）：静态检查已通过，
+    // 继续用这条真实线路，别让详情页退回“自动线路”；真播不了时
+    // 取流接口会现场重解析。
+    return staticallyPlayable;
+  }
+}
 // 把“解析到一半”的公共线路快照写到边缘缓存，让跨 isolate / 跨 PoP 的后续
 // 请求也能立刻看到真实线路。
 // 刻意只写边缘、不写 D1：长期持久层（video-persist-v1）的键里不含
@@ -13682,9 +13720,16 @@ async function resolveVideoForResponse(
   fetchImpl,
   ctx,
   budgetMs,
+  probeState = null,
 ) {
   const totalBudgetMs = Math.max(0, Number(budgetMs) || 0);
   const startedAt = Date.now();
+  // 本次请求共用的线路校验结果：resolveVideo 的正式校验与后面的
+  // “单线路中途快照”兜底校验共享，避免同一条线路被探测两次。
+  const requestValidationCache = new Map();
+  if (probeState && typeof probeState === "object") {
+    probeState.validationCache = requestValidationCache;
+  }
   const remainingBudgetMs = () => Math.max(
     0,
     totalBudgetMs - (Date.now() - startedAt),
@@ -13894,6 +13939,7 @@ async function resolveVideoForResponse(
     armPartialTimer();
   };
   const resolveTask = resolveVideoCached(movie, env, fetchImpl, ctx, {
+    validationCache: requestValidationCache,
     onPartial: (video, meta) => {
       partial.video = video;
       armPartialWindow(resolvedVideoSourceCount(video), meta?.major === true);
@@ -15006,8 +15052,15 @@ async function mediaSourcesForMovie(
       token,
       {
         ...variant,
+        // 单线路时上游不给 sourceName，旧代码会退回影片标题（客户端显示成
+        // “fcjav JUX-990 地方在住人妻…”）。有线路标签、或 variant 属于
+        // 已知提供方（fcjav）时用线路自己的名称；GetAV 这类没有标签的
+        // 内部变体仍退回标题，避免客户端出现 “getav_raw_4k” 这种原始串。
         sourceName: variant.sourceName ||
-          (variants.length > 1 ? videoVariantLabel(variant, index, variants.length) : ""),
+          (String(variant.label || "").trim() ||
+              providerNameFromVariant(variant.variant)
+            ? videoVariantLabel(variant, index, variants.length)
+            : ""),
       },
       subtitles,
       mediaSourceIds[index],
@@ -15566,6 +15619,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
   );
   // MemoJav 查询与播放源解析并行启动（结果在下方按预算取用）。
   const memoResolution = startMemoResolution(movie, env, fetchImpl, ctx);
+  const detailProbeState = {};
   const videoResolution = await resolveVideoForResponse(
     movie,
     env,
@@ -15579,6 +15633,7 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
         ITEM_DETAIL_RESOLVE_BUDGET_MS,
       ),
     ),
+    detailProbeState,
   );
   video = videoResolution.video;
   markTiming("video");
@@ -15663,11 +15718,16 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
       env,
       preMemoSources.length ? 0 : LATE_SNAPSHOT_WAIT_MS,
     );
-    if (
-      isUsableResolvedVideo(lateSnapshot) &&
-      resolvedVideoSourceCount(lateSnapshot) >= 2
-    ) {
-      video = lateSnapshot;
+    // 单线路快照也要收下：它和 MemoJav 的 302 线路是互补的，丢掉会让
+    // 详情页只剩一个播放源。校验失败才退回 MemoJav / 占位源。
+    const thinVideo = await acceptThinResolvedVideo(
+      lateSnapshot,
+      fetchImpl,
+      env,
+      detailProbeState.validationCache,
+    );
+    if (thinVideo) {
+      video = thinVideo;
     } else {
       const memoFallbackSources = preMemoSources;
       if (memoFallbackSources.length) {
@@ -15681,27 +15741,22 @@ async function itemResponse(id, request, env, fetchImpl, token, ctx = null) {
         refreshDetailBackdropTags(item, movie);
         return itemJsonResponse(item, request, { refreshSources: true, timing });
       }
-      // 中途快照里只有 1 条线路时不能直接用：那一份是未校验的半成品，
-      // 可能是 .image 伪 m3u8、字体段或已过期签名（详情页会给出永远播不了的
-      // 按钮）。至少 2 条才采用，否则仍回按需线路，播放时现场解析真实地址。
-      {
-        const sources = pendingMediaSources(
-          item,
-          request.url,
-          playbackToken,
-          subtitles,
-          requestUserAgent,
-        );
-        item.MediaSources = sources;
-        item.MediaStreams = sources[0].MediaStreams;
-        item.MediaSourceCount = sources.length;
-        item.Container = sources[0].Container;
-        item.Path = sources[0].Path;
-        item.HasSubtitles = subtitles.length > 0;
-        // 艺术图同样按 20 秒时间桶换 tag，客户端重进详情页时会重新取图。
-        refreshDetailBackdropTags(item, movie);
-        return itemJsonResponse(item, request, { pendingSources: true, timing });
-      }
+      const sources = pendingMediaSources(
+        item,
+        request.url,
+        playbackToken,
+        subtitles,
+        requestUserAgent,
+      );
+      item.MediaSources = sources;
+      item.MediaStreams = sources[0].MediaStreams;
+      item.MediaSourceCount = sources.length;
+      item.Container = sources[0].Container;
+      item.Path = sources[0].Path;
+      item.HasSubtitles = subtitles.length > 0;
+      // 艺术图同样按 20 秒时间桶换 tag，客户端重进详情页时会重新取图。
+      refreshDetailBackdropTags(item, movie);
+      return itemJsonResponse(item, request, { pendingSources: true, timing });
     }
   }
   const mediaSources = await mediaSourcesForMovie(
@@ -19030,6 +19085,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
       // 不再返回无地址的假线路。
       // 命中旧成功源时立即返回，同时后台继续刷新；上游解析账号临时停用时
       // 仍能保留多线路，不会把客户端变成“没有播放按钮”。
+      const playbackProbeState = {};
       const videoResolution = await resolveVideoForResponse(
         movie,
         env,
@@ -19043,6 +19099,7 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
             PLAYBACK_INFO_RESOLVE_BUDGET_MS,
           ),
         ),
+        playbackProbeState,
       );
       let video = videoResolution.video;
       const subtitleWaitMs = Math.min(
@@ -19100,11 +19157,17 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
           env,
           preMemoSources.length ? 0 : LATE_SNAPSHOT_WAIT_MS,
         );
-        if (
-          isUsableResolvedVideo(lateSnapshot) &&
-          resolvedVideoSourceCount(lateSnapshot) >= 2
-        ) {
-          video = lateSnapshot;
+        const lateAccepted = isUsableResolvedVideo(lateSnapshot) &&
+            resolvedVideoSourceCount(lateSnapshot) >= 2
+          ? lateSnapshot
+          : await acceptThinResolvedVideo(
+            lateSnapshot,
+            fetchImpl,
+            env,
+            playbackProbeState.validationCache,
+          );
+        if (lateAccepted) {
+          video = lateAccepted;
           // 继续走公共路径（下方 mediaSourcesForMovie 会合并 MemoJav），
           // 用 IIFE 之外的普通流程无法直接跳出 if，这里单独返回。
           const lateSources = await mediaSourcesForMovie(
