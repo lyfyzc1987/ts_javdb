@@ -194,10 +194,10 @@ const HLS_PLAYLIST_SCAN_MAX_LINES = 128;
 // 旧 DTO / 旧解析缓存必须失效。
 // v39：收紧实例内多份缓存的内存预算，避免长寿命热点 isolate 在反复解析 /
 // 播放分片后累计超过 Cloudflare Worker 内存上限并返回 503 / 1102。
-const ITEM_DTO_ETAG_VERSION = "item-dto-v40";
+const ITEM_DTO_ETAG_VERSION = "item-dto-v41";
 // 部署标记：客户端忽略这个未知字段，运维侧可据此确认“新代码是否真的上线”，
 // 用来区分“修了没生效”和“根本没部署”。
-const SERVER_BUILD_ID = "2026-10-24-thin-source-117";
+const SERVER_BUILD_ID = "2026-10-24-no-auto-line-118";
 // 播放源还没解析完的详情 DTO 会带上“时间桶”参与 ETag 计算：同一个桶内
 // ETag 稳定（客户端可以正常命中 304），跨桶后 ETag 必然变化。
 // Emby 客户端会把整份 DTO 缓存在本地库里，只有 ETag 变化才会真正替换缓存；
@@ -14381,12 +14381,18 @@ function estimatedMediaBitrate(isHls, height) {
 function providerFirstSourceName(value) {
   const name = String(value || "").trim();
   if (!name) return "";
-  const match = name.match(/^(.*?)\s*[（(]\s*([^（()）]+?)\s*[）)]\s*$/);
+  // assignUniqueSourceNames 会给重名线路追加 “ · 1” 序号；先剥掉序号再匹配
+  // 括号，否则 “原版 (服务器GG) · 1” 匹配不到，详情页和 PlaybackInfo 就会
+  // 一直显示成 “原版 (服务器GG) · 1” 这种提供方在后的旧格式。
+  const ordinalSuffix = /\s*·\s*(\d+)\s*$/.exec(name);
+  const core = ordinalSuffix ? name.slice(0, ordinalSuffix.index).trim() : name;
+  const match = core.match(/^(.*?)\s*[（(]\s*([^（()）]+?)\s*[）)]\s*$/);
   if (!match) return name;
   const descriptor = match[1].trim();
   const provider = match[2].trim();
   if (!descriptor || !provider) return name;
-  return `${provider} ${descriptor}`;
+  const suffix = ordinalSuffix ? ` · ${ordinalSuffix[1]}` : "";
+  return `${provider} ${descriptor}${suffix}`;
 }
 
 // “解析中”是过渡状态，不应作为媒体信息显示。无论名称来自实时解析、旧缓存
@@ -14403,7 +14409,7 @@ function mediaSourceDisplayName(value, fallback, options = {}) {
       .replace(/\s{2,}/g, " ")
       .trim(),
   );
-  const name = clean(value) || clean(fallback) || "自动线路";
+  const name = clean(value) || clean(fallback) || "线路";
   if (!options.memoDirect) return name;
   // MemoJav 前缀是“取流方式”（302/代理），后面的 GetAV / 服务器GG 才是真实来源。
   // 显示顺序统一成「MemoJav 清晰度」在前、「来源」在后：
@@ -15099,9 +15105,9 @@ async function mediaSourcesForMovie(
 // /Videos/{id}/stream 会现场解析真实地址再转发，不会播到假地址。
 // 解析完成后客户端重新进入详情页就会拿到全部真实线路。
 // 名称不再带“（解析中）”：这一屏只有在所有解析链路都没有给出线路时才出现，
-// 用户看到“解析中”会以为后台还在跑并一直等；改成中性名称后详情页不再出现
-// “自动线路（解析中）”字样，播放按钮仍然保留（走取流接口现场解析）。
-const PENDING_MEDIA_SOURCE_NAME = "自动线路";
+// 用户看到“解析中”会以为后台还在跑并一直等。这里直接说明当前没有可用线路，
+// 播放按钮仍然保留（走取流接口现场解析），播放记录和进度条也不会被清空。
+const PENDING_MEDIA_SOURCE_NAME = "暂无可用线路";
 
 function pendingMediaSources(
   item,

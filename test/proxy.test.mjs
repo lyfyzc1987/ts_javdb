@@ -862,7 +862,7 @@ function expectedItemEtag(payload, options = {}) {
   const stableDto = {
     // 与 src/emby.js 的 ITEM_DTO_ETAG_VERSION 保持同步：版本号一升，客户端
     // 才会丢掉旧 DTO 缓存重新拉详情（例如新增/修正播放源时的必须动作）。
-    version: "item-dto-v40",
+    version: "item-dto-v41",
     // 详情 DTO（无论解析中还是解析完成）都会把 20 秒时间桶拼进指纹，
     // 生产代码见 itemEtag，这里同步复现。
     ...(options.pendingSources === true || options.refreshSources === true
@@ -2268,7 +2268,7 @@ test("returns a retryable detail response while cold resolution continues", asyn
   // 现场解析真实地址，不会播到假地址。
   assert.equal(firstPayload.MediaSourceCount, 1);
   assert.equal(firstPayload.MediaSources.length, 1);
-  assert.equal(firstPayload.MediaSources[0].Name, "自动线路");
+  assert.equal(firstPayload.MediaSources[0].Name, "暂无可用线路");
   // 占位线路的 Path 必须指向本服务的取流接口且不带 source 参数，
   // 否则客户端会去播一个伪造的上游地址。
   assert.match(firstPayload.MediaSources[0].Path, /\/Videos\/42\/stream\.mp4\?/);
@@ -2568,7 +2568,7 @@ test("returns a placeholder playback session while PlaybackInfo resolution conti
   assert.equal(first.headers.get("x-emby-retryable"), null);
   assert.ok(firstPayload.PlaySessionId);
   assert.equal(firstPayload.MediaSources.length, 1);
-  assert.equal(firstPayload.MediaSources[0].Name, "自动线路");
+  assert.equal(firstPayload.MediaSources[0].Name, "暂无可用线路");
 
   const deleted = await callLocalEmby(
     embyJsonRequest("/Users/bbjavdb-user/PlayedItems/42/Delete"),
@@ -2725,7 +2725,8 @@ test("keeps a playable on-demand placeholder instead of PlayAccess=None when res
   // 必须给一条按需占位线路（Path 指向本服务取流接口，播放时现场解析）。
   assert.equal(detailPayload.PlayAccess, "Full");
   assert.equal(detailPayload.MediaSources.length, 1);
-  assert.equal(detailPayload.MediaSources[0].Name, "自动线路");
+  assert.equal(detailPayload.MediaSources[0].Name, "暂无可用线路");
+  assert.doesNotMatch(JSON.stringify(detailPayload), /自动线路/);
   assert.equal(detailPayload.MediaSourceCount, 1);
   assert.equal(
     detailPayload.Etag,
@@ -2743,7 +2744,7 @@ test("keeps a playable on-demand placeholder instead of PlayAccess=None when res
   // 必须创建播放会话并下发同一条占位线路，否则用户看到播放按钮却怎么也播不了。
   assert.ok(playbackPayload.PlaySessionId);
   assert.equal(playbackPayload.MediaSources.length, 1);
-  assert.equal(playbackPayload.MediaSources[0].Name, "自动线路");
+  assert.equal(playbackPayload.MediaSources[0].Name, "暂无可用线路");
 });
 
 test("strips parsing-state text from every media source response boundary", async () => {
@@ -2777,7 +2778,7 @@ test("strips parsing-state text from every media source response boundary", asyn
           variants: [
             {
               variant: "original",
-              label: "自动线路（解析中）",
+              label: "暂无可用线路（解析中）",
               sourceUrl: sourceUrls[0],
               sourceType: "video/mp4",
               quality: 1080,
@@ -2835,7 +2836,7 @@ test("strips parsing-state text from every media source response boundary", asyn
   assert.equal(detail.status, 200);
   assert.deepEqual(
     detailPayload.MediaSources.map((source) => source.Name),
-    ["自动线路", "线路 2"],
+    ["暂无可用线路", "线路 2"],
   );
   assert.doesNotMatch(JSON.stringify(detailPayload), /解析中/);
 
@@ -2852,7 +2853,7 @@ test("strips parsing-state text from every media source response boundary", asyn
   assert.equal(playback.status, 200);
   assert.deepEqual(
     playbackPayload.MediaSources.map((source) => source.Name),
-    ["自动线路", "线路 2"],
+    ["暂无可用线路", "线路 2"],
   );
   assert.doesNotMatch(JSON.stringify(playbackPayload), /解析中/);
 });
@@ -2873,7 +2874,7 @@ test("buckets the pending detail ETag so clients refresh within 20 seconds", asy
     const firstPayload = await first.json();
     assert.equal(first.status, 200);
     assert.equal(firstPayload.MediaSources.length, 1);
-    assert.equal(firstPayload.MediaSources[0].Name, "自动线路");
+    assert.equal(firstPayload.MediaSources[0].Name, "暂无可用线路");
 
     // 同一个 20 秒桶内 ETag 稳定，但“解析中”绝不回 304：客户端把整份 DTO
     // 存在本地库里，304 会让它继续用没有播放按钮的旧副本。
@@ -3989,7 +3990,7 @@ test("drops .image pseudo-HLS sources when the body is a real PNG", async () => 
     false,
   );
   assert.equal(payload.MediaSources.length, 1);
-  assert.equal(payload.MediaSources[0].Name, "自动线路");
+  assert.equal(payload.MediaSources[0].Name, "暂无可用线路");
 });
 
 test("drops remote HLS sources whose segment body is real font data", async () => {
@@ -4062,7 +4063,7 @@ test("drops remote HLS sources whose segment body is real font data", async () =
     false,
   );
   assert.equal(payload.MediaSources.length, 1);
-  assert.equal(payload.MediaSources[0].Name, "自动线路");
+  assert.equal(payload.MediaSources[0].Name, "暂无可用线路");
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
   assert.equal(calls.includes(segmentUrl), true);
 });
@@ -4365,7 +4366,7 @@ test("drops AES-128 HLS sources when the decryption key is not 16 bytes", async 
     false,
   );
   assert.equal(payload.MediaSources.length, 1);
-  assert.equal(payload.MediaSources[0].Name, "自动线路");
+  assert.equal(payload.MediaSources[0].Name, "暂无可用线路");
   assert.equal(calls.includes(segmentUrl), false);
 });
 
@@ -4603,7 +4604,7 @@ test("drops remote HLS sources whose segment signature already expired", async (
   const expired = await run(expiredSegmentUrl);
   assert.equal(expired.calls.includes(expiredSegmentUrl), false);
   assert.equal(expired.payload.MediaSources.length, 1);
-  assert.equal(expired.payload.MediaSources[0].Name, "自动线路");
+  assert.equal(expired.payload.MediaSources[0].Name, "暂无可用线路");
 
   // 签名仍有效（kx = 2100-01-01）：正常探测并保留线路。
   const liveSegmentUrl =
@@ -4612,7 +4613,7 @@ test("drops remote HLS sources whose segment signature already expired", async (
   const live = await run(liveSegmentUrl);
   assert.equal(live.calls.includes(liveSegmentUrl), true);
   assert.equal(live.payload.MediaSources.length, 1);
-  assert.notEqual(live.payload.MediaSources[0].Name, "自动线路");
+  assert.notEqual(live.payload.MediaSources[0].Name, "暂无可用线路");
 });
 
 test("probes ordinary remote MP4 resolver sources before advertising them", async () => {
@@ -4732,7 +4733,7 @@ test("drops resolver sources marked metadata_invalid_reference", async () => {
     false,
   );
   assert.equal(payload.MediaSources.length, 1);
-  assert.equal(payload.MediaSources[0].Name, "自动线路");
+  assert.equal(payload.MediaSources[0].Name, "暂无可用线路");
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
 });
 
@@ -4814,7 +4815,7 @@ test("names a single real resolver line instead of the pending placeholder", asy
   const detailPayload = await detail.json();
   assert.equal(detail.status, 200);
   // 上游本来只有一条 fcjav 线路时，详情页必须用它自己的名称，不能退回
-  // “自动线路”占位源，也不能拿影片标题当播放源名。
+  // “暂无可用线路”占位源，也不能拿影片标题当播放源名。
   assert.deepEqual(
     detailPayload.MediaSources.map((source) => source.Name),
     ["fcjav 原版"],
@@ -5697,7 +5698,7 @@ test("publishes early public lines instead of a pending placeholder when a slow 
     "慢解析器应该已经被启动，否则这个用例没有覆盖到合并窗口",
   );
   // 关键点：预算耗尽时下发的是“已经解析出来的真实公共线路”，不再是
-  // “自动线路（解析中）”的占位源——这正是详情页一直只有一个解析中
+  // “暂无可用线路（解析中）”的占位源——这正是详情页一直只有一个解析中
   // 播放源、点播放一直转圈的直接原因。
   assert.equal(
     payload.MediaSources.some((source) =>
@@ -5735,7 +5736,7 @@ test("shows the first self-hosted line on the detail screen while both resolver 
     // 详情页预算压到 1.2 秒：公共解析器（2.5 秒）和另一条自建链路 GetAV
     // （3 秒）都来不及，唯一能在预算内出现的真实线路只能来自自建补源的
     // 第一批结果（Javtiful 秒回）。旧实现要等两条自建链路合并完才发布，
-    // 于是预算内什么都拿不到，客户端只能看到“自动线路（解析中）”。
+    // 于是预算内什么都拿不到，客户端只能看到“暂无可用线路（解析中）”。
     ITEM_DETAIL_RESOLVE_BUDGET_MS: 1200,
   };
   const response = await handleProxy(
@@ -5811,7 +5812,7 @@ test("shows the first self-hosted line on the detail screen while both resolver 
   const payload = await response.json();
   assert.equal(response.status, 200);
   assert.equal(payload.PlayAccess, "Full");
-  // 关键点：首屏直接是真实线路，不再有“自动线路（解析中）”的占位源。
+  // 关键点：首屏直接是真实线路，不再有“暂无可用线路（解析中）”的占位源。
   assert.equal(
     payload.MediaSources.some((source) =>
       String(source.Name || "").includes("解析中")
@@ -6037,7 +6038,7 @@ test("waits for the slow public batch instead of answering with the first self-h
   // 公共解析器要 1.9~4.3 秒才回 5 条（单个响应 1.1~1.8MB）。
   // 旧实现只要拿到自建快照就武装 3000ms 的静默窗口，于是 3.0 秒用 2 条答复、
   // 3.5 秒才到的公共批次被丢掉：客户端详情页只显示一个/两个播放源，点播放又
-  // 因为落在“自动线路”占位源上而一直加载。这里断言首屏必须等到公共批次。
+  // 因为落在“暂无可用线路”占位源上而一直加载。这里断言首屏必须等到公共批次。
   const detailUrl = "https://javtiful.com/zh/video/99996/RCTD-740";
   const javtifulUrls = [
     "https://fast-stream.jav.si/rctd-740/self-1080.mp4",
@@ -6397,7 +6398,7 @@ test("returns the full first-screen batch when one real source arrives before fo
 
 test("keeps a cold detail request alive for a real source just past the old deadline", async () => {
   // 线上 JUX-844 实测：元数据约 1.2 秒，首条真实源约 8.43 秒才到。
-  // 旧总截止 8.4 秒会先返回“自动线路（解析中）”；这里把时间线固定为
+  // 旧总截止 8.4 秒会先返回“暂无可用线路（解析中）”；这里把时间线固定为
   // 元数据 1.5 秒 + 公共源 7.2 秒，验证 9.2 秒总截止能保住真实多源。
   const number = "RCTD-744";
   const publicUrls = [
@@ -6690,7 +6691,7 @@ test("answers with the self-hosted lines once the first-screen grace expires", a
   const elapsed = Date.now() - startedAt;
   assert.equal(response.status, 200);
   assert.equal(payload.PlayAccess, "Full");
-  // 首屏是自建那 3 条真实线路，而不是“自动线路”占位源。
+  // 首屏是自建那 3 条真实线路，而不是“暂无可用线路”占位源。
   assert.equal(payload.MediaSourceCount, selfHostedUrls.length);
   assert.deepEqual(
     payload.MediaSources.map((source) =>
@@ -6933,7 +6934,7 @@ test("keeps inline HLS lines on the first screen when every upstream line is a d
     // 预算内出现的线路只能来自“公共解析器第一批快照”。上游三份线路全是
     // data: 内联 HLS（RCTD-740 在真实上游的形态）；旧实现把内联清单一律
     // 判成不可用，resolverPayloadUsableSourceCount 归零，详情页只能回落到
-    // “自动线路”占位源，客户端首屏就没有任何播放线路。
+    // “暂无可用线路”占位源，客户端首屏就没有任何播放线路。
     ITEM_DETAIL_RESOLVE_BUDGET_MS: 1200,
   };
   const response = await handleProxy(
@@ -14923,6 +14924,20 @@ test("memo display names always put a quality token right after MemoJav", async 
   ]) {
     assert.equal(mediaSourceDisplayNameForTests(name, "回退名"), name);
   }
+  // 重名线路带 “ · 1” 序号时也要把提供方挪到前面，和详情页保持同一格式。
+  assert.equal(
+    mediaSourceDisplayNameForTests("原版 (服务器GG) · 1", ""),
+    "服务器GG 原版 · 1",
+  );
+  assert.equal(
+    mediaSourceDisplayNameForTests("去码版 (服务器GG) · 2", ""),
+    "服务器GG 去码版 · 2",
+  );
+  // 占位源和任何回退名都不应再出现旧文案“自动线路”。
+  assert.doesNotMatch(
+    mediaSourceDisplayNameForTests("", ""),
+    /自动线路/,
+  );
 });
 
 test("memo reads real resolution from the fMP4 init segment", async () => {
