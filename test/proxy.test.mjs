@@ -1417,7 +1417,9 @@ test("merges legacy token playback buckets into the username bucket without revi
     `tombstone\u0000${usernameKey}:removed-v2`,
     JSON.stringify({
       "77": {
-        at: 1791131300000,
+        // 墓碑只保留 30 天。这里必须用相对时间，否则用例会随着日历腐坏：
+        // 固定时间戳一旦超过保留期，迁移前的合法清理就会让它消失。
+        at: Date.now() - 60_000,
         positionTicks: 100_000_000,
         played: false,
         playSessionId: "",

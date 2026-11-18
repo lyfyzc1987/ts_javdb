@@ -337,6 +337,17 @@ npx wrangler deploy --config=wrangler.worker.jsonc --dry-run
 npx wrangler pages functions build --outdir=.wrangler/pages-functions-build
 ```
 
+## 最近更新
+
+### 2026-11-19
+
+- Emby 客户端登录现在默认要求真实 JavDB 账号。旧部署想继续用“本地信任登录”时，
+  显式设置 `EMBY_REAL_JAVDB_LOGIN=false` 即可。
+- 上游详情/搜索接口要求登录后，详情请求遇到登录态错误会先复用进程内缓存的影片
+  数据；没有缓存时，错误不再误报成 `502`，而是返回 `401`，让客户端重新登录。
+- 修正旧播放记录迁移回归测试里的固定时间戳：删除墓碑只保留 30 天，改用相对时间
+  避免测试随日历过期。
+
 ## 验证视频 Range 响应
 
 将域名和番号替换成实际值：
