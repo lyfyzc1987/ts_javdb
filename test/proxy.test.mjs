@@ -14326,7 +14326,12 @@ test("streams relative URLs from alternate resolver response fields", async () =
 });
 
 test("remembers the first login password per username and rejects later mismatches", async () => {
-  const env = { PLAYBACK_DB: createPlaybackD1() };
+  // 新默认要求真实 JavDB 登录；这里专门回归旧的本地信任密码逻辑，
+  // 因此显式关闭真实登录，只验证每个用户名的首次密码记忆。
+  const env = {
+    PLAYBACK_DB: createPlaybackD1(),
+    EMBY_REAL_JAVDB_LOGIN: "false",
+  };
   const login = (username, password) =>
     callLocalEmby(
       new Request("https://clone.example/emby/Users/AuthenticateByName", {

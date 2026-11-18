@@ -8163,7 +8163,10 @@ function guestToken(env) {
 // 默认“本地信任登录”：不要求真实 JavDB 账号，随便输入的用户名都能登录成功。
 // 只有显式设置 EMBY_REAL_JAVDB_LOGIN=true 时，才回到“必须真实 JavDB 账号验证”。
 function realJavdbLoginEnabled(env) {
-  const value = String(env.EMBY_REAL_JAVDB_LOGIN ?? "false").trim().toLowerCase();
+  // 上游详情/搜索接口现在已要求真实 JWT；默认启用真实 JavDB 登录，
+  // 让客户端输入的账号产生的 token 能透传到数据接口。老部署仍可通过
+  // EMBY_REAL_JAVDB_LOGIN=false/0/no/off 回到本地信任登录。
+  const value = String(env.EMBY_REAL_JAVDB_LOGIN ?? "true").trim().toLowerCase();
   return ["1", "true", "yes", "on"].includes(value);
 }
 
@@ -9243,6 +9246,16 @@ function moviesFromPayload(payload) {
   return payload?.movies || payload?.data?.movies || [];
 }
 
+function isJavdbAuthRequiredError(error) {
+  return /請登錄帳號|请登录账号|請登錄|请登录|JWTVerificationError/i
+    .test(String(error instanceof Error ? error.message : error || ""));
+}
+
+function cachedMovieById(id, env, upstreamToken) {
+  const key = movieCacheKey(id, env, upstreamToken);
+  return MOVIE_CACHE.read(key) ?? undefined;
+}
+
 function tagName(tag) {
   return typeof tag === "string" ? tag : tag?.name || "";
 }
@@ -10185,7 +10198,19 @@ async function getMovie(id, env, fetchImpl, token = "", options = {}) {
       { token: upstreamToken, deadline },
     ));
   } catch (error) {
+    // 上游已把匿名详情查询切换为登录态。对客户端而言，这是“需要重新
+    // 登录”，而不是当前实现误透传的 502；同时首页/列表刚拿到的条目
+    // 本来就包含详情页必需的字段，先用进程内缓存兜底，避免点击即炸。
     directError = error;
+    if (isJavdbAuthRequiredError(error)) {
+      const upstreamTokenForCache = typeof options.upstreamToken === "string"
+        ? options.upstreamToken
+        : await apiToken(token, env);
+      const cached = cachedMovieById(id, env, upstreamTokenForCache);
+      if (cached?.id || cached?.number) {
+        return cached;
+      }
+    }
   }
   if (
     direct &&
@@ -19310,7 +19335,10 @@ async function handleEmbyInternal(request, env = {}, fetchImpl = fetch, ctx = nu
     try {
       return await itemResponse(decodeURIComponent(itemMatch[1]), request, env, fetchImpl, token, ctx);
     } catch (error) {
-      return errorResponse(502, error instanceof Error ? error.message : "Movie metadata unavailable");
+      return errorResponse(
+        isJavdbAuthRequiredError(error) ? 401 : 502,
+        error instanceof Error ? error.message : "Movie metadata unavailable",
+      );
     }
   }
 
