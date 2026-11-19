@@ -3044,6 +3044,7 @@ test("moves a legacy session stateKey into the tagged bucket without losing reco
 });
 
 test("forwards Emby access tokens to JavDB catalog requests", async () => {
+  resetEmbyCachesForTests();
   let authorization;
   const response = await handleProxy(
     new Request(
@@ -3054,10 +3055,63 @@ test("forwards Emby access tokens to JavDB catalog requests", async () => {
     {},
     async (_url, init) => {
       authorization = init.headers.get("authorization");
+      if (init.headers.has("jdsignature")) {
+        return new Response(
+          JSON.stringify({ success: 1, data: { movies: [] } }),
+        );
+      }
       return new Response(
         JSON.stringify({ success: 1, data: { movies: [] } }),
         { headers: { "content-type": "application/json" } },
       );
+    },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(authorization, "javdb-token");
+});
+
+test("uses a shared JavDB token for guest catalog requests when configured", async () => {
+  resetEmbyCachesForTests();
+  let authorization;
+  let sessionCalls = 0;
+  const response = await handleProxy(
+    new Request("https://clone.example/Items?SearchTerm=TEST&Limit=1"),
+    {
+      JAVDB_SHARED_USERNAME: "shared-user",
+      JAVDB_SHARED_PASSWORD: "shared-password",
+    },
+    {},
+    async (url, init) => {
+      if (url.includes("/v1/sessions")) {
+        if (!init.headers.has("jdsignature")) {
+          return new Response(JSON.stringify({ success: 0 }), { status: 401 });
+        }
+        sessionCalls += 1;
+        return new Response(
+          JSON.stringify({ success: 1, data: { token: "shared-jwt" } }),
+        );
+      }
+      authorization = init.headers.get("authorization");
+      return new Response(JSON.stringify({ success: 1, data: { movies: [] } }));
+    },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(authorization, "shared-jwt");
+  assert.equal(sessionCalls, 1);
+});
+
+test("keeps guest catalog requests anonymous when no shared account is configured", async () => {
+  resetEmbyCachesForTests();
+  let authorization;
+  const response = await handleProxy(
+    new Request("https://clone.example/Items?SearchTerm=TEST&Limit=1"),
+    {},
+    {},
+    async (_url, init) => {
+      authorization = init.headers.get("authorization");
+      return new Response(JSON.stringify({ success: 1, data: { movies: [] } }));
     },
   );
 
@@ -7332,6 +7386,98 @@ test("deduplicates exact cross-source URLs but keeps distinct URLs", async () =>
   assert.equal(sourceUrls.filter((source) => source === sharedUrl).length, 1);
   assert.equal(sourceUrls.includes(publicUrl), true);
   assert.equal(sourceUrls.includes(getavUrl), true);
+});
+
+test("loads Javtiful ticket sources through the playback handshake", async () => {
+  resetEmbyCachesForTests();
+  const detailUrl = "https://javtiful.com/zh/video/12345/SAN-449";
+  const sourceUrl = "https://fast-stream.jav.si/san-449/1080.mp4";
+  const calls = [];
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/42/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/42")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: { movie: { id: 42, number: "SAN-449", title: "SAN-449 Test" } },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target.includes(`${RESOLVER}/api/v/resolve?code=SAN-449`)) {
+        return new Response(
+          JSON.stringify({ variants: [] }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=SAN-449") {
+        return new Response(
+          `<a href="${detailUrl}">SAN-449 Test</a>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script id="frontWatchConfig">${JSON.stringify({
+            playback: {
+              endpoint: "/zh/video/12345/SAN-449/playback",
+              ticket: "ticket-token",
+            },
+          })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === "https://javtiful.com/csrf-token") {
+        return new Response(JSON.stringify({ token: "csrf-token" }), {
+          headers: {
+            "content-type": "application/json",
+            "set-cookie": "javtiful_session=session-cookie; Path=/",
+          },
+        });
+      }
+      if (target === `${detailUrl}/playback`) {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            videoTitle: "SAN-449 Test",
+            sources: [{ src: sourceUrl, type: "video/mp4", size: 1080 }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === sourceUrl) {
+        return new Response(new Uint8Array(512), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-511/512",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      if (target.startsWith("https://memojav.org/hls/get_video_info.php")) {
+        return new Response("not found", { status: 404 });
+      }
+      return new Response(
+        JSON.stringify({ code: 0, data: [] }),
+        { headers: { "content-type": "application/json" } },
+      );
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    payload.MediaSources.map((source) => source.Name),
+    ["MemoJav 1080P Javtiful"],
+  );
+  assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
 });
 
 test("loads Javtiful MP4 qualities in order and probes each stream", async () => {

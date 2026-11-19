@@ -85,6 +85,7 @@ function libraryForRequestedId(parentId) {
 
 const MEDIA_HOSTS = new Set([
   "fast-stream.jav.si",
+  "javtiful.com",
   "jdforrepam.com",
   "lh3.googleusercontent.com",
   "tp.spfcas.com",
@@ -8726,6 +8727,7 @@ const RESOLVE_SUBTITLE_CACHE = createTtlCache(RESOLVE_CACHE_TTL_MS, MAX_RESOLVE_
 const LIST_CACHE = createTtlCache(LIST_CACHE_TTL_MS, MAX_LIST_CACHE_ENTRIES);
 const LIST_WINDOW_CACHE = createTtlCache(LIST_WINDOW_TTL_MS, MAX_LIST_WINDOW_ENTRIES);
 const API_TOKEN_CACHE = createTtlCache(60 * 1000, 500);
+const SHARED_API_TOKEN_CACHE = createTtlCache(10 * 60 * 1000, 1);
 const MEDIA_SEGMENT_BODY_CACHE = createTtlCache(
   MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
   MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES,
@@ -10089,21 +10091,57 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
   return item;
 }
 
-async function apiToken(token, env) {
+async function apiToken(token, env, fetchImpl = fetch) {
   const value = String(token || "").trim();
   if (!value || value === guestToken(env)) {
-    return "";
+    return sharedUpstreamToken(env, fetchImpl);
   }
   // 会话查询本身也是一次存储读取，这里缓存一小段时间，避免每个请求都查一遍。
   // 只有“真实 JavDB 会话”的 token 才透传给上游数据接口；
   // “本地信任登录”生成的随机 token 一律不带，避免被 JavDB 当成无效会话拒绝。
   return API_TOKEN_CACHE.fetch(value, async () => {
     const record = await lookupSessionRecord(env, value);
-    if (!record || record.trusted === true) {
-      return "";
+    if (record && record.trusted === true) {
+      return sharedUpstreamToken(env, fetchImpl);
     }
     return value;
   });
+}
+
+async function sharedUpstreamToken(env, fetchImpl) {
+  const username = String(env.JAVDB_SHARED_USERNAME || "").trim();
+  const password = String(env.JAVDB_SHARED_PASSWORD || "").trim();
+  if (!username || !password) {
+    return "";
+  }
+  const form = new FormData();
+  form.set("username", username);
+  form.set("password", password);
+  form.set("device_uuid", `emby-shared-${serverId(env)}`);
+  form.set("device_name", "Emby Shared");
+  form.set("device_model", "Emby Compatible");
+  form.set("platform", "android");
+  form.set("system_version", "Emby Compatible");
+  form.set("app_channel", "official");
+  form.set("app_version", "emby-bridge");
+  form.set("app_version_number", "1.0.0");
+  const jwt = await SHARED_API_TOKEN_CACHE.fetch("shared", async () => {
+    try {
+      const data = await javdbRequest("/v1/sessions", env, fetchImpl, {
+        method: "POST",
+        body: form,
+      });
+      const value = String(data?.token || "").trim();
+      if (!value) throw new Error("JavDB shared authentication failed");
+      return value;
+    } catch {
+      // 没配置账号、账号失效或网络抖动时退回匿名请求；这比把整页变成
+      // 502 更符合“访客仍能看公开列表”的行为。搜索/详情一旦上游要求
+      // JWT，调用方会自然收到失败，部署端只需要修复共享账号。
+      return "";
+    }
+  });
+  return jwt;
 }
 function movieCacheKey(id, env, upstreamToken) {
   return `${apiOrigin(env)}|${upstreamToken ? "u" : "g"}|${String(id)}`;
@@ -10182,10 +10220,63 @@ async function findMovieByExactSearch(
   return null;
 }
 
+// 上游已经把匿名 /v4 详情和精确搜索都切到 JWT。刚从列表/首页点进来的条目
+// 先用进程内缓存兜底；缓存没有时，Javtiful 的公开详情页仍能提供同样的番号
+// 元数据。这里只造最小可用的 Movie，真正的播放源仍走原来的解析链。
+async function fallbackJavtifulMovie(id, env, fetchImpl) {
+  const code = exactSearchCode(id) || normalizedCodeToken(id);
+  if (!code || !selfHostedSearchCode(code)) return null;
+  const pageHeaders = { accept: "text/html", "user-agent": "Mozilla/5.0" };
+  const searchUrl = new URL("/zh/search", JAVTIFUL_ORIGIN);
+  searchUrl.searchParams.set("q", code);
+  const searchHtml = await fetchSelfHostedPageText(fetchImpl, searchUrl, pageHeaders);
+  const detailUrl = parseJavtifulSearchResult(searchHtml, code);
+  if (!detailUrl) return null;
+  const html = await fetchSelfHostedPageText(fetchImpl, detailUrl, pageHeaders);
+  const ld = [...String(html || "").matchAll(
+    /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
+  )].map((match) => {
+    try {
+      return JSON.parse(match[1].trim());
+    } catch {
+      return null;
+    }
+  }).find((payload) => payload?.["@type"] === "VideoObject");
+  const title = String(ld?.name || "").trim();
+  const number = movieNumberFromText(title) || code;
+  const cover = absoluteHttpUrl(
+    Array.isArray(ld?.thumbnailUrl) ? ld.thumbnailUrl[0] : ld?.thumbnailUrl,
+    JAVTIFUL_ORIGIN,
+  );
+  const date = String(ld?.uploadDate || "").trim();
+  const movie = {
+    id: number,
+    number,
+    title,
+    origin_title: title,
+    cover_url: cover,
+    release_date: date ? date.slice(0, 10) : "",
+    actors: [],
+    tags: [],
+    can_play: true,
+    has_cnsub: false,
+  };
+  if (!movie.id || !movie.title) return null;
+  // 只有拿到至少一条真实可播线路时才把它当成匿名兜底元数据，避免上游
+  // 资源页 404 / 无播放时把占位条目缓存成“可播”。
+  const variants = await loadJavtifulVariants(number, fetchImpl).catch(() => []);
+  if (!Array.isArray(variants) || !variants.length) return null;
+  // 详情页、图片、字幕和 PlaybackInfo 都会重新取元数据；写入同一份进程内
+  // 缓存，避免每次点击都重新抓公开页面。
+  MOVIE_CACHE.write(movieCacheKey(id, env, ""), movie);
+  MOVIE_CACHE.write(movieCacheKey(movie.id, env, ""), movie);
+  return movie;
+}
+
 async function getMovie(id, env, fetchImpl, token = "", options = {}) {
   const upstreamToken = typeof options.upstreamToken === "string"
     ? options.upstreamToken
-    : await apiToken(token, env);
+    : await apiToken(token, env, fetchImpl);
   const deadline = Number(options.deadline) || 0;
   const code = exactSearchCode(id);
   let directError = null;
@@ -10205,10 +10296,14 @@ async function getMovie(id, env, fetchImpl, token = "", options = {}) {
     if (isJavdbAuthRequiredError(error)) {
       const upstreamTokenForCache = typeof options.upstreamToken === "string"
         ? options.upstreamToken
-        : await apiToken(token, env);
+        : await apiToken(token, env, fetchImpl);
       const cached = cachedMovieById(id, env, upstreamTokenForCache);
       if (cached?.id || cached?.number) {
         return cached;
+      }
+      const anonymous = await fallbackJavtifulMovie(id, env, fetchImpl).catch(() => null);
+      if (anonymous?.id || anonymous?.number) {
+        return anonymous;
       }
     }
   }
@@ -10246,7 +10341,7 @@ async function getMovie(id, env, fetchImpl, token = "", options = {}) {
 async function getMovieCached(id, env, fetchImpl, token = "", options = {}) {
   const upstreamToken = typeof options.upstreamToken === "string"
     ? options.upstreamToken
-    : await apiToken(token, env);
+    : await apiToken(token, env, fetchImpl);
   const key = movieCacheKey(id, env, upstreamToken);
   return MOVIE_CACHE.fetch(key, async () => {
     const shared = await edgeCacheRead(EDGE_NAMESPACE_MOVIE, key);
@@ -10384,7 +10479,7 @@ async function getMoviePage(query, env, fetchImpl, token = "", options = {}) {
   const needsFullCatalog =
     !isNaturalCatalogOrder(sortComparators, sortOrder) ||
     (Boolean(searchTerm) && !fastSearch);
-  const upstreamToken = await apiToken(token, env);
+  const upstreamToken = await apiToken(token, env, fetchImpl);
 
   // 同一页数据短时间内直接复用：客户端返回再进、翻页回退、重复请求都不再回源。
   const cacheKey = [
@@ -10715,7 +10810,7 @@ async function keywordMoviesPage(query, env, fetchImpl, token, searchTerm, cache
   // 客户端会据此以为总共只有这么多，搜索结果看起来就“变少了”。
   const needsFullCatalog =
     Boolean(options.exactTotal) || !isNaturalCatalogOrder(sortComparators, sortOrder);
-  const upstreamToken = await apiToken(token, env);
+  const upstreamToken = await apiToken(token, env, fetchImpl);
   // 本次请求的翻页预算：关键词搜索（含标签 / 演员 / 片商）冷启动要全量扫描，
   // 上游抖动时容易拖过客户端超时，这里统一给一个墙钟上限。
   const scanDeadline = Date.now() + LIST_SCAN_DEADLINE_MS;
@@ -11308,6 +11403,90 @@ function parseJavtifulWatchConfig(html) {
   return variants.sort((left, right) => right.quality - left.quality);
 }
 
+function parseJavtifulTicket(html) {
+  const script = String(html || "").match(
+    /<script\b[^>]*\bid\s*=\s*(?:"(?:frontWatchConfig|watch-config)"|'(?:frontWatchConfig|watch-config)')[^>]*>([\s\S]*?)<\/script>/i,
+  );
+  if (!script) return null;
+  let config;
+  try {
+    config = JSON.parse(script[1]);
+  } catch {
+    return null;
+  }
+  const ticket = String(config?.playback?.ticket || "").trim();
+  return ticket ? { endpoint: config?.playback?.endpoint || "", ticket } : null;
+}
+
+function parseJavtifulCsrfToken(html) {
+  const match = String(html || "").match(
+    /name\s*=\s*(?:"_token"|'_token')\s+value\s*=\s*(?:"([^"]+)"|'([^']+)')/i,
+  );
+  return String(match?.[1] || match?.[2] || "").trim();
+}
+
+// Javtiful 现在把真实 MP4 藏在“详情页票据 + CSRF + playback 接口”后面。
+// 这套握手仍不需要登录：详情页公开票据，/csrf-token 公开临时会话。
+// 输入是详情页和票据接口复用的 headers；服务端没有 cookie jar，必须把
+// playback 返回的 Set-Cookie 透传给后续票据请求。
+async function loadJavtifulTicketVariants(detailUrl, pageHtml, pageHeaders, fetchImpl) {
+  const playback = parseJavtifulTicket(pageHtml);
+  if (!playback?.ticket) return [];
+  const csrfResponse = await fetchImpl(new URL("/csrf-token", JAVTIFUL_ORIGIN), {
+    headers: {
+      ...pageHeaders,
+      accept: "application/json",
+      "x-requested-with": "XMLHttpRequest",
+    },
+    redirect: "follow",
+  });
+  const csrfPayload = await csrfResponse.json().catch(() => ({}));
+  const csrfToken = String(csrfPayload?.token || "").trim();
+  const setCookie = csrfResponse.headers.get("set-cookie");
+  if (!csrfToken || !setCookie) return [];
+
+  const endpoint = playback.endpoint && playback.endpoint.startsWith("/")
+    ? playback.endpoint
+    : new URL(new URL(detailUrl).pathname + "/playback", JAVTIFUL_ORIGIN).pathname;
+  const response = await fetchImpl(new URL(endpoint, JAVTIFUL_ORIGIN), {
+    method: "POST",
+    headers: {
+      ...pageHeaders,
+      accept: "application/json",
+      "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+      origin: JAVTIFUL_ORIGIN,
+      referer: detailUrl,
+      "x-requested-with": "XMLHttpRequest",
+      "x-csrf-token": csrfToken,
+      cookie: setCookie.split(", ").map((part) => part.split(";")[0]).join("; "),
+    },
+    body: `ticket=${encodeURIComponent(playback.ticket)}`,
+    redirect: "follow",
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload?.success !== true || !Array.isArray(payload?.sources)) {
+    return [];
+  }
+
+  const variants = [];
+  for (const [index, source] of payload.sources.entries()) {
+    const sourceUrl = absoluteHttpUrl(source?.src, JAVTIFUL_ORIGIN);
+    if (!sourceUrl) continue;
+    const sourceType = String(source?.type || "video/mp4");
+    const quality = Math.max(0, Number(source?.size || source?.quality) || 0);
+    const qualityLabel = quality > 0 ? `${quality}P` : `线路 ${index + 1}`;
+    variants.push({
+      sourceUrl,
+      sourceType,
+      directRedirect: isDirectMediaSourceUrl(sourceUrl, sourceType),
+      label: `Javtiful ${qualityLabel}`,
+      variant: `javtiful_${quality || index + 1}`,
+      title: String(payload?.videoTitle || "").trim(),
+      quality,
+    });
+  }
+  return variants.sort((left, right) => right.quality - left.quality);
+}
 function absoluteHttpUrl(value, baseUrl) {
   try {
     const url = new URL(String(value || "").trim(), baseUrl);
@@ -11322,11 +11501,18 @@ function absoluteHttpUrl(value, baseUrl) {
 async function loadJavtifulVariants(code, fetchImpl) {
   const searchUrl = new URL("/zh/search", JAVTIFUL_ORIGIN);
   searchUrl.searchParams.set("q", code);
-  const searchHtml = await fetchSelfHostedPageText(fetchImpl, searchUrl);
+  const pageHeaders = { accept: "text/html", "user-agent": "Mozilla/5.0" };
+  const searchHtml = await fetchSelfHostedPageText(fetchImpl, searchUrl, pageHeaders);
   const detailUrl = parseJavtifulSearchResult(searchHtml, code);
   if (!detailUrl) return [];
-  const detailHtml = await fetchSelfHostedPageText(fetchImpl, detailUrl);
-  return parseJavtifulWatchConfig(detailHtml);
+  const detailHtml = await fetchSelfHostedPageText(fetchImpl, detailUrl, pageHeaders);
+  const ticketVariants = await loadJavtifulTicketVariants(
+    detailUrl,
+    detailHtml,
+    pageHeaders,
+    fetchImpl,
+  ).catch(() => []);
+  return ticketVariants.length ? ticketVariants : parseJavtifulWatchConfig(detailHtml);
 }
 
 function unescapeRscText(input) {
@@ -17308,7 +17494,7 @@ const FACET_CACHE_TTL_SECONDS = 6 * 60 * 60;
 const FACET_EXCLUDED_TAG_CATEGORIES = new Set(["year", "duration"]);
 
 async function upstreamFacetNames(kind, env, fetchImpl, token) {
-  const upstreamToken = await apiToken(token, env);
+  const upstreamToken = await apiToken(token, env, fetchImpl);
   const cacheKey = ["facets-v1", kind, apiOrigin(env), upstreamToken ? "u" : "g"].join("|");
   return LIST_CACHE.fetch(cacheKey, async () => {
     const shared = await edgeCacheRead(EDGE_NAMESPACE_LIST, cacheKey);
@@ -17510,8 +17696,6 @@ async function recordPlaybackEvent(path, request, env) {
   state[itemId] = record;
   await writePlaybackState(env, state, token);
 }
-
-
 
 function isEmbyClientRequest(request) {
   const url = new URL(request.url);
@@ -19536,6 +19720,7 @@ export function resetEmbyCachesForTests() {
   LIST_CACHE.clear();
   LIST_WINDOW_CACHE.clear();
   API_TOKEN_CACHE.clear();
+  SHARED_API_TOKEN_CACHE.clear();
   MEDIA_SEGMENT_BODY_CACHE.clear();
   MEDIA_SEGMENT_PREFIX_CACHE.clear();
   MEDIA_SEGMENT_RANGE_CACHE.clear();
@@ -19558,4 +19743,6 @@ export function resetEmbyCachesForTests() {
   MEMORY_PLAY_SESSIONS.clear();
   MEMORY_LEGACY_ADOPT_GUARDS.clear();
 }
+
+
 
