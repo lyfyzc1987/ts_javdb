@@ -8728,6 +8728,9 @@ const LIST_CACHE = createTtlCache(LIST_CACHE_TTL_MS, MAX_LIST_CACHE_ENTRIES);
 const LIST_WINDOW_CACHE = createTtlCache(LIST_WINDOW_TTL_MS, MAX_LIST_WINDOW_ENTRIES);
 const API_TOKEN_CACHE = createTtlCache(60 * 1000, 500);
 const SHARED_API_TOKEN_CACHE = createTtlCache(10 * 60 * 1000, 1);
+// 上游匿名详情被切成 JWT 后，刚从列表点进来的条目只剩 Emby 的内部 Id。
+// 这里记住“内部 Id → 真实番号”，让匿名 Javtiful 兜底能用真实番号搜索。
+const MOVIE_ID_TO_NUMBER_CACHE = createTtlCache(MOVIE_CACHE_TTL_MS, 5000);
 const MEDIA_SEGMENT_BODY_CACHE = createTtlCache(
   MEDIA_SEGMENT_CACHE_MAX_AGE_SECONDS * 1000,
   MEDIA_SEGMENT_BODY_CACHE_MAX_ENTRIES,
@@ -9976,6 +9979,10 @@ function itemJsonResponse(item, request, options = {}) {
 
 function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRARY_ID) {
   const id = String(movie.id ?? movie.number ?? "");
+  const number = movieNumber(movie);
+  if (id && number && id !== number) {
+    MOVIE_ID_TO_NUMBER_CACHE.write(id, number);
+  }
   const image = movie.cover_url || movie.thumb_url || "";
   const backdropImages = movieBackdropImages(movie);
   const displayDate = movieDisplayDate(movie);
@@ -10224,7 +10231,10 @@ async function findMovieByExactSearch(
 // 先用进程内缓存兜底；缓存没有时，Javtiful 的公开详情页仍能提供同样的番号
 // 元数据。这里只造最小可用的 Movie，真正的播放源仍走原来的解析链。
 async function fallbackJavtifulMovie(id, env, fetchImpl) {
-  const code = exactSearchCode(id) || normalizedCodeToken(id);
+  const cachedNumber = MOVIE_ID_TO_NUMBER_CACHE.read(String(id || ""));
+  const code = exactSearchCode(id) ||
+    (cachedNumber ? movieNumberFromText(cachedNumber) : "") ||
+    normalizedCodeToken(id);
   if (!code || !selfHostedSearchCode(code)) return null;
   const pageHeaders = { accept: "text/html", "user-agent": "Mozilla/5.0" };
   const searchUrl = new URL("/zh/search", JAVTIFUL_ORIGIN);
@@ -19721,6 +19731,7 @@ export function resetEmbyCachesForTests() {
   LIST_WINDOW_CACHE.clear();
   API_TOKEN_CACHE.clear();
   SHARED_API_TOKEN_CACHE.clear();
+  MOVIE_ID_TO_NUMBER_CACHE.clear();
   MEDIA_SEGMENT_BODY_CACHE.clear();
   MEDIA_SEGMENT_PREFIX_CACHE.clear();
   MEDIA_SEGMENT_RANGE_CACHE.clear();

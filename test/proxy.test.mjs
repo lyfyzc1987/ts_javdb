@@ -7480,6 +7480,119 @@ test("loads Javtiful ticket sources through the playback handshake", async () =>
   assert.equal(calls.filter((target) => target === sourceUrl).length, 1);
 });
 
+test("maps a list item id to its number for the anonymous Javtiful fallback", async () => {
+  resetEmbyCachesForTests();
+  const detailUrl = "https://javtiful.com/zh/video/12345/ABF-005";
+  const sourceUrl = "https://fast-stream.jav.si/abf-005/720.mp4";
+  const calls = [];
+  await handleProxy(
+    new Request("https://clone.example/Items?Limit=1&Recursive=true"),
+    {},
+    {},
+    async (url) => {
+      const target = String(url);
+      if (target.includes("/v1/movies")) {
+        return new Response(
+          JSON.stringify({
+            success: 1,
+            data: {
+              movies: [{
+                id: 35,
+                number: "ABF-005",
+                title: "ABF-005 Test",
+                can_play: true,
+                has_cnsub: true,
+              }],
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ code: 0, data: [] }));
+    },
+  );
+
+  const response = await handleProxy(
+    new Request("https://clone.example/Items/35/PlaybackInfo", {
+      method: "POST",
+    }),
+    {},
+    {},
+    async (url, init = {}) => {
+      const target = String(url);
+      calls.push(target);
+      if (target.includes("/v4/movies/35")) {
+        return new Response(
+          JSON.stringify({ success: 0, error: "請登錄帳號" }),
+          { status: 401, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (target === "https://javtiful.com/zh/search?q=ABF-005") {
+        return new Response(
+          `<a href="${detailUrl}">ABF-005 Test</a>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === detailUrl) {
+        return new Response(
+          `<script type="application/ld+json">${JSON.stringify({
+            "@type": "VideoObject",
+            name: "ABF-005 Test",
+            uploadDate: "2026-01-02T00:00:00Z",
+          })}</script>` +
+            `<script id="frontWatchConfig">${JSON.stringify({
+              playback: {
+                endpoint: "/zh/video/12345/ABF-005/playback",
+                ticket: "ticket-token",
+              },
+            })}</script>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      if (target === "https://javtiful.com/csrf-token") {
+        return new Response(JSON.stringify({ token: "csrf-token" }), {
+          headers: {
+            "set-cookie": "javtiful_session=session-cookie; Path=/",
+          },
+        });
+      }
+      if (target === `${detailUrl}/playback`) {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            videoTitle: "ABF-005 Test",
+            sources: [{ src: sourceUrl, type: "video/mp4", size: 720 }],
+          }),
+        );
+      }
+      if (target === sourceUrl) {
+        return new Response(new Uint8Array(512), {
+          status: 206,
+          headers: {
+            "content-range": "bytes 0-511/512",
+            "content-type": "video/mp4",
+          },
+        });
+      }
+      if (target.startsWith("https://memojav.org/hls/get_video_info.php")) {
+        return new Response("not found", { status: 404 });
+      }
+      return new Response(JSON.stringify({ code: 0, data: [] }));
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(calls.some((target) => target.includes("/v4/movies/35")), true);
+  assert.equal(
+    calls.some((target) => target === "https://javtiful.com/zh/search?q=ABF-005"),
+    true,
+  );
+  assert.deepEqual(payload.MediaSources.map((source) => source.Name), [
+    "MemoJav 720P Javtiful",
+  ]);
+});
+
 test("loads Javtiful MP4 qualities in order and probes each stream", async () => {
   const detailUrl = "https://javtiful.com/zh/video/12345/SAN-449";
   const fullHdUrl = "https://fast-stream.jav.si/san-449/1080.mp4";
