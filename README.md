@@ -200,6 +200,8 @@ npx wrangler deploy --config=wrangler.worker.jsonc --dry-run
 | `EMBY_SERVER_ID` | `bbjavdb-emby` | 返回给客户端的虚拟服务器 ID，改动后客户端可能需要重新添加服务器 |
 | `EMBY_GUEST_ACCESS` | `true` | 是否允许 Emby 客户端免账号密码登录 |
 | `EMBY_GUEST_TOKEN` | `bbjavdb-guest` | 访客播放会话使用的本地令牌 |
+| `JAVDB_SHARED_USERNAME` | 空 | 可选：服务端自动登录 JavDB 的共享账号；配置后 Emby 访客也能访问详情/搜索 |
+| `JAVDB_SHARED_PASSWORD` | 空 | 与共享账号配套的密码，只放服务端环境变量，不要写进前端或仓库 |
 | `EXTRA_MEDIA_HOSTS` | 空 | 额外允许代理的媒体域名，多个域名用英文逗号分隔 |
 | `PROXY_EXTERNAL_MEDIA` | `false` | 是否把白名单外部资源改写到同源媒体代理 |
 | `MEMOJAV_MEDIA_HOSTS` | `video10.memojav.net,*.memojav.net` | MemoJav 短链允许 302 跳转的媒体域名，多个域名用英文逗号分隔 |
