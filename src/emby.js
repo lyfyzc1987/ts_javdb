@@ -8770,6 +8770,7 @@ const REWRITTEN_HLS_CACHE = createTtlCache(
 let edgeCacheOrigin = "";
 
 const EDGE_NAMESPACE_MOVIE = "movie";
+const EDGE_NAMESPACE_MOVIE_ID_NUMBER = "movie-id-number";
 const EDGE_NAMESPACE_VIDEO = "video";
 // 解析中途的“公共线路快照”单独用一个命名空间：它和 EDGE_NAMESPACE_VIDEO 里
 // 的“完整结果”绝不能混，否则别的 isolate 会把半成品当成最终结果而不去补源。
@@ -9982,6 +9983,14 @@ function mapMovie(movie, requestUrl, env = {}, parentId = CHINESE_PLAYABLE_LIBRA
   const number = movieNumber(movie);
   if (id && number && id !== number) {
     MOVIE_ID_TO_NUMBER_CACHE.write(id, number);
+    // 进程内映射只在同一个 Worker 实例有效。边缘缓存让它跨实例存活，
+    // 避免列表命中 A 实例、详情请求落到 B 实例时匿名兜底查错番号。
+    edgeCacheWrite(
+      EDGE_NAMESPACE_MOVIE_ID_NUMBER,
+      movieIdNumberCacheKey(id, env),
+      number,
+      MOVIE_CACHE_TTL_MS / 1000,
+    ).catch(() => {});
   }
   const image = movie.cover_url || movie.thumb_url || "";
   const backdropImages = movieBackdropImages(movie);
@@ -10154,6 +10163,10 @@ function movieCacheKey(id, env, upstreamToken) {
   return `${apiOrigin(env)}|${upstreamToken ? "u" : "g"}|${String(id)}`;
 }
 
+function movieIdNumberCacheKey(id, env) {
+  return `${apiOrigin(env)}|id2number|${String(id || "")}`;
+}
+
 function preferredExactSearchMovie(movies, searchTerm, exactCode) {
   const expectedId = String(searchTerm || "").trim();
   const matches = (Array.isArray(movies) ? movies : []).filter((movie) => {
@@ -10232,8 +10245,16 @@ async function findMovieByExactSearch(
 // 元数据。这里只造最小可用的 Movie，真正的播放源仍走原来的解析链。
 async function fallbackJavtifulMovie(id, env, fetchImpl) {
   const cachedNumber = MOVIE_ID_TO_NUMBER_CACHE.read(String(id || ""));
+  let edgeNumber;
+  if (!cachedNumber) {
+    edgeNumber = await edgeCacheRead(
+      EDGE_NAMESPACE_MOVIE_ID_NUMBER,
+      movieIdNumberCacheKey(id, env),
+    );
+  }
+  const knownNumber = cachedNumber || edgeNumber;
   const code = exactSearchCode(id) ||
-    (cachedNumber ? movieNumberFromText(cachedNumber) : "") ||
+    (knownNumber ? movieNumberFromText(knownNumber) : "") ||
     normalizedCodeToken(id);
   if (!code || !selfHostedSearchCode(code)) return null;
   const pageHeaders = { accept: "text/html", "user-agent": "Mozilla/5.0" };
